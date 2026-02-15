@@ -1,0 +1,219 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Traxim Centreline Tool</title>
+    <!-- Cloudflare Web Analytics --><script defer src='https://static.cloudflareinsights.com/beacon.min.js' data-cf-beacon='{"token": "100b3db215f04098972a2d1be37f3721"}'></script><!-- End Cloudflare Web Analytics -->
+    <link rel="icon" type="image/png" href="traxim button - tight.png">
+    <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+    <div class="container">
+        <header>
+            <div class="header-content">
+                <img src="traxim button - tight.png" alt="Traxim Logo" class="header-logo">
+                <div class="header-text">
+                    <h1>Traxim Centreline Tool</h1>
+                    <p class="subtitle">Geospatial data conversion tool to create and manage centreline geometry for use with Traxim</p>
+                </div>
+            </div>
+        </header>
+
+        <main>
+            <!-- KML to Traxim Section -->
+            <section class="conversion-section">
+                <div class="section-header">
+                    <h2>Convert Google Earth kml to Traxim Centerline csv</h2>
+                    <button id="btnToggleAdvancedCsv" class="btn-toggle">Advanced Options</button>
+                </div>
+                
+                <div class="section-content">
+                    <div class="instruction-box" id="instructionsKml">
+                        <p>Use Google Earth Pro's Add Path Tool to draw an approximate centerline of the desired alignment.</p>
+                        <p>For best results, use more points to capture curves and fewer points on long straights. Limit anomalies by gradually increasing and decreasing the relative spacing between points.</p>
+                        <p>Save the alignment as a KML to a convenient local directory.</p>
+                        <p>This tool will attempt to curve fit the selected points to generate a regular 25 meter interval centerline optimised for use with Traxim.</p>
+                        <p>Actual cumulative geometric distance will be calculated and returned in the kilometrage column. This can subsequently be adjusted to match official kilometrages.</p>
+                        <p>Clicking "Convert to Traxim Centreline" will convert the selected files, and automatically download them as a zip file.</p>
+                        <p>This tool doesn't generate altitude data. We recommend https://www.gpsvisualizer.com/elevation to populate elevation.</p>
+                    </div>
+
+                    <div class="advanced-panel" id="panelAdvancedToCsv" style="display: none;">
+                        <h3>Advanced Options</h3>
+                        <div class="form-grid">
+                            <div class="form-group">
+                                <label for="tboxMaxSpace">
+                                    Max Segment Length (m): 
+                                    <span class="help-icon" title="Maximum distance between KML points before densification. Segments longer than this will have intermediate points added to prevent spline overshoot.">ℹ</span>
+                                </label>
+                                <input type="number" id="tboxMaxSpace" value="800" step="1">
+                            </div>
+                            <div class="form-group">
+                                <label for="tboxDensifySpace">
+                                    Densify Spacing (m): 
+                                    <span class="help-icon" title="Spacing between intermediate points when densifying long segments. Used to ensure the curve fitting algorithm works accurately on long gaps.">ℹ</span>
+                                </label>
+                                <input type="number" id="tboxDensifySpace" value="600" step="1">
+                            </div>
+                            <div class="form-group">
+                                <label for="tboxOutMinSpace">
+                                    Output Spacing (m): 
+                                    <span class="help-icon" title="Final spacing between points in the output centerline. Smaller values create more points and larger file sizes but smoother curves.">ℹ</span>
+                                </label>
+                                <input type="number" id="tboxOutMinSpace" value="25" step="1">
+                            </div>
+                            <div class="form-group">
+                                <label for="tboxSplineDetail">
+                                    Spline Detail: 
+                                    <span class="help-icon" title="Number of interpolation points per Bezier curve segment. Higher values create smoother curves but take longer to process. Default: 60">ℹ</span>
+                                </label>
+                                <input type="number" id="tboxSplineDetail" value="60" step="1">
+                            </div>
+                            <div class="form-group">
+                                <label for="tboxCurveArc">
+                                    Curve Arc Length (m): 
+                                    <span class="help-icon" title="Distance over which curve radius is calculated (uses 3 points spanning this distance). Shorter lengths detect tighter curves but may be affected by noise.">ℹ</span>
+                                </label>
+                                <input type="number" id="tboxCurveArc" value="100" step="1">
+                            </div>
+                            <div class="form-group">
+                                <label for="tboxCurveMin">
+                                    Straight Line Threshold (m): 
+                                    <span class="help-icon" title="Curve radius above this value is treated as straight (radius = 0). For railway design, 5000m is typically considered straight track.">ℹ</span>
+                                </label>
+                                <input type="number" id="tboxCurveMin" value="5000" step="1">
+                            </div>
+                            <div class="form-group">
+                                <label>
+                                    <input type="checkbox" id="chkboxFindCurves" checked>
+                                    Calculate Curve Radius 
+                                    <span class="help-icon" title="Calculate and include curve radius in the output CSV. Useful for railway alignment design.">ℹ</span>
+                                </label>
+                            </div>
+                        </div>
+                        <div class="button-group">
+                            <button id="btnRestoreDefaults" class="btn-secondary">Restore Defaults</button>
+                        </div>
+                    </div>
+
+                    <div class="file-input-section">
+                        <label for="kmlFileInput" class="btn-file-input">
+                            Select KML Files
+                            <input type="file" id="kmlFileInput" accept=".kml" multiple>
+                        </label>
+                        <div id="kmlFileList" class="file-list"></div>
+                    </div>
+
+                    <button id="btnKmlToTraxim" class="btn-primary" disabled>Convert to Traxim Centerline</button>
+                    
+                    <div class="progress-container" id="progressKml" style="display: none;">
+                        <div class="progress-bar">
+                            <div class="progress-fill" id="progressFillKml"></div>
+                        </div>
+                        <p class="progress-text" id="progressTextKml">Processing...</p>
+                    </div>
+                </div>
+            </section>
+
+            <!-- CSV to Google Earth Section -->
+            <section class="conversion-section">
+                <div class="section-header">
+                    <h2>Convert Traxim Centerline csv to Google Earth kmz</h2>
+                    <button id="btnToggleAdvancedKml" class="btn-toggle">Advanced Options</button>
+                </div>
+                
+                <div class="section-content">
+                    <div class="instruction-box" id="instructionsGE">
+                        <p>Select Traxim centerline csv files to convert them to Google Earth kmz files.</p>
+                        <p>Visualising the track geometry in Google Earth provides an easy way to identify errors, and to correlate nominal kilometrages to rail network features.</p>
+                        <p>The output will be a single lines.kmz file containing all centerlines organized in folders, with normal and low-detail versions, plus kilometrage markers.</p>
+                        <p>Clicking "Convert to Google Earth" will convert the selected files, and automatically download the index.kmz as a zip file.</p>
+                        <p>This can be opened in Google Earth Pro. Just drag and drop. Please be patient: Large files may take some time to load in Google Earth.</p>
+                    </div>
+
+                    <div class="advanced-panel" id="panelAdvancedKml" style="display: none;">
+                        <h3>Advanced Options</h3>
+                        <div class="form-grid">
+                            <div class="form-group">
+                                <label for="textBoxExaggeration">
+                                    Exaggeration: 
+                                    <span class="help-icon" title="Vertical exaggeration multiplier for altitude values. Values > 1 exaggerate terrain features. Use 1 for no exaggeration.">ℹ</span>
+                                </label>
+                                <input type="number" id="textBoxExaggeration" value="1" step="0.1">
+                            </div>
+                            <div class="form-group">
+                                <label for="textBoxOffset">
+                                    Offset (m): 
+                                    <span class="help-icon" title="Vertical offset added to all altitude values. Useful for raising the centerline above the ground for better visibility.">ℹ</span>
+                                </label>
+                                <input type="number" id="textBoxOffset" value="3" step="0.1">
+                            </div>
+                            <div class="form-group">
+                                <label>
+                                    Altitude Mode: 
+                                    <span class="help-icon" title="Clamp to Ground: Follows terrain surface. Absolute: Uses actual altitude values from data.">ℹ</span>
+                                </label>
+                                <div class="radio-group">
+                                    <label>
+                                        <input type="radio" name="altitudeMode" value="clampToGround" checked>
+                                        Clamp to Ground
+                                    </label>
+                                    <label>
+                                        <input type="radio" name="altitudeMode" value="absolute">
+                                        Absolute
+                                    </label>
+                                </div>
+                            </div>
+                            <div class="form-group">
+                                <label>
+                                    <input type="checkbox" id="ckboxFindColours" checked>
+                                    Find Colours 
+                                    <span class="help-icon" title="Automatically detect and apply colors from the CSV data if available.">ℹ</span>
+                                </label>
+                                <label>
+                                    <input type="checkbox" id="ckboxWriteColours" checked>
+                                    Write Colours 
+                                    <span class="help-icon" title="Include color information in the output KML file.">ℹ</span>
+                                </label>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="file-input-section">
+                        <label for="csvFileInput" class="btn-file-input">
+                            Select CSV Files
+                            <input type="file" id="csvFileInput" accept=".csv" multiple>
+                        </label>
+                        <div id="csvFileList" class="file-list"></div>
+                    </div>
+
+                    <button id="btnToNetworkGE" class="btn-primary" disabled>Convert to Google Earth</button>
+                    
+                    <div class="progress-container" id="progressGE" style="display: none;">
+                        <div class="progress-bar">
+                            <div class="progress-fill" id="progressFillGE"></div>
+                        </div>
+                        <p class="progress-text" id="progressTextGE">Processing...</p>
+                    </div>
+                </div>
+            </section>
+        </main>
+
+        <footer>
+            <p>Web version of Traxim Centerline Tools - Ported from WinForms application</p>
+        </footer>
+    </div>
+
+    <!-- External Libraries -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/PapaParse/5.4.1/papaparse.min.js"></script>
+    
+    <!-- Application Scripts -->
+    <script src="lib/geopoint.js"></script>
+    <script src="lib/geodetic.js"></script>
+    <script src="lib/curves.js"></script>
+    <script src="lib/io.js"></script>
+    <script src="app.js"></script>
+</body>
+</html>
