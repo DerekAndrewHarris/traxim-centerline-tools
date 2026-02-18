@@ -18,7 +18,7 @@ jobs:
         username: ${{ secrets.SSH_USERNAME }}
         key: ${{ secrets.SSH_PRIVATE_KEY }}
         script: |
-          cd /var/www/traxim-centerline-tools
+          cd /var/www/TraximCentrelineTools
           git pull origin main
-          sudo chown -R www-data:www-data /var/www/traxim-centerline-tools
-          sudo chmod -R 755 /var/www/traxim-centerline-tools
+          sudo chown -R www-data:www-data /var/www/TraximCentrelineTools
+          sudo chmod -R 755 /var/www/TraximCentrelineTools
