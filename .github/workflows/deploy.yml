@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - main
+  workflow_dispatch:
 
 jobs:
   deploy:
@@ -19,5 +20,5 @@ jobs:
         script: |
           cd /var/www/traxim-centerline-tools
           git pull origin main
-          chown -R www-data:www-data /var/www/traxim-centerline-tools
-          chmod -R 755 /var/www/traxim-centerline-tools
+          sudo chown -R www-data:www-data /var/www/traxim-centerline-tools
+          sudo chmod -R 755 /var/www/traxim-centerline-tools
