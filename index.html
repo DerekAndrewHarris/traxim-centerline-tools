@@ -210,10 +210,23 @@
     <script src="https://cdnjs.cloudflare.com/ajax/libs/PapaParse/5.4.1/papaparse.min.js"></script>
     
     <!-- Application Scripts -->
-    <script src="lib/geopoint.js"></script>
-    <script src="lib/geodetic.js"></script>
-    <script src="lib/curves.js"></script>
-    <script src="lib/io.js"></script>
-    <script src="app.js"></script>
+    <script src="lib/geopoint.js" onerror="console.error('Failed to load geopoint.js'); alert('Error: Failed to load geopoint.js. Check browser console.');"></script>
+    <script src="lib/geodetic.js" onerror="console.error('Failed to load geodetic.js'); alert('Error: Failed to load geodetic.js');"></script>
+    <script src="lib/curves.js" onerror="console.error('Failed to load curves.js'); alert('Error: Failed to load curves.js');"></script>
+    <script src="lib/io.js" onerror="console.error('Failed to load io.js'); alert('Error: Failed to load io.js. This will cause IOFunctions errors.');"></script>
+    <script src="app.js" onerror="console.error('Failed to load app.js'); alert('Error: Failed to load app.js');"></script>
+    <script>
+        // Verify all required classes are loaded
+        window.addEventListener('DOMContentLoaded', function() {
+            const required = ['GeoPoint', 'Ellipsoid', 'GeodeticCalculator', 'Curves', 'IOFunctions'];
+            const missing = required.filter(cls => typeof window[cls] === 'undefined');
+            if (missing.length > 0) {
+                console.error('Missing required classes:', missing);
+                alert('Error: Missing required classes: ' + missing.join(', ') + '. Check browser console and Network tab.');
+            } else {
+                console.log('All required classes loaded successfully');
+            }
+        });
+    </script>
 </body>
 </html>

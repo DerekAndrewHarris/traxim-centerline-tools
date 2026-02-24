@@ -1,4 +1,17 @@
 // Main Application Logic
+console.log('[app.js] Starting to load app.js...');
+console.log('[app.js] Dependencies check:');
+console.log('  - GeoPoint:', typeof GeoPoint);
+console.log('  - Ellipsoid:', typeof Ellipsoid);
+console.log('  - GeodeticCalculator:', typeof GeodeticCalculator);
+console.log('  - Curves:', typeof Curves);
+console.log('  - IOFunctions:', typeof IOFunctions);
+
+if (typeof IOFunctions === 'undefined') {
+    console.error('[app.js] CRITICAL: IOFunctions is not defined! Check if lib/io.js loaded correctly.');
+    alert('Critical Error: IOFunctions class is not loaded. Please check browser console and ensure lib/io.js is loaded properly.');
+}
+
 class TraximCenterlineTools {
     constructor() {
         this.kmlFiles = [];
