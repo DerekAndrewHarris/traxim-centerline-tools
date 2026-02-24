@@ -16,6 +16,7 @@
                 <div class="header-text">
                     <h1>Traxim Centreline Tool</h1>
                     <p class="subtitle">Geospatial data conversion tool to create and manage centreline geometry for use with Traxim</p>
+                    <p class="subtitle" style="font-size: 0.8em; opacity: 0.6;">v2024.02.24-fix</p>
                 </div>
             </div>
         </header>
@@ -216,6 +217,13 @@
     <script src="lib/io.js" onerror="console.error('Failed to load io.js'); alert('Error: Failed to load io.js. This will cause IOFunctions errors.');"></script>
     <script src="app.js" onerror="console.error('Failed to load app.js'); alert('Error: Failed to load app.js');"></script>
     <script>
+        // Version tracking
+        const APP_VERSION = 'v2024.02.24-fix';
+        console.log('%c=== Traxim Centreline Tool ===', 'font-weight: bold; color: #0066cc;');
+        console.log('%cVersion: ' + APP_VERSION, 'color: #0066cc;');
+        console.log('%cUpdated: 2024-02-24', 'color: #0066cc;');
+        console.log('%c==============================', 'font-weight: bold; color: #0066cc;');
+        
         // Verify all required classes are loaded
         window.addEventListener('DOMContentLoaded', function() {
             const required = ['GeoPoint', 'Ellipsoid', 'GeodeticCalculator', 'Curves', 'IOFunctions'];

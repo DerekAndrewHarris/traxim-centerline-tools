@@ -18,7 +18,24 @@ jobs:
         username: ${{ secrets.SSH_USERNAME }}
         key: ${{ secrets.SSH_PRIVATE_KEY }}
         script: |
+          echo "=== Deployment Debug Info ==="
           cd /var/www/TraximCenterlineTools
+          echo "Current directory: $(pwd)"
+          echo "Current branch: $(git branch --show-current)"
+          echo "Git status before pull:"
+          git status
+          echo "Last commit on server:"
+          git log -1 --oneline
+          echo "Fetching from origin..."
+          git fetch origin main
+          echo "Latest commit on origin/main:"
+          git log origin/main -1 --oneline
+          echo "Running git pull..."
           git pull origin main
+          echo "Git status after pull:"
+          git status
+          echo "Index.html modified date:"
+          ls -la index.html
           sudo chown -R www-data:www-data /var/www/TraximCenterlineTools
           sudo chmod -R 755 /var/www/TraximCenterlineTools
+          echo "=== Deployment Complete ==="
