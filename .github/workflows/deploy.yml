@@ -32,6 +32,8 @@ jobs:
           git fetch origin main
           echo "Latest commit on origin/main:"
           git log origin/main -1 --oneline
+          echo "Resetting local changes to match origin/main..."
+          git reset --hard origin/main
           echo "Running git pull..."
           git pull origin main
           echo "Git status after pull:"
