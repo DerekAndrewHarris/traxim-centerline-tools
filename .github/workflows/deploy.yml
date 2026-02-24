@@ -21,6 +21,8 @@ jobs:
           echo "=== Deployment Debug Info ==="
           cd /var/www/TraximCenterlineTools
           echo "Current directory: $(pwd)"
+          echo "Configuring git safe directory..."
+          git config --global --add safe.directory /var/www/TraximCenterlineTools
           echo "Current branch: $(git branch --show-current)"
           echo "Git status before pull:"
           git status
