@@ -3,9 +3,13 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Traxim Centreline Tool</title>
+    <title>Traxim File Generator</title>
     <!-- Cloudflare Web Analytics --><script defer src='https://static.cloudflareinsights.com/beacon.min.js' data-cf-beacon='{"token": "100b3db215f04098972a2d1be37f3721"}'></script><!-- End Cloudflare Web Analytics -->
     <link rel="icon" type="image/png" href="traxim button - tight.png">
+    
+    <!-- Leaflet CSS for map -->
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    
     <link rel="stylesheet" href="styles.css">
 </head>
 <body>
@@ -14,199 +18,383 @@
             <div class="header-content">
                 <img src="traxim button - tight.png" alt="Traxim Logo" class="header-logo">
                 <div class="header-text">
-                    <h1>Traxim Centreline Tool</h1>
-                    <p class="subtitle">Geospatial data conversion tool to create and manage centreline geometry for use with Traxim</p>
-                    <p class="subtitle" style="font-size: 0.8em; opacity: 0.6;">v2024.02.24-fix</p>
+                    <h1>Traxim File Generator</h1>
+                    <p class="subtitle">Generate Traxim input files from OpenStreetMap  •  Convert between KML and CSV formats</p>
+                    <p class="subtitle" style="font-size: 0.8em; opacity: 0.6;">v2024.02.24 + OSM</p>
                 </div>
+            </div>
+            <!-- Session Info in top right -->
+            <div class="session-info-header">
+                <span id="sessionStatus">No active session</span>
+                <button id="btnNewSession" class="btn-small">New Session</button>
             </div>
         </header>
 
-        <main>
-            <!-- KML to Traxim Section -->
-            <section class="conversion-section">
-                <div class="section-header">
-                    <h2>Convert Google Earth kml to Traxim Centerline csv</h2>
-                    <button id="btnToggleAdvancedCsv" class="btn-toggle">Advanced Options</button>
-                </div>
-                
-                <div class="section-content">
-                    <div class="instruction-box" id="instructionsKml">
-                        <p>Use Google Earth Pro's Add Path Tool to draw an approximate centerline of the desired alignment.</p>
-                        <p>For best results, use more points to capture curves and fewer points on long straights. Limit anomalies by gradually increasing and decreasing the relative spacing between points.</p>
-                        <p>Save the alignment as a KML to a convenient local directory.</p>
-                        <p>This tool will attempt to curve fit the selected points to generate a regular 25 meter interval centerline optimised for use with Traxim.</p>
-                        <p>Actual cumulative geometric distance will be calculated and returned in the kilometrage column. This can subsequently be adjusted to match official kilometrages.</p>
-                        <p>Clicking "Convert to Traxim Centreline" will convert the selected files, and automatically download them as a zip file.</p>
-                        <p>This tool doesn't generate altitude data. We recommend https://www.gpsvisualizer.com/elevation to populate elevation.</p>
-                    </div>
+        <!-- Tab Navigation -->
+        <div class="main-layout">
+            <nav class="tab-nav">
+                <button class="tab-button active" data-tab="osm">OSM File Generator</button>
+                <button class="tab-button" data-tab="centerline">Centerline Conversion</button>
+            </nav>
 
-                    <div class="advanced-panel" id="panelAdvancedToCsv" style="display: none;">
-                        <h3>Advanced Options</h3>
-                        <div class="form-grid">
-                            <div class="form-group">
-                                <label for="tboxMaxSpace">
-                                    Max Segment Length (m): 
-                                    <span class="help-icon" title="Maximum distance between KML points before densification. Segments longer than this will have intermediate points added to prevent spline overshoot.">ℹ</span>
-                                </label>
-                                <input type="number" id="tboxMaxSpace" value="800" step="1">
-                            </div>
-                            <div class="form-group">
-                                <label for="tboxDensifySpace">
-                                    Densify Spacing (m): 
-                                    <span class="help-icon" title="Spacing between intermediate points when densifying long segments. Used to ensure the curve fitting algorithm works accurately on long gaps.">ℹ</span>
-                                </label>
-                                <input type="number" id="tboxDensifySpace" value="600" step="1">
-                            </div>
-                            <div class="form-group">
-                                <label for="tboxOutMinSpace">
-                                    Output Spacing (m): 
-                                    <span class="help-icon" title="Final spacing between points in the output centerline. Smaller values create more points and larger file sizes but smoother curves.">ℹ</span>
-                                </label>
-                                <input type="number" id="tboxOutMinSpace" value="25" step="1">
-                            </div>
-                            <div class="form-group">
-                                <label for="tboxSplineDetail">
-                                    Spline Detail: 
-                                    <span class="help-icon" title="Number of interpolation points per Bezier curve segment. Higher values create smoother curves but take longer to process. Default: 60">ℹ</span>
-                                </label>
-                                <input type="number" id="tboxSplineDetail" value="60" step="1">
-                            </div>
-                            <div class="form-group">
-                                <label for="tboxCurveArc">
-                                    Curve Arc Length (m): 
-                                    <span class="help-icon" title="Distance over which curve radius is calculated (uses 3 points spanning this distance). Shorter lengths detect tighter curves but may be affected by noise.">ℹ</span>
-                                </label>
-                                <input type="number" id="tboxCurveArc" value="100" step="1">
-                            </div>
-                            <div class="form-group">
-                                <label for="tboxCurveMin">
-                                    Straight Line Threshold (m): 
-                                    <span class="help-icon" title="Curve radius above this value is treated as straight (radius = 0). For railway design, 5000m is typically considered straight track.">ℹ</span>
-                                </label>
-                                <input type="number" id="tboxCurveMin" value="5000" step="1">
-                            </div>
-                            <div class="form-group">
-                                <label>
-                                    <input type="checkbox" id="chkboxFindCurves" checked>
-                                    Calculate Curve Radius 
-                                    <span class="help-icon" title="Calculate and include curve radius in the output CSV. Useful for railway alignment design.">ℹ</span>
-                                </label>
-                            </div>
-                        </div>
-                        <div class="button-group">
-                            <button id="btnRestoreDefaults" class="btn-secondary">Restore Defaults</button>
-                        </div>
-                    </div>
-
-                    <div class="file-input-section">
-                        <label for="kmlFileInput" class="btn-file-input">
-                            Select KML Files
-                            <input type="file" id="kmlFileInput" accept=".kml" multiple>
-                        </label>
-                        <div id="kmlFileList" class="file-list"></div>
-                    </div>
-
-                    <button id="btnKmlToTraxim" class="btn-primary" disabled>Convert to Traxim Centerline</button>
-                    
-                    <div class="progress-container" id="progressKml" style="display: none;">
-                        <div class="progress-bar">
-                            <div class="progress-fill" id="progressFillKml"></div>
-                        </div>
-                        <p class="progress-text" id="progressTextKml">Processing...</p>
-                    </div>
-                </div>
-            </section>
-
-            <!-- CSV to Google Earth Section -->
-            <section class="conversion-section">
-                <div class="section-header">
-                    <h2>Convert Traxim Centerline csv to Google Earth kmz</h2>
-                    <button id="btnToggleAdvancedKml" class="btn-toggle">Advanced Options</button>
-                </div>
-                
-                <div class="section-content">
-                    <div class="instruction-box" id="instructionsGE">
-                        <p>Select Traxim centerline csv files to convert them to Google Earth kmz files.</p>
-                        <p>Visualising the track geometry in Google Earth provides an easy way to identify errors, and to correlate nominal kilometrages to rail network features.</p>
-                        <p>The output will be a single lines.kmz file containing all centerlines organized in folders, with normal and low-detail versions, plus kilometrage markers.</p>
-                        <p>Clicking "Convert to Google Earth" will convert the selected files, and automatically download the index.kmz as a zip file.</p>
-                        <p>This can be opened in Google Earth Pro. Just drag and drop. Please be patient: Large files may take some time to load in Google Earth.</p>
-                    </div>
-
-                    <div class="advanced-panel" id="panelAdvancedKml" style="display: none;">
-                        <h3>Advanced Options</h3>
-                        <div class="form-grid">
-                            <div class="form-group">
-                                <label for="textBoxExaggeration">
-                                    Exaggeration: 
-                                    <span class="help-icon" title="Vertical exaggeration multiplier for altitude values. Values > 1 exaggerate terrain features. Use 1 for no exaggeration.">ℹ</span>
-                                </label>
-                                <input type="number" id="textBoxExaggeration" value="1" step="0.1">
-                            </div>
-                            <div class="form-group">
-                                <label for="textBoxOffset">
-                                    Offset (m): 
-                                    <span class="help-icon" title="Vertical offset added to all altitude values. Useful for raising the centerline above the ground for better visibility.">ℹ</span>
-                                </label>
-                                <input type="number" id="textBoxOffset" value="3" step="0.1">
-                            </div>
-                            <div class="form-group">
-                                <label>
-                                    Altitude Mode: 
-                                    <span class="help-icon" title="Clamp to Ground: Follows terrain surface. Absolute: Uses actual altitude values from data.">ℹ</span>
-                                </label>
-                                <div class="radio-group">
-                                    <label>
-                                        <input type="radio" name="altitudeMode" value="clampToGround" checked>
-                                        Clamp to Ground
-                                    </label>
-                                    <label>
-                                        <input type="radio" name="altitudeMode" value="absolute">
-                                        Absolute
+            <div class="content-area">
+                <!-- OSM Workflow Tab -->
+                <div id="tab-osm" class="tab-content active">
+                <div class="osm-layout">
+                    <!-- Map Container (Left Side) -->
+                    <div class="map-container">
+                        <div id="map" class="map"></div>
+                        <div class="map-controls">
+                            <button id="btnClearMap" class="btn-map-control">Clear Map</button>
+                            <div class="map-legend">
+                                <div class="legend-item"><span class="legend-marker geocoded"></span> Geocoded Points</div>
+                                <div class="legend-item"><span class="legend-marker section"></span> Search Bboxes / Corridors</div>
+                                <div class="legend-item"><span class="legend-marker geometry"></span> Generated Geometry</div>
+                                <div class="legend-item"><span class="legend-marker alt-route"></span> Alternative Routes</div>
+                                <div class="legend-item"><span class="legend-marker corridor-buffer"></span> Corridor Buffer (~1 km)</div>
+                                <div class="legend-item">
+                                    <label style="display:flex;align-items:center;gap:5px;cursor:pointer;margin:0;">
+                                        <input type="checkbox" id="chkTopologyWays" checked style="margin:0;">
+                                        <span class="legend-marker topology"></span> OSM Topology Ways
                                     </label>
                                 </div>
                             </div>
-                            <div class="form-group">
-                                <label>
-                                    <input type="checkbox" id="ckboxFindColours" checked>
-                                    Find Colours 
-                                    <span class="help-icon" title="Automatically detect and apply colors from the CSV data if available.">ℹ</span>
-                                </label>
-                                <label>
-                                    <input type="checkbox" id="ckboxWriteColours" checked>
-                                    Write Colours 
-                                    <span class="help-icon" title="Include color information in the output KML file.">ℹ</span>
-                                </label>
+                        </div>
+                    </div>
+
+                    <!-- Control Panels (Right Side) -->
+                    <div class="control-panels">
+                        <!-- Step 1: Route Definition -->
+                        <section class="workflow-panel" id="panel-route">
+                            <div class="panel-header">
+                                <span class="step-number">1</span>
+                                <h3>Define Route</h3>
+                                <span class="panel-toggle">▼</span>
                             </div>
-                        </div>
-                    </div>
+                            <div class="panel-content">
+                                <div class="instruction-box">
+                                    <p>Add waypoints along your route (minimum 2 locations). Each waypoint creates a focused search area.</p>
+                                </div>
+                                
+                                <!-- Two-column layout: inputs on left, results on right -->
+                                <div class="route-step-layout">
+                                    <div class="route-inputs">
+                                        <div id="waypointsList">
+                                            <!-- Waypoints will be added here dynamically -->
+                                        </div>
+                                        
+                                        <button id="btnAddWaypoint" class="btn-secondary btn-small" style="margin-bottom: 15px;">+ Add Waypoint</button>
+                                        
+                                        <div class="form-group">
+                                            <label for="inputSearchRadius">Search Radius (km)</label>
+                                            <input type="number" id="inputSearchRadius" value="10" min="5" max="50" />
+                                        </div>
+                                        
+                                        <button id="btnGeocode" class="btn-primary">Geocode Locations</button>
+                                    </div>
+                                    
+                                    <div class="route-results">
+                                        <div id="geocodedSummary" style="display: none;" class="results-box">
+                                            <h4>Geocoded Waypoints</h4>
+                                            <div id="geocodedList"></div>
+                                            <p style="margin-top: 10px; font-size: 11px; color: #aaa;">If a location is wrong, adjust your search term in the left panel and re-geocode.</p>
+                                        </div>
+                                    </div>
+                                </div>
+                                
+                                <div class="instruction-box" id="queryInstructions" style="display: none; margin-top: 15px;">
+                                    <p><strong>Next step:</strong> Search OpenStreetMap for railway relations (lines/routes) that connect your waypoints.</p>
+                                    <p><strong>Search strategy:</strong> Creates tight bounding boxes between consecutive pairs of waypoints and queries for railway sections that connect them.</p>
+                                </div>
+                                
+                                <button id="btnQuerySections" class="btn-primary" style="display: none; margin-top: 15px;" disabled>Query OSM Sections</button>
+                            </div>
+                        </section>
 
-                    <div class="file-input-section">
-                        <label for="csvFileInput" class="btn-file-input">
-                            Select CSV Files
-                            <input type="file" id="csvFileInput" accept=".csv" multiple>
-                        </label>
-                        <div id="csvFileList" class="file-list"></div>
-                    </div>
+                        <!-- Step 2: Find Railway Routes & Generate Geometry -->
+                        <section class="workflow-panel disabled collapsed" id="panel-sections">
+                            <div class="panel-header">
+                                <span class="step-number">2</span>
+                                <h3>Generate Geometry</h3>
+                                <span class="panel-toggle">▼</span>
+                            </div>
+                            <div class="panel-content">
+                                <div class="instruction-box">
+                                    <p><strong>Select routes:</strong> Check the railway lines/routes you want to include in your network. Typically you'll want to select all sections that form your route. Uncheck any that are unrelated branches or metro lines.</p>
+                                    <p class="osm-note"><strong>Note:</strong> Geometry generation relies on OpenStreetMap queries. Due to query rate limits this process can sometimes take a few minutes.</p>
+                                </div>
+                                
+                                <div id="sectionsResults" class="results-box" style="display: none;"></div>
+                                
+                                <div class="form-group" id="spacingGroup" style="display: none; margin-top: 15px;">
+                                    <label for="inputSpacing">Point Spacing (meters)</label>
+                                    <input type="number" id="inputSpacing" value="25" min="10" max="100" />
+                                </div>
+                                <button id="btnGenerateGeometry" class="btn-primary" style="display: none; margin-top: 10px;" disabled>Confirm routes and generate geometry</button>
 
-                    <button id="btnToNetworkGE" class="btn-primary" disabled>Convert to Google Earth</button>
-                    
-                    <div class="progress-container" id="progressGE" style="display: none;">
-                        <div class="progress-bar">
-                            <div class="progress-fill" id="progressFillGE"></div>
-                        </div>
-                        <p class="progress-text" id="progressTextGE">Processing...</p>
+                                <div class="progress-container" id="progressGeometry" style="display: none; margin-top: 15px;">
+                                    <div class="progress-bar">
+                                        <div class="progress-fill" id="progressFillGeometry"></div>
+                                    </div>
+                                    <p class="progress-text" id="progressTextGeometry">Initializing...</p>
+                                </div>
+
+                            </div>
+                        </section>
+
+                        <!-- Step 3: Download Geometry -->
+                        <section class="workflow-panel disabled collapsed" id="panel-download-geometry">
+                            <div class="panel-header">
+                                <span class="step-number">3</span>
+                                <h3>Download Geometry</h3>
+                                <span class="panel-toggle">▼</span>
+                            </div>
+                            <div class="panel-content">
+                                <div id="geometryResults" class="results-box" style="display: none;"></div>
+                                <div style="display: flex; flex-direction: column; gap: 10px; margin-top: 15px;">
+                                    <button id="btnDownloadGeometryZip" class="btn-primary" disabled>Download Geometry ZIP</button>
+                                    <button id="btnDownloadGeometryKml" class="btn-primary" disabled>Generate & Download KMZ</button>
+                                    <button id="btnDownloadGeometryBoth" class="btn-primary" disabled>Download Both (ZIP + KMZ)</button>
+                                </div>
+                            </div>
+                        </section>
+
+                        <!-- Step 4: Generate Infrastructure -->
+                        <section class="workflow-panel disabled collapsed" id="panel-infrastructure">
+                            <div class="panel-header">
+                                <span class="step-number">4</span>
+                                <h3>Generate Infrastructure</h3>
+                                <span class="panel-toggle">▼</span>
+                            </div>
+                            <div class="panel-content">
+                                <div class="instruction-box">
+                                    <p>Generate Infrastructure.csv with junctions, platforms, and connections</p>
+                                </div>
+                                <div class="form-group">
+                                    <label for="inputNetworkName">Network Name</label>
+                                    <input type="text" id="inputNetworkName" placeholder="e.g., Italian Coastal Railway" />
+                                </div>
+                                <button id="btnGenerateInfrastructure" class="btn-primary" disabled>Generate Infrastructure</button>
+                                
+                                <div class="progress-container" id="progressInfrastructure" style="display: none;">
+                                    <div class="progress-bar">
+                                        <div class="progress-fill" id="progressFillInfrastructure"></div>
+                                    </div>
+                                    <p class="progress-text" id="progressTextInfrastructure">Initializing...</p>
+                                </div>
+                                
+                                <div id="infrastructureResults" class="results-box" style="display: none;"></div>
+                            </div>
+                        </section>
+
+                        <!-- Step 5: Download Infrastructure -->
+                        <section class="workflow-panel disabled collapsed" id="panel-download">
+                            <div class="panel-header">
+                                <span class="step-number">5</span>
+                                <h3>Download Infrastructure</h3>
+                                <span class="panel-toggle">▼</span>
+                            </div>
+                            <div class="panel-content">
+                                <div id="downloadSummary" class="results-box" style="display: none;"></div>
+                                <button id="btnDownloadAll" class="btn-primary" disabled>Download Infrastructure.csv</button>
+                            </div>
+                        </section>
                     </div>
                 </div>
-            </section>
-        </main>
+                </div>
+                <!-- End OSM Workflow Tab -->
+
+                <!-- Centerline Conversion Tab -->
+                <div id="tab-centerline" class="tab-content">
+                <!-- KML to Traxim Section -->
+                <section class="conversion-section">
+                    <div class="section-header">
+                        <h2>Convert Google Earth kml to Traxim Centerline csv</h2>
+                        <button id="btnToggleAdvancedCsv" class="btn-toggle">Advanced Options</button>
+                    </div>
+                    
+                    <div class="section-content">
+                        <div class="instruction-box" id="instructionsKml">
+                            <p>Use Google Earth Pro's Add Path Tool to draw an approximate centerline of the desired alignment.</p>
+                            <p>For best results, use more points to capture curves and fewer points on long straights. Limit anomalies by gradually increasing and decreasing the relative spacing between points.</p>
+                            <p>Save the alignment as a KML to a convenient local directory.</p>
+                            <p>This tool will attempt to curve fit the selected points to generate a regular 25 meter interval centerline optimised for use with Traxim.</p>
+                            <p>Actual cumulative geometric distance will be calculated and returned in the kilometrage column. This can subsequently be adjusted to match official kilometrages.</p>
+                            <p>Clicking "Convert to Traxim Centreline" will convert the selected files, and automatically download them as a zip file.</p>
+                            <p>This tool doesn't generate altitude data. We recommend https://www.gpsvisualizer.com/elevation to populate elevation.</p>
+                        </div>
+
+                        <div class="advanced-panel" id="panelAdvancedToCsv" style="display: none;">
+                            <h3>Advanced Options</h3>
+                            <div class="form-grid">
+                                <div class="form-group">
+                                    <label for="tboxMaxSpace">
+                                        Max Segment Length (m): 
+                                        <span class="help-icon" title="Maximum distance between KML points before densification. Segments longer than this will have intermediate points added to prevent spline overshoot.">ℹ</span>
+                                    </label>
+                                    <input type="number" id="tboxMaxSpace" value="800" step="1">
+                                </div>
+                                <div class="form-group">
+                                    <label for="tboxDensifySpace">
+                                        Densify Spacing (m): 
+                                        <span class="help-icon" title="Spacing between intermediate points when densifying long segments. Used to ensure the curve fitting algorithm works accurately on long gaps.">ℹ</span>
+                                    </label>
+                                    <input type="number" id="tboxDensifySpace" value="600" step="1">
+                                </div>
+                                <div class="form-group">
+                                    <label for="tboxOutMinSpace">
+                                        Output Spacing (m): 
+                                        <span class="help-icon" title="Final spacing between points in the output centerline. Smaller values create more points and larger file sizes but smoother curves.">ℹ</span>
+                                    </label>
+                                    <input type="number" id="tboxOutMinSpace" value="25" step="1">
+                                </div>
+                                <div class="form-group">
+                                    <label for="tboxSplineDetail">
+                                        Spline Detail: 
+                                        <span class="help-icon" title="Number of interpolation points per Bezier curve segment. Higher values create smoother curves but take longer to process. Default: 60">ℹ</span>
+                                    </label>
+                                    <input type="number" id="tboxSplineDetail" value="60" step="1">
+                                </div>
+                                <div class="form-group">
+                                    <label for="tboxCurveArc">
+                                        Curve Arc Length (m): 
+                                        <span class="help-icon" title="Distance over which curve radius is calculated (uses 3 points spanning this distance). Shorter lengths detect tighter curves but may be affected by noise.">ℹ</span>
+                                    </label>
+                                    <input type="number" id="tboxCurveArc" value="100" step="1">
+                                </div>
+                                <div class="form-group">
+                                    <label for="tboxCurveMin">
+                                        Straight Line Threshold (m): 
+                                        <span class="help-icon" title="Curve radius above this value is treated as straight (radius = 0). For railway design, 5000m is typically considered straight track.">ℹ</span>
+                                    </label>
+                                    <input type="number" id="tboxCurveMin" value="5000" step="1">
+                                </div>
+                                <div class="form-group">
+                                    <label>
+                                        <input type="checkbox" id="chkboxFindCurves" checked>
+                                        Calculate Curve Radius 
+                                        <span class="help-icon" title="Calculate and include curve radius in the output CSV. Useful for railway alignment design.">ℹ</span>
+                                    </label>
+                                </div>
+                            </div>
+                            <div class="button-group">
+                                <button id="btnRestoreDefaults" class="btn-secondary">Restore Defaults</button>
+                            </div>
+                        </div>
+
+                        <div class="file-input-section">
+                            <label for="kmlFileInput" class="btn-file-input">
+                                Select KML Files
+                                <input type="file" id="kmlFileInput" accept=".kml" multiple>
+                            </label>
+                            <div id="kmlFileList" class="file-list"></div>
+                        </div>
+
+                        <button id="btnKmlToTraxim" class="btn-primary" disabled>Convert to Traxim Centerline</button>
+                        
+                        <div class="progress-container" id="progressKml" style="display: none;">
+                            <div class="progress-bar">
+                                <div class="progress-fill" id="progressFillKml"></div>
+                            </div>
+                            <p class="progress-text" id="progressTextKml">Processing...</p>
+                        </div>
+                    </div>
+                </section>
+
+                <!-- CSV to Google Earth Section -->
+                <section class="conversion-section">
+                    <div class="section-header">
+                        <h2>Convert Traxim Centerline csv to Google Earth kmz</h2>
+                        <button id="btnToggleAdvancedKml" class="btn-toggle">Advanced Options</button>
+                    </div>
+                    
+                    <div class="section-content">
+                        <div class="instruction-box" id="instructionsGE">
+                            <p>Select Traxim centerline csv files to convert them to Google Earth kmz files.</p>
+                            <p>Visualising the track geometry in Google Earth provides an easy way to identify errors, and to correlate nominal kilometrages to rail network features.</p>
+                            <p>The output will be a single lines.kmz file containing all centerlines organized in folders, with normal and low-detail versions, plus kilometrage markers.</p>
+                            <p>Clicking "Convert to Google Earth" will convert the selected files, and automatically download the index.kmz as a zip file.</p>
+                            <p>This can be opened in Google Earth Pro. Just drag and drop. Please be patient: Large files may take some time to load in Google Earth.</p>
+                        </div>
+
+                        <div class="advanced-panel" id="panelAdvancedKml" style="display: none;">
+                            <h3>Advanced Options</h3>
+                            <div class="form-grid">
+                                <div class="form-group">
+                                    <label for="textBoxExaggeration">
+                                        Exaggeration: 
+                                        <span class="help-icon" title="Vertical exaggeration multiplier for altitude values. Values > 1 exaggerate terrain features. Use 1 for no exaggeration.">ℹ</span>
+                                    </label>
+                                    <input type="number" id="textBoxExaggeration" value="1" step="0.1">
+                                </div>
+                                <div class="form-group">
+                                    <label for="textBoxOffset">
+                                        Offset (m): 
+                                        <span class="help-icon" title="Vertical offset added to all altitude values. Useful for raising the centerline above the ground for better visibility.">ℹ</span>
+                                    </label>
+                                    <input type="number" id="textBoxOffset" value="3" step="0.1">
+                                </div>
+                                <div class="form-group">
+                                    <label>
+                                        Altitude Mode: 
+                                        <span class="help-icon" title="Clamp to Ground: Follows terrain surface. Absolute: Uses actual altitude values from data.">ℹ</span>
+                                    </label>
+                                    <div class="radio-group">
+                                        <label>
+                                            <input type="radio" name="altitudeMode" value="clampToGround" checked>
+                                            Clamp to Ground
+                                        </label>
+                                        <label>
+                                            <input type="radio" name="altitudeMode" value="absolute">
+                                            Absolute
+                                        </label>
+                                    </div>
+                                </div>
+                                <div class="form-group">
+                                    <label>
+                                        <input type="checkbox" id="ckboxFindColours" checked>
+                                        Find Colours 
+                                        <span class="help-icon" title="Automatically detect and apply colors from the CSV data if available.">ℹ</span>
+                                    </label>
+                                    <label>
+                                        <input type="checkbox" id="ckboxWriteColours" checked>
+                                        Write Colours 
+                                        <span class="help-icon" title="Include color information in the output KML file.">ℹ</span>
+                                    </label>
+                                </div>
+                            </div>
+                        </div>
+
+                        <div class="file-input-section">
+                            <label for="csvFileInput" class="btn-file-input">
+                                Select CSV Files
+                                <input type="file" id="csvFileInput" accept=".csv" multiple>
+                            </label>
+                            <div id="csvFileList" class="file-list"></div>
+                        </div>
+
+                        <button id="btnToNetworkGE" class="btn-primary" disabled>Convert to Google Earth</button>
+                        
+                        <div class="progress-container" id="progressGE" style="display: none;">
+                            <div class="progress-bar">
+                                <div class="progress-fill" id="progressFillGE"></div>
+                            </div>
+                            <p class="progress-text" id="progressTextGE">Processing...</p>
+                        </div>
+                    </div>
+                </section>
+                </div>
+                <!-- End Centerline Conversion Tab -->
+            </div>
+        </div>
 
         <footer>
-            <p>Web version of Traxim Centerline Tools - Ported from WinForms application</p>
+            <p>Traxim File Generator - OSM-based generation & centerline conversion tools</p>
         </footer>
     </div>
 
     <!-- External Libraries -->
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/PapaParse/5.4.1/papaparse.min.js"></script>
     
@@ -215,14 +403,23 @@
     <script src="lib/geodetic.js?v=20240224" onerror="console.error('Failed to load geodetic.js'); alert('Error: Failed to load geodetic.js');"></script>
     <script src="lib/curves.js?v=20240224" onerror="console.error('Failed to load curves.js'); alert('Error: Failed to load curves.js');"></script>
     <script src="lib/io.js?v=20240224" onerror="console.error('Failed to load io.js'); alert('Error: Failed to load io.js. This will cause IOFunctions errors.');"></script>
+    
+    <!-- Tab switching logic -->
+    <script src="tabs.js"></script>
+    
+    <!-- OSM Workflow logic -->
+    <script src="osm-workflow.js"></script>
+    
+    <!-- Centerline conversion logic -->
     <script src="app.js?v=20240224" onerror="console.error('Failed to load app.js'); alert('Error: Failed to load app.js');"></script>
+    
     <script>
         // Version tracking
-        const APP_VERSION = 'v2024.02.24-fix';
-        console.log('%c=== Traxim Centreline Tool ===', 'font-weight: bold; color: #0066cc;');
+        const APP_VERSION = 'v2024.02.24-OSM';
+        console.log('%c=== Traxim File Generator ===', 'font-weight: bold; color: #0066cc;');
         console.log('%cVersion: ' + APP_VERSION, 'color: #0066cc;');
-        console.log('%cUpdated: 2024-02-24', 'color: #0066cc;');
-        console.log('%c==============================', 'font-weight: bold; color: #0066cc;');
+        console.log('%cUpdated: 2024-02-24 + OSM', 'color: #0066cc;');
+        console.log('%c============================', 'font-weight: bold; color: #0066cc;');
         
         // Verify all required classes are loaded
         window.addEventListener('DOMContentLoaded', function() {

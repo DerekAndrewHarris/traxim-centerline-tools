@@ -1,8 +1,62 @@
-# Traxim Centerline Tools - Web Version
+# Traxim File Generator
 
-This is a web-based port of the original WinForms Traxim Centerline Tools application. It provides the same core functionality for converting between Google Earth KML files and Traxim centerline CSV files.
+**Unified web application for generating Traxim input files from OpenStreetMap data and converting between Google Earth KML and Traxim CSV formats.**
+
+## Overview
+
+This tool combines two major capabilities:
+
+1. **OSM-Based Generation** (NEW): Generate complete Traxim input files (Geometry, Infrastructure, Regions, Speedboards) from OpenStreetMap railway data
+2. **Centerline Conversion**: Convert between Google Earth KML files and Traxim centerline CSV files (original functionality preserved)
+
+The backend provides a REST API for automation (agents), while the frontend offers an interactive visual interface for human users.
+
+## Project Status
+
+### ✅ Phase 1 Complete (Backend Infrastructure)
+- Session management (temporary storage + 24hr cleanup)
+- ZIP file downloads
+- In-memory job queue
+- REST API foundation
+- Development server + integration guide
+
+### 🚧 Phase 2 In Progress (OSM Services)
+**Geography Services (Completed):**
+- ✅ IPv4-only fetch wrapper (prevents Windows IPv6 hangs)
+- ✅ Overpass API client (endpoint failover, rate limiting)
+- ✅ Place name geocoding (admin boundaries + railway stations + Nominatim fallback)
+- ✅ Railway section discovery (bidirectional deduplication, multi-bbox support)
+- ✅ Geography API routes (/geocode, /sections, /confirm)
+
+**Geometry Generation (Completed):**
+- ✅ OSM geometry fetcher (full way coordinates from Overpass)
+- ✅ Parallel track deduplication (20m threshold)
+- ✅ Way chaining via graph traversal (F→T heuristic)
+- ✅ Spline smoothing + resampling (simplified for backend)
+- ✅ Chainage computation
+- ✅ CSV writer (Traxim format)
+- ✅ Job queue integration (background processing with progress tracking)
+- ✅ Geometry API routes (POST /geometry/generate, GET /geometry/jobs/:jobId)
+- ✅ Elevation service integration (Open-Elevation API with sub-sampling and interpolation)
+
+**Infrastructure Generation (Completed):**
+- ✅ Topology adjacency graph construction
+- ✅ Junction detection (degree-based analysis)
+- ✅ Chain following through degree-2 nodes
+- ✅ F/T/D branch assignment (angle analysis for turnouts)
+- ✅ Diamond crossing handling (degree-4 nodes split into two back-to-back turnouts)
+- ✅ Spatial separation enforcement (30m minimum between connected nodes)
+- ✅ Platform node insertion
+- ✅ Reciprocal link enforcement (bidirectional connections)
+- ✅ Display position computation
+- ✅ Infrastructure API routes (POST /infrastructure/generate, GET /infrastructure/jobs/:jobId)
+
+**Next Steps:**
+- Frontend UI for OSM workflow (Leaflet map, visual panels, progress tracking)
 
 ## Features
+
+### Centerline Conversion (Original Functionality)
 
 - **KML to Traxim Centerlines**: Convert Google Earth KML path files to Traxim-compatible CSV centerline files
 - **CSV to Google Earth KMZ**: Convert Traxim centerline CSV files to Google Earth KMZ format
@@ -10,13 +64,96 @@ This is a web-based port of the original WinForms Traxim Centerline Tools applic
 - **Client-Side Processing**: All processing happens in your browser - your files never leave your machine
 - **Progress Indication**: Visual feedback during processing
 
-## Getting Started
+### OSM-Based File Generation (NEW Backend)
 
-### Quick Start
+- **Geocoding**: Convert place names to railway station coordinates
+- **OSM Section Discovery**: Find railway relations and ways in OpenStreetMap
+- **Geometry Generation**: Create centerline CSV files from OSM data with:
+  - Curve detection and radius calculation
+  - Parallel track deduplication
+  - Elevation data integration
+  - Configurable point spacing
+- **Infrastructure Generation** (Coming Soon): Generate Infrastructure.csv with junctions and platforms
+- **Additional Files** (Coming Soon): Regions.csv, Speedboards.csv
+- **REST API**: All functionality available via HTTP API for agent automation
+- **Session Management**: Temporary storage with automatic cleanup (24 hours)
+- **ZIP Downloads**: Download all generated files as a single archive
 
-1. Open `index.html` in a modern web browser (Chrome, Firefox, Edge, or Safari)
+## Quick Start
+
+### Frontend (Centerline Conversion)
+
+1. Open `index.html` in a modern web browser
 2. Select your files using the file input buttons
 3. Configure options if needed
+4. Click the conversion button
+5. Your converted files will be downloaded automatically
+
+### Backend (OSM Generation)
+
+#### Development Server
+
+```bash
+# Install dependencies
+npm install
+
+# Run development server
+npm run dev
+```
+
+Server starts on `http://localhost:3001`
+
+#### API Usage
+
+See [BACKEND_README.md](./BACKEND_README.md) for complete API documentation.
+
+**Quick example:**
+
+```bash
+# Create a session
+curl -X POST http://localhost:3001/api/file-generator/sessions
+
+# Response: {"success": true, "session": {"id": "abc-123", ...}}
+```
+
+#### Integration with Traxim Controller
+
+For production deployment, see [INTEGRATION_GUIDE.md](./INTEGRATION_GUIDE.md) for instructions on integrating the backend with your existing Traxim Controller server.
+
+## Architecture & File Structure
+
+```
+traxim-centerline-tools/
+├── Frontend (Centerline Conversion)
+│   ├── index.html              # Main UI
+│   ├── app.js                  # Frontend logic
+│   ├── styles.css              # Styling
+│   └── lib/
+│       ├── geopoint.js         # GeoPoint class
+│       ├── geodetic.js         # Geodetic calculations
+│       ├── curves.js           # Curve fitting (bug-free!)
+│       └── io.js               # File I/O utilities
+│
+├── Backend (OSM Generation API)
+│   ├── server.js               # Development server
+│   ├── routes/                 # API endpoints
+│   ├── services/               # (TODO) Business logic
+│   └── utils/                  # Helpers & utilities
+│
+└── Documentation
+    ├── README.md               # This file
+    ├── BACKEND_README.md       # Backend API docs
+    └── INTEGRATION_GUIDE.md    # Integration instructions
+```
+
+## Using VS Code Live Server (Frontend Development)
+
+1. Install the **Live Server** extension in VS Code
+2. Right-click on `index.html` and select "Open with Live Server"
+3. Your browser will open with the application
+4. Any changes you make will auto-reload
+
+## How It Works
 4. Click the conversion button
 5. Your converted files will be downloaded automatically
 
