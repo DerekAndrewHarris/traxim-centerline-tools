@@ -254,19 +254,33 @@ export async function generateGeometryForSegment(segmentLabel, segmentBbox, outp
     const truncated = (() => {
       if ((!startPoint && !endPoint) || processedPoints.length < 2) return processedPoints;
 
-      let startIdx = 0;
-      let endIdx = processedPoints.length - 1;
-
+      // Find closest chain indices for each waypoint
+      let closestStart = 0, closestEnd = processedPoints.length - 1;
       if (startPoint) {
-        // Find the index closest to startPoint
-        let minD = Infinity, closest = 0;
+        let minD = Infinity;
         for (let i = 0; i < processedPoints.length; i++) {
           const d = distanceMetres(startPoint.lat, startPoint.lon, processedPoints[i].latitude, processedPoints[i].longitude);
-          if (d < minD) { minD = d; closest = i; }
+          if (d < minD) { minD = d; closestStart = i; }
         }
-        // Walk backward from closest until we've gone >= TRUNCATE_OVERSHOOT_M
+      }
+      if (endPoint) {
+        let minD = Infinity;
+        for (let i = 0; i < processedPoints.length; i++) {
+          const d = distanceMetres(endPoint.lat, endPoint.lon, processedPoints[i].latitude, processedPoints[i].longitude);
+          if (d < minD) { minD = d; closestEnd = i; }
+        }
+      }
+
+      // Determine which waypoint appears first in the chain.  The "low" end
+      // overshoots toward index 0 and the "high" end toward the last index,
+      // regardless of which is "start" vs "end".
+      const lowIdx = Math.min(closestStart, closestEnd);
+      const highIdx = Math.max(closestStart, closestEnd);
+
+      // Walk the low end backward (toward index 0) for overshoot
+      let startIdx = lowIdx;
+      {
         let walked = 0;
-        startIdx = closest;
         while (startIdx > 0) {
           walked += distanceMetres(
             processedPoints[startIdx].latitude, processedPoints[startIdx].longitude,
@@ -277,14 +291,10 @@ export async function generateGeometryForSegment(segmentLabel, segmentBbox, outp
         }
       }
 
-      if (endPoint) {
-        let minD = Infinity, closest = processedPoints.length - 1;
-        for (let i = 0; i < processedPoints.length; i++) {
-          const d = distanceMetres(endPoint.lat, endPoint.lon, processedPoints[i].latitude, processedPoints[i].longitude);
-          if (d < minD) { minD = d; closest = i; }
-        }
+      // Walk the high end forward (toward last index) for overshoot
+      let endIdx = highIdx;
+      {
         let walked = 0;
-        endIdx = closest;
         while (endIdx < processedPoints.length - 1) {
           walked += distanceMetres(
             processedPoints[endIdx].latitude, processedPoints[endIdx].longitude,
@@ -295,9 +305,8 @@ export async function generateGeometryForSegment(segmentLabel, segmentBbox, outp
         }
       }
 
-      if (startIdx > endIdx) return processedPoints; // sanity guard
       const slice = processedPoints.slice(startIdx, endIdx + 1);
-      console.log(`[Geometry Generator] Truncated: kept [${startIdx}..${endIdx}] of ${processedPoints.length} points`);
+      console.log(`[Geometry Generator] Truncated: kept [${startIdx}..${endIdx}] of ${processedPoints.length} (closest waypoints at ${lowIdx}, ${highIdx})`);
       return slice;
     })();
 

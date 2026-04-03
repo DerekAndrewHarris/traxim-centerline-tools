@@ -186,7 +186,7 @@ async function findNearbyStations(centerLat, centerLon, radiusDeg = 0.1) {
   `;
   
   try {
-    const data = await overpassFetch(query, 30, 1);
+    const data = await overpassFetch(query, 30, 2);
     const stations = [];
     
     for (const element of data.elements || []) {

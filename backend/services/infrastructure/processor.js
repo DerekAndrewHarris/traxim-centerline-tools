@@ -319,10 +319,14 @@ function determineBranch(nodeKey, nodeConns, arrivedViaWayId, waysById, nodeKm, 
   }
 
   if (degree >= 3) {
-    // Turnout - angle-based branch identification.
-    // Step 1: Find the most opposite pair (most negative dot product ≈ 180°
-    //         apart).  These form the through route: F and T.
-    //         The remaining way is D (diverging).
+    // Turnout - branch identification.
+    // Primary signal: OSM way continuity.  After splitting at intermediate
+    // junctions, two segments of the same original way share a base ID
+    // (e.g. "1117308999_0" and "1117308999_2").  These are definitively the
+    // through pair (F-T); the odd one out is D.
+    // Fallback: angle-based analysis (most-opposite dot product) when no
+    // shared base way ID exists.
+
     const dirs = nodeConns.map(c => {
       if (c._isSynthetic && c.otherKey) {
         const { lat: la1, lon: lo1 } = parseCoordKey(nodeKey);
@@ -337,14 +341,36 @@ function determineBranch(nodeKey, nodeConns, arrivedViaWayId, waysById, nodeKm, 
         ...computeWayDirection(nodeKey, c.wayId, waysById)
       };
     });
-    let minDot = Infinity, ftIdx1 = 0, ftIdx2 = 1;
-    for (let i = 0; i < dirs.length; i++) {
-      for (let j = i + 1; j < dirs.length; j++) {
-        const dot = dirs[i].dlat * dirs[j].dlat + dirs[i].dlon * dirs[j].dlon;
-        if (dot < minDot) {
-          minDot = dot;
-          ftIdx1 = i;
-          ftIdx2 = j;
+
+    // --- Way-continuity through-pair detection ---
+    // Extract base way ID by stripping the _N split suffix
+    const baseId = (id) => id.replace(/_\d+$/, '');
+    let ftIdx1 = -1, ftIdx2 = -1;
+
+    if (degree === 3) {
+      const bases = dirs.map(d => baseId(d.wayId));
+      for (let i = 0; i < 3; i++) {
+        for (let j = i + 1; j < 3; j++) {
+          if (bases[i] === bases[j]) {
+            ftIdx1 = i;
+            ftIdx2 = j;
+          }
+        }
+      }
+    }
+
+    // --- Fallback: angle-based through-pair detection ---
+    if (ftIdx1 < 0) {
+      let minDot = Infinity;
+      ftIdx1 = 0; ftIdx2 = 1;
+      for (let i = 0; i < dirs.length; i++) {
+        for (let j = i + 1; j < dirs.length; j++) {
+          const dot = dirs[i].dlat * dirs[j].dlat + dirs[i].dlon * dirs[j].dlon;
+          if (dot < minDot) {
+            minDot = dot;
+            ftIdx1 = i;
+            ftIdx2 = j;
+          }
         }
       }
     }

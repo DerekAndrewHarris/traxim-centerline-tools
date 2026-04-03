@@ -696,8 +696,6 @@ export function detectAlternativeRoutes(allWayIds, wayGeometry, mainChainWayIds,
 
   console.log(`[Alt Routes] ${excludedWayIds.length} excluded ways, ${divergingWayIds.length} diverging (>50m from main)`);
 
-  // (debug tracing removed)
-
   // Build connectivity graph for excluded ways
   const excludedEndpointIndex = buildEndpointIndex(excludedWayIds, wayGeometry);
 
@@ -1037,13 +1035,12 @@ function buildAlternativeCenterline(
 
   const maxSteps = totalWays + 10;
   let steps = 0;
-  let _fwdExitReason = 'maxSteps';
 
   while (steps++ < maxSteps) {
     const tailDist = minDistanceToLineMeters(chain[chain.length - 1], mainCenterlineCoords);
     maxDeviation = Math.max(maxDeviation, tailDist);
 
-    if (tailDist < convergenceThreshold) { _fwdExitReason = `converged tailDist=${tailDist.toFixed(1)}m`; reconverged = true; break; }
+    if (tailDist < convergenceThreshold) { reconverged = true; break; }
     if (tailDist > maxAllowedDeviation) return null;
 
     const connectedIds = endpointIndex.get(tailKey) ?? new Set();
@@ -1094,14 +1091,12 @@ function buildAlternativeCenterline(
           console.log(`[Alt Chain] Stopped: chain doubled back after gap bridge to way ${bestGapWay}`);
           chain.length = preLen;
           visited.delete(bestGapWay);
-          _fwdExitReason = `gapBridgeDoubleBack way=${bestGapWay}`;
           break;
         }
         tailKey = coordKey(chain[chain.length - 1]);
         incomingDir = directionFromChainTail(chain);
         continue;
       }
-      _fwdExitReason = `noMoreCandidates tailKey=${tailKey}`;
       break;
     }
 
@@ -1126,7 +1121,7 @@ function buildAlternativeCenterline(
           dlon: chain[chain.length-1].lon - chain[chain.length-5].lon }
       : incomingDir;
     const nextWayId = chooseThroughWay(filtered, tailKey, altDir, wayGeometry, true);
-    if (nextWayId === null) { _fwdExitReason = `chooseThroughWay=null tailKey=${tailKey} cands=${filtered.join(',')}`; break; }
+    if (nextWayId === null) break;
 
     const pts = wayGeometry.get(nextWayId);
     if (!pts || pts.length < 2) { visited.add(nextWayId); break; }
@@ -1140,21 +1135,10 @@ function buildAlternativeCenterline(
       console.log(`[Alt Chain] Stopped: chain doubled back after adding way ${nextWayId}`);
       chain.length = preLen;
       visited.delete(nextWayId);
-      _fwdExitReason = `chainDoubleBack way=${nextWayId}`;
       break;
     }
     tailKey = coordKey(chain[chain.length - 1]);
     incomingDir = directionFromChainTail(chain);
-  }
-
-  // Log forward exit reason for chains near S20 area
-  {
-    const _tail = chain[chain.length - 1];
-    const _head = chain[0];
-    if ((_tail && Math.abs(_tail.lat - 43.605) < 0.03) || (_head && Math.abs(_head.lat - 43.605) < 0.03)) {
-      const tailDist = minDistanceToLineMeters(chain[chain.length - 1], mainCenterlineCoords);
-      console.log(`[DBG FWD EXIT] startWay=${startWayId} exit=${_fwdExitReason} chainLen=${chain.length} tailLat=${_tail.lat.toFixed(7)} tailDist=${tailDist.toFixed(1)}m reconverged=${reconverged} visited=[${[...visited].join(',')}]`);
-    }
   }
 
   // Forward traversal complete. Now extend backward from the head of the chain
@@ -1203,7 +1187,9 @@ function buildAlternativeCenterline(
       }
       if (bestGapWay) {
         const gapPts = wayGeometry.get(bestGapWay);
-        const ordered = bestGapForward ? gapPts : [...gapPts].reverse();
+        // For backward prepend the shared (near-head) endpoint must be LAST
+        // so slice(0,-1) drops it.  This is opposite to the forward gap bridge.
+        const ordered = bestGapForward ? [...gapPts].reverse() : gapPts;
         console.log(`[Alt Gap Bridge BWD] Jumped ${(bestGapDist * 111000).toFixed(1)}m to way ${bestGapWay}`);
         chain = [...ordered.slice(0, -1), ...chain];
         visited.add(bestGapWay);

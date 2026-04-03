@@ -4,7 +4,7 @@
  */
 
 // API Configuration
-const API_BASE = 'http://localhost:3001/api/file-generator';
+const API_BASE = '/api/file-generator';
 const POLL_INTERVAL = 2000; // 2 seconds
 
 // State Management

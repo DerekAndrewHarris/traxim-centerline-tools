@@ -32,7 +32,6 @@ import {
   determineBranch,
   nearestKm,
   projectOntoGeometry,
-  applySpatialSeparation,
   enforceReciprocalLinks
 } from './processor.js';
 
@@ -230,7 +229,9 @@ async function fetchRailwayTopologyFromOverpass(bbox) {
  */
 function ensureKmSeparation(nodes, geometryBySection) {
   const minKmSpacing = MIN_NODE_SPACING_M / 1000;
+  const EPS = 1e-9;  // floating-point tolerance for km comparisons
   const nodeByName = new Map(nodes.map(n => [n.name, n]));
+  const arms = [['fNode','fOnBranch'], ['tNode','tOnBranch'], ['dNode','dOnBranch']];
 
   // Helpers to read/write km for any geometry slot on a node
   function getKmOnGeo(node, geo) {
@@ -251,54 +252,126 @@ function ensureKmSeparation(nodes, geometryBySection) {
     return geos;
   }
 
+  // Geometry bounds cache
+  const geoBounds = new Map();
+  function getBounds(geo) {
+    if (geoBounds.has(geo)) return geoBounds.get(geo);
+    const pts = geometryBySection.get(geo);
+    const bounds = (pts && pts.length > 0)
+      ? { min: Math.min(...pts.map(p => p.km)), max: Math.max(...pts.map(p => p.km)) }
+      : { min: -Infinity, max: Infinity };
+    geoBounds.set(geo, bounds);
+    return bounds;
+  }
+
+  // Recursive: after pushing `pushedNode` on `geo`, check whether it now
+  // violates the spacing constraint with any of its OTHER connected nodes
+  // and propagate the push outward.  `visited` prevents infinite loops.
+  // `pushDir` (+1 or -1) is the inherited direction — neighbours are always
+  // pushed further in this direction so that chains stay monotonic.
+  function propagate(pushedNode, geo, visited, pushDir) {
+    const pushedKm = getKmOnGeo(pushedNode, geo);
+    if (pushedKm == null) return;
+
+    for (const [armField] of arms) {
+      const otherName = pushedNode[armField];
+      if (!otherName) continue;
+      const other = nodeByName.get(otherName);
+      if (!other || visited.has(other.name)) continue;
+
+      const otherKm = getKmOnGeo(other, geo);
+      if (otherKm == null) continue;
+
+      const diff = Math.abs(pushedKm - otherKm);
+      if (diff >= minKmSpacing - EPS) continue;
+
+      // Push `other` in the inherited direction so that chains remain
+      // monotonic — the current km ordering may be unreliable for nodes
+      // that started at nearly identical positions.
+      const { min: gMin, max: gMax } = getBounds(geo);
+      const dir = pushDir;
+      let newOtherKm = pushedKm + dir * minKmSpacing;
+      // Round in the push direction so quantisation doesn't shrink the gap
+      newOtherKm = dir > 0
+        ? Math.ceil(newOtherKm * 1000) / 1000
+        : Math.floor(newOtherKm * 1000) / 1000;
+      // Clamp to geometry bounds
+      newOtherKm = Math.max(gMin, Math.min(gMax, newOtherKm));
+
+      setKmOnGeo(other, geo, newOtherKm);
+      visited.add(pushedNode.name);
+      propagate(other, geo, visited, pushDir);
+    }
+  }
+
+  // Outer loop: scan all connected pairs; when a violation is found, push
+  // the pair apart symmetrically and recursively propagate both sides.
   for (let iter = 0; iter < 10; iter++) {
     let changed = false;
     for (const node of nodes) {
-      for (const [armField, branchField] of [['fNode','fOnBranch'], ['tNode','tOnBranch'], ['dNode','dOnBranch']]) {
+      for (const [armField] of arms) {
         const targetName = node[armField];
         if (!targetName) continue;
         const target = nodeByName.get(targetName);
         if (!target) continue;
 
-        // Skip degree-4 F-to-F partner pairs — they share km intentionally
-        if (armField === 'fNode' && node[branchField] === 'F') continue;
-
-        // Check ALL shared geometries between the two nodes
         const sharedGeos = getGeos(node).filter(g => getGeos(target).includes(g));
         for (const geo of sharedGeos) {
           const nKm = getKmOnGeo(node, geo);
           const tKm = getKmOnGeo(target, geo);
           if (nKm == null || tKm == null) continue;
+          if (Math.abs(nKm - tKm) >= minKmSpacing - EPS) continue;
 
-          const kmDiff = Math.abs(nKm - tKm);
-          if (kmDiff < minKmSpacing) {
-            const midKm = (nKm + tKm) / 2;
+          const midKm = (nKm + tKm) / 2;
+          const { min: gMin, max: gMax } = getBounds(geo);
 
-            // Determine which geometry range is valid
-            const geomPts = geometryBySection.get(geo);
-            let minGeomKm = -Infinity, maxGeomKm = Infinity;
-            if (geomPts && geomPts.length > 0) {
-              minGeomKm = Math.min(...geomPts.map(p => p.km));
-              maxGeomKm = Math.max(...geomPts.map(p => p.km));
+          let kmLow  = midKm - minKmSpacing / 2;
+          let kmHigh = midKm + minKmSpacing / 2;
+          if (kmLow < gMin)  { kmLow = gMin;  kmHigh = kmLow + minKmSpacing; }
+          if (kmHigh > gMax) { kmHigh = gMax;  kmLow = kmHigh - minKmSpacing; }
+
+          // Round outward so quantisation preserves the gap
+          kmLow  = Math.floor(kmLow * 1000) / 1000;
+          kmHigh = Math.ceil(kmHigh * 1000) / 1000;
+
+          // Determine which node should be lo (lower km) and which hi.
+          // When both nodes are very close, current km ordering may not
+          // reflect the physical track direction.  Use each node's OTHER
+          // neighbours as context: the node whose wider neighbourhood has
+          // higher average km should become the hi node.
+          let loNode, hiNode;
+          {
+            let ctxN = 0, ctxNc = 0, ctxT = 0, ctxTc = 0;
+            for (const [af] of arms) {
+              const nn = node[af];
+              if (nn && nn !== targetName) {
+                const nb = nodeByName.get(nn);
+                if (nb) { const k = getKmOnGeo(nb, geo); if (k != null) { ctxN += k; ctxNc++; } }
+              }
+              const tn = target[af];
+              if (tn && tn !== node.name) {
+                const nb = nodeByName.get(tn);
+                if (nb) { const k = getKmOnGeo(nb, geo); if (k != null) { ctxT += k; ctxTc++; } }
+              }
             }
-
-            let kmA = midKm - minKmSpacing / 2;
-            let kmB = midKm + minKmSpacing / 2;
-
-            // Clamp to geometry bounds
-            if (kmA < minGeomKm) { kmA = minGeomKm; kmB = kmA + minKmSpacing; }
-            if (kmB > maxGeomKm) { kmB = maxGeomKm; kmA = kmB - minKmSpacing; }
-
-            // Assign so the lower-km node keeps the lower value
-            if (nKm <= tKm) {
-              setKmOnGeo(node, geo, +kmA.toFixed(3));
-              setKmOnGeo(target, geo, +kmB.toFixed(3));
+            const avgN = ctxNc > 0 ? ctxN / ctxNc : null;
+            const avgT = ctxTc > 0 ? ctxT / ctxTc : null;
+            if (avgN != null && avgT != null && Math.abs(avgN - avgT) > EPS) {
+              // Node with higher-km neighbourhood becomes hi
+              [loNode, hiNode] = avgN > avgT ? [target, node] : [node, target];
             } else {
-              setKmOnGeo(node, geo, +kmB.toFixed(3));
-              setKmOnGeo(target, geo, +kmA.toFixed(3));
+              [loNode, hiNode] = nKm <= tKm ? [node, target] : [target, node];
             }
-            changed = true;
           }
+          setKmOnGeo(loNode, geo, kmLow);
+          setKmOnGeo(hiNode, geo, kmHigh);
+          changed = true;
+
+          // Recursively fix any neighbours that loNode / hiNode now violate
+          const visitedLo = new Set([hiNode.name]);
+          propagate(loNode, geo, visitedLo, -1);
+          const visitedHi = new Set([loNode.name]);
+          propagate(hiNode, geo, visitedHi, 1);
         }
       }
     }
@@ -576,21 +649,35 @@ async function generateInfrastructureForSections(confirmedSections, networkName,
         // the target to the partner sub-node so the through-route connects
         // same-side nodes across both crossings.
         const refWayId = conns[bestPairing[0][0]].wayId;
-        const connsA = [
-          { ...conns[bestPairing[0][1]], _deg4Branch: 'T' },
-          { ...conns[bestPairing[1][0]], _deg4Branch: 'D' }
-        ];
-        const connsB = [
-          { ...conns[bestPairing[0][0]], _deg4Branch: 'T' },
-          { ...conns[bestPairing[1][1]], _deg4Branch: 'D' }
-        ];
 
-        // Spatially separate by ±15m
+        // Compute ref way direction — needed for both D-way alignment
+        // and spatial offset.  Node A is offset in the NEGATIVE direction
+        // and Node B in the POSITIVE direction of this vector.
         const { dlat: dirLat, dlon: dirLon } = computeWayDirection(coordKey, refWayId, waysById);
         const dirMag = Math.sqrt(dirLat * dirLat + dirLon * dirLon) || 1;
         const normDLat = dirLat / dirMag;
         const normDLon = dirLon / dirMag;
 
+        // Assign D-ways to sub-nodes by spatial alignment.
+        // The D-way whose direction dot-products more negatively with the
+        // ref direction goes to Node A (negative-offset side); the other
+        // goes to Node B (positive-offset side).
+        const dIdx0 = bestPairing[1][0], dIdx1 = bestPairing[1][1];
+        const dDot0 = dirs[dIdx0].dlat * normDLat + dirs[dIdx0].dlon * normDLon;
+        const dDot1 = dirs[dIdx1].dlat * normDLat + dirs[dIdx1].dlon * normDLon;
+        const dConnA = dDot0 <= dDot1 ? conns[dIdx0] : conns[dIdx1];
+        const dConnB = dDot0 <= dDot1 ? conns[dIdx1] : conns[dIdx0];
+
+        const connsA = [
+          { ...conns[bestPairing[0][1]], _deg4Branch: 'T' },
+          { ...dConnA, _deg4Branch: 'D' }
+        ];
+        const connsB = [
+          { ...conns[bestPairing[0][0]], _deg4Branch: 'T' },
+          { ...dConnB, _deg4Branch: 'D' }
+        ];
+
+        // Spatially separate by ±15m
         const offsetM = 15;
         const offsetDegLat = offsetM / 111000;
         const offsetDegLon = (offsetM / 111000) / Math.cos(lat * Math.PI / 180);
@@ -675,6 +762,58 @@ async function generateInfrastructureForSections(confirmedSections, networkName,
       if (!realKeyToNodes.has(realKey)) realKeyToNodes.set(realKey, []);
       const arr = Array.isArray(entry) ? entry : [entry];
       realKeyToNodes.get(realKey).push(...arr);
+    }
+  }
+
+  // ── Step 7b: Filter topology nodes outside the corridor bounding box ──
+  // The Overpass query expands the bbox by a margin to capture ways that
+  // straddle the boundary.  This can pull in junction nodes that sit outside
+  // the actual corridor, creating spurious loops (e.g. balloon loops at the
+  // bbox edge).  Removing them here means the chains terminate at the
+  // boundary and Step 8e's boundary-node logic creates truncation points.
+  // The bbox comes from confirmedSections[].corridorBbox in session.json —
+  // the same source the UI draws as the orange dashed rectangle (mainline
+  // geometry + 200 m buffer, computed by the geometry pipeline).
+  {
+    let bMinLat, bMinLon, bMaxLat, bMaxLon;
+    let bboxSource;
+    if (sessionPath) {
+      try {
+        const sessionMeta = JSON.parse(fs.readFileSync(path.join(sessionPath, 'session.json'), 'utf-8'));
+        const cbs = (sessionMeta.confirmedSections || [])
+          .map(s => s.corridorBbox).filter(Boolean);
+        if (cbs.length > 0) {
+          bMinLat = Math.min(...cbs.map(b => b.minLat));
+          bMinLon = Math.min(...cbs.map(b => b.minLon));
+          bMaxLat = Math.max(...cbs.map(b => b.maxLat));
+          bMaxLon = Math.max(...cbs.map(b => b.maxLon));
+          bboxSource = 'corridorBbox';
+        }
+      } catch { /* session.json read failure — fall through */ }
+    }
+    if (bboxSource) {
+      let filteredCount = 0;
+      for (const [key, entries] of [...realKeyToNodes]) {
+        const { lat, lon } = parseCoordKey(key);
+        if (lat < bMinLat || lat > bMaxLat || lon < bMinLon || lon > bMaxLon) {
+          realKeyToNodes.delete(key);
+          // Remove associated nodes from the nodes array
+          const nodeList = Array.isArray(entries) ? entries : [entries];
+          const namesToRemove = new Set(nodeList.map(n => n.name));
+          for (let i = nodes.length - 1; i >= 0; i--) {
+            if (namesToRemove.has(nodes[i].name)) nodes.splice(i, 1);
+          }
+          // Remove from topoNodesBySection (both real key and _deg4B variant)
+          for (const [, sectionTopoNodes] of topoNodesBySection) {
+            sectionTopoNodes.delete(key);
+            sectionTopoNodes.delete(key + '_deg4B');
+          }
+          filteredCount += nodeList.length;
+        }
+      }
+      if (filteredCount > 0) {
+        warnings.push(`Filtered ${filteredCount} topology node(s) outside the corridor bounding box.`);
+      }
     }
   }
 
@@ -767,7 +906,9 @@ async function generateInfrastructureForSections(confirmedSections, networkName,
           // (for km / display) remains as set in Step 6.
           let farNode = candidates.find(c => c !== node && c.region === sectionName)
                      ?? candidates.find(c => c !== node);
-          if (!farNode) continue;
+          if (!farNode) {
+            continue;
+          }
 
           // For degree-4 targets, pick the specific sub-node that owns the
           // arriving way.  Without this, candidates.find() picks the first
@@ -831,6 +972,7 @@ async function generateInfrastructureForSections(confirmedSections, networkName,
             node[branchField] = farBranch;
           }
         }
+
       }
     }
   }
@@ -1026,7 +1168,7 @@ async function generateInfrastructureForSections(confirmedSections, networkName,
       if (!node.tNode && !node.dNode) continue; // completely unconnected — orphan pass handles it
 
       // Skip real turnouts — their branch labels are geometry-derived and correct
-      const topoDegreeC = node._topoConns?.length ?? 0;
+      const topoDegreeC = (node._topoConns?.length ?? 0) + (node._degree4Partner ? 1 : 0);
       if (topoDegreeC > 2) continue;
 
       // Determine what to swap into F
@@ -1076,7 +1218,7 @@ async function generateInfrastructureForSections(confirmedSections, networkName,
     for (const node of nodes) {
       // Skip partial turnouts: if the topology gives this node 3+ arms,
       // it is a real junction even if only 2 currently chain to a node.
-      const topoDegree = node._topoConns?.length ?? 0;
+      const topoDegree = (node._topoConns?.length ?? 0) + (node._degree4Partner ? 1 : 0);
       if (topoDegree > 2) continue;
 
       const hasFNode = !!node.fNode;
@@ -1137,27 +1279,121 @@ async function generateInfrastructureForSections(confirmedSections, networkName,
     }
   }
 
-  updateProgress(70, 'Applying spatial separation');
+  // ── Step 8e: Create boundary nodes for chains exiting the network ──
+  // When a turnout (degree ≥ 3) has an empty arm because the chain off that
+  // arm runs beyond the bounded area without meeting another topo node, create
+  // an artificial end-node at the chain's terminal coordinate.  This makes the
+  // boundary visible in the infrastructure rather than leaving it as a silent
+  // empty arm.  Boundary nodes are degree-1 end-nodes connected only via F.
+  {
+    let boundaryCount = 0;
+    const nodesByName = new Map(nodes.map(n => [n.name, n]));
 
-  // ── Step 9: Spatial separation ──
-  const separationCount = applySpatialSeparation(nodes, warnings);
-
-  // Recalculate km values after spatial separation — nodes that were pushed
-  // apart now have different coordinates but still carry the old shared km.
-  if (separationCount > 0) {
     for (const node of nodes) {
-      const geomPts = geometryBySection.get(node.region);
-      if (geomPts && geomPts.length > 0) {
-        node.km = +nearestKm({ lat: node.lat, lon: node.lon }, geomPts).toFixed(3);
+      const rawKey = node._topoKey;
+      if (!rawKey) continue;
+      const realKey = rawKey.endsWith('_deg4B') ? rawKey.slice(0, -6) : rawKey;
+      const conns = node._topoConns ?? adj.get(realKey) ?? [];
+      const topoDegree = conns.length + (node._degree4Partner ? 1 : 0);
+      if (topoDegree < 3) continue;
+      if (node.fNode && node.tNode && node.dNode) continue;
+
+      for (const conn of conns) {
+        if (node.fNode && node.tNode && node.dNode) break;
+
+        const result = followChainToNode(realKey, conn.wayId, waysById, adj, allTopoNodeKeys);
+        if (!result) {
+          continue;
+        }
+
+        const { reachedKey, arrivedViaWayId } = result;
+        const candidates = realKeyToNodes.get(reachedKey) ?? [];
+
+        // If there IS a topo node at the end, this way is already handled
+        // by Step 8 — skip it.
+        if (candidates.length > 0) continue;
+
+        // This chain exits the network boundary.  Determine which arm of
+        // the source node this way belongs to.
+        let sourceConns = conns;
+        if (node._degree4Partner) {
+          const partner = node._degree4Partner;
+          sourceConns = [...conns, {
+            wayId: `_synthetic_partner_${node.name}`,
+            otherKey: `${partner.lat},${partner.lon}`,
+            _isSynthetic: true
+          }];
+        }
+
+        let sourceBranch;
+        if (node._degree4Partner) {
+          const taggedConn = conns.find(c => c.wayId === conn.wayId);
+          sourceBranch = taggedConn?._deg4Branch ?? null;
+        } else {
+          sourceBranch = determineBranch(
+            realKey, sourceConns, conn.wayId, waysById, node.km, null
+          );
+        }
+        if (!sourceBranch) continue;
+
+        // Only create boundary node if this arm is still empty
+        const nodeField = sourceBranch === 'F' ? 'fNode' : sourceBranch === 'T' ? 'tNode' : 'dNode';
+        if (node[nodeField]) {
+          continue;
+        }
+
+        // Create boundary node at the chain's terminal coordinate
+        const { lat: bLat, lon: bLon } = parseCoordKey(reachedKey);
+        const geomPts = geometryBySection.get(node.region);
+        const bKm = geomPts ? +nearestKm({ lat: bLat, lon: bLon }, geomPts).toFixed(3) : node.km;
+
+        // Generate unique name
+        const bBaseName = `${node.region} Boundary`;
+        let bName = bBaseName;
+        let bIdx = 0;
+        while (nodesByName.has(bName)) {
+          bName = `${bBaseName} ${String.fromCharCode(65 + bIdx++)}`;
+        }
+
+        const boundaryNode = {
+          name: bName,
+          lat: bLat, lon: bLon, km: bKm,
+          region: node.region,
+          railwayType: 'buffer_stop',
+          fNode: node.name,
+          fOnBranch: sourceBranch,
+        };
+        nodes.push(boundaryNode);
+        nodesByName.set(bName, boundaryNode);
+
+        // Wire the source node's empty arm to the boundary node's F
+        const branchField = sourceBranch === 'F' ? 'fOnBranch' : sourceBranch === 'T' ? 'tOnBranch' : 'dOnBranch';
+        node[nodeField] = bName;
+        node[branchField] = 'F';
+
+        boundaryCount++;
       }
     }
-    // Ensure connected pairs have km values ≥ MIN_NODE_SPACING_M apart
-    ensureKmSeparation(nodes, geometryBySection);
+    if (boundaryCount > 0) {
+      warnings.push(`Boundary nodes: created ${boundaryCount} artificial end-node(s) where chains exit the network boundary.`);
+    }
   }
 
-  updateProgress(75, 'Fetching platform nodes');
+  updateProgress(70, 'Applying spatial separation');
 
-  // ── Step 10: Fetch and insert platform nodes ──
+  // ── Step 9: Spatial separation (disabled) ──
+  // Lat/lon positions are no longer moved.  The minimum 30 m spacing
+  // requirement applies to kilometrage, not physical coordinates.
+  // ensureKmSeparation (called after Step 11) handles the km rule.
+
+  // ── Step 10: Platform nodes — DISABLED ──
+  // Platform fetching and insertion is disabled pending a future enhancement.
+  // Proper implementation requires geo-matching platforms to track links and
+  // link-splitting.  The Overpass query and insertion loop are preserved in
+  // source but skipped at runtime to save time.
+  // To re-enable: remove the `if (false)` guard below.
+  if (false) {
+  updateProgress(75, 'Fetching platform nodes');
   let platforms = [];
   if (bbox) {
     const cacheFile = sessionPath ? path.join(sessionPath, 'osm_platforms.json') : null;
@@ -1176,50 +1412,9 @@ async function generateInfrastructureForSections(confirmedSections, networkName,
       }
     }
   }
-
-  // Insert platforms (simplified - just add as adjacent nodes for now)
-  const nodeByName = new Map(nodes.map(n => [n.name, n]));
-  for (const platform of platforms) {
-    const { centLat, centLon, name, id } = platform;
-
-    // Find nearest node
-    let bestNode = null, bestDistSq = Infinity;
-    for (const node of nodes) {
-      if (!node._topoKey) continue;
-      const dSq = (node.lat - centLat) ** 2 + (node.lon - centLon) ** 2;
-      if (dSq < bestDistSq) {
-        bestDistSq = dSq;
-        bestNode = node;
-      }
-    }
-
-    // Only insert if within 500m
-    if (!bestNode || bestDistSq > (500 / 111320) ** 2) continue;
-
-    const sectionName = bestNode.region;
-    const geomPoints = geometryBySection.get(sectionName) ?? [];
-    const km = nearestKm({ lat: centLat, lon: centLon }, geomPoints);
-
-    // Ensure unique name
-    let platName = name;
-    let idx = 0;
-    while (nodes.some(n => n.name === platName)) {
-      platName = `${name} ${String.fromCharCode(65 + idx++)}`;
-    }
-
-    // Add as adjacent node (simplified - full link splitting would be more complex)
-    nodes.push({
-      name: platName,
-      lat: centLat,
-      lon: centLon,
-      km,
-      region: sectionName,
-      railwayType: 'platform'
-    });
-  }
+  } // end disabled Step 10
 
   updateProgress(80, 'Enforcing reciprocal links');
-
   // ── Step 11: Enforce reciprocal links ──
   enforceReciprocalLinks(nodes, warnings);
 
@@ -1245,20 +1440,8 @@ async function generateInfrastructureForSections(confirmedSections, networkName,
     }
   }
 
-  // ── Final spatial separation pass ──
-  // Run again after all connections (reciprocal enforcement,
-  // cross-section) are finalized so that newly-connected pairs are also pushed
-  // apart to the required minimum spacing.
-  const finalSepCount = applySpatialSeparation(nodes, []);
-  if (finalSepCount > 0) {
-    for (const node of nodes) {
-      const geomPts = geometryBySection.get(node.region);
-      if (geomPts && geomPts.length > 0) {
-        node.km = +nearestKm({ lat: node.lat, lon: node.lon }, geomPts).toFixed(3);
-      }
-    }
-    warnings.push(`Final spatial separation: pushed apart ${finalSepCount} additional close pair(s).`);
-  }
+  // ── Final spatial separation pass (disabled) ──
+  // See Step 9 comment — lat/lon positions are no longer moved.
 
   // Clamp all km values to geometry bounds — prevents negative values from
   // extrapolation and keeps values within the geometry's defined range.
@@ -1414,13 +1597,9 @@ async function generateInfrastructureForSections(confirmedSections, networkName,
   }
 
   updateProgress(85, 'Computing display positions');
-
   // ── Step 12: Clean up internal annotations ──
-  for (const node of nodes) {
-    delete node._topoKey;
-    delete node._topoConns;
-    delete node._degree4Partner;
-  }
+  // Note: _topoKey, _topoConns, _degree4Partner are cleaned up AFTER Step 14
+  // (flip calculation) which needs them.  Only general annotations removed here.
 
   updateProgress(87, 'Applying station-based naming');
 
@@ -1536,7 +1715,6 @@ async function generateInfrastructureForSections(confirmedSections, networkName,
       warnings.push(`Naming pass: renamed ${renameMap.size} of ${nodes.length} nodes to nearest-station convention`);
     }
   }
-
   // ── Step 14: Compute display positions and turnout flip ──
   //   posX/posY   = position of the node's centerline projection on the canvas
   //   offsetX/offsetY = residual from centerline to actual geographic position
@@ -1547,7 +1725,11 @@ async function generateInfrastructureForSections(confirmedSections, networkName,
     const maxLat = Math.max(...allLats);
     const minLon = Math.min(...allLons);
     const maxLon = Math.max(...allLons);
-    const scale = 4000 / Math.max(maxLat - minLat, maxLon - minLon, 0.001);
+    // Constant geographic scale: calibrated so ~0.15° extent (Livorno-Pisa)
+    // produces ~40,000 canvas units, allowing the Network Editor to open at
+    // default zoom (10) instead of requiring 100. Larger areas get proportionally
+    // larger canvases, maintaining consistent node-to-canvas ratio.
+    const scale = 250000;
 
     const nodeByName = new Map(nodes.map(n => [n.name, n]));
     for (const node of nodes) {
@@ -1570,33 +1752,135 @@ async function generateInfrastructureForSections(confirmedSections, networkName,
 
       // Turnout flip: determine whether the diverge is left or right when
       // looking along the through route from the node toward T.
-      // Cross product of (node→T direction) × (node→D direction):
-      //   positive → D diverges to the left  → flip = false (Network Editor convention)
-      //   negative → D diverges to the right → flip = true
-      if (node.dNode) {
-        const dNeighbour = nodeByName.get(node.dNode);
-        if (dNeighbour) {
-          // Through direction: prefer node→T; fall back to node→F when T is empty
-          let throughNeighbour;
-          if (node.tNode) throughNeighbour = nodeByName.get(node.tNode);
-          if (!throughNeighbour && node.fNode) throughNeighbour = nodeByName.get(node.fNode);
+      // Uses the OSM way geometry tangent at the junction (from _topoConns)
+      // rather than neighbour node positions, which may be far away on a
+      // curve or nearly collinear with D.
+      if (node.dNode && node._topoKey && node._topoConns && node._topoConns.length === 3) {
+        const dirs = node._topoConns.map(c => ({
+          wayId: c.wayId,
+          ...computeWayDirection(node._topoKey, c.wayId, waysById)
+        }));
 
-          if (throughNeighbour) {
-            const throughLat = throughNeighbour.lat - node.lat;
-            const throughLon = throughNeighbour.lon - node.lon;
-            const divLat = dNeighbour.lat - node.lat;
-            const divLon = dNeighbour.lon - node.lon;
-            const cross = throughLon * divLat - throughLat * divLon;
-            node.flip = cross < 0;
+        // Identify through pair (F-T) vs diverge (D) — same logic as determineBranch
+        const baseId = (id) => id.replace(/_\d+$/, '');
+        let ftIdx1 = -1, ftIdx2 = -1;
+        const bases = dirs.map(d => baseId(d.wayId));
+        for (let i = 0; i < 3; i++) {
+          for (let j = i + 1; j < 3; j++) {
+            if (bases[i] === bases[j]) { ftIdx1 = i; ftIdx2 = j; }
           }
+        }
+        if (ftIdx1 < 0) {
+          // Angle fallback: most-opposite pair is through
+          let minDot = Infinity;
+          for (let i = 0; i < 3; i++) {
+            for (let j = i + 1; j < 3; j++) {
+              const dot = dirs[i].dlat * dirs[j].dlat + dirs[i].dlon * dirs[j].dlon;
+              if (dot < minDot) { minDot = dot; ftIdx1 = i; ftIdx2 = j; }
+            }
+          }
+        }
+        const dIdx = [0, 1, 2].find(k => k !== ftIdx1 && k !== ftIdx2) ?? 0;
+
+        // T is the through-pair member closer in angle to D
+        const dot1 = dirs[ftIdx1].dlat * dirs[dIdx].dlat + dirs[ftIdx1].dlon * dirs[dIdx].dlon;
+        const dot2 = dirs[ftIdx2].dlat * dirs[dIdx].dlat + dirs[ftIdx2].dlon * dirs[dIdx].dlon;
+        const tIdx = dot1 > dot2 ? ftIdx1 : ftIdx2;
+
+        // Cross product of T-direction × D-direction:
+        //   positive → D diverges left  → flip = false
+        //   negative → D diverges right → flip = true
+        const cross = dirs[tIdx].dlon * dirs[dIdx].dlat - dirs[tIdx].dlat * dirs[dIdx].dlon;
+        node.flip = cross < 0;
+      } else if (node.dNode && node._topoKey && node._topoConns && node._topoConns.length === 2
+                 && node._topoConns.every(c => c._deg4Branch)) {
+        // Degree-4 diamond crossing sub-node: _topoConns has exactly T and D,
+        // tagged with _deg4Branch.  Use the real (un-suffixed) topology key
+        // for way direction lookup.
+        const realKey = node._topoKey.endsWith('_deg4B')
+          ? node._topoKey.slice(0, -6)
+          : node._topoKey;
+        const tConn = node._topoConns.find(c => c._deg4Branch === 'T');
+        const dConn = node._topoConns.find(c => c._deg4Branch === 'D');
+        if (tConn && dConn) {
+          const tDir = computeWayDirection(realKey, tConn.wayId, waysById);
+          const dDir = computeWayDirection(realKey, dConn.wayId, waysById);
+          const cross = tDir.dlon * dDir.dlat - tDir.dlat * dDir.dlon;
+          node.flip = cross < 0;
         }
       }
     }
 
+    // ── Auto-rotate nodes based on F/T connections ──
+    // Mirrors the C# AutoRotateNodes algorithm from NetworkEditor.Shared.
+    // Uses distance-weighted average of ideal rotations from F and T neighbours.
+    for (const node of nodes) {
+      const centerX = parseFloat(node.posX) + parseFloat(node.offsetX);
+      const centerY = parseFloat(node.posY) + parseFloat(node.offsetY);
+
+      const fTarget = node.fNode ? nodeByName.get(node.fNode) : null;
+      const tTarget = node.tNode ? nodeByName.get(node.tNode) : null;
+
+      if (!fTarget && !tTarget) continue;
+
+      let rotation;
+
+      if (fTarget && tTarget) {
+        const fCX = parseFloat(fTarget.posX) + parseFloat(fTarget.offsetX);
+        const fCY = parseFloat(fTarget.posY) + parseFloat(fTarget.offsetY);
+        const tCX = parseFloat(tTarget.posX) + parseFloat(tTarget.offsetX);
+        const tCY = parseFloat(tTarget.posY) + parseFloat(tTarget.offsetY);
+
+        const dxF = fCX - centerX, dyF = fCY - centerY;
+        const dxT = tCX - centerX, dyT = tCY - centerY;
+        const distF = Math.sqrt(dxF * dxF + dyF * dyF);
+        const distT = Math.sqrt(dxT * dxT + dyT * dyT);
+
+        if (distF < 1 && distT < 1) continue;
+
+        let angleToF = ((Math.atan2(dyF, dxF) * 180 / Math.PI) % 360 + 360) % 360;
+        let angleToT = ((Math.atan2(dyT, dxT) * 180 / Math.PI) % 360 + 360) % 360;
+
+        // F points away (backward), T points toward (forward)
+        let idF = ((angleToF + 180) % 360 + 360) % 360;
+        let idT = angleToT;
+
+        const totalDist = distF + distT;
+        const wF = distF / totalDist;
+        let diff = idT - idF;
+        if (diff > 180) diff -= 360;
+        if (diff < -180) diff += 360;
+        rotation = idF + diff * wF;
+      } else if (fTarget) {
+        const fCX = parseFloat(fTarget.posX) + parseFloat(fTarget.offsetX);
+        const fCY = parseFloat(fTarget.posY) + parseFloat(fTarget.offsetY);
+        const dxF = fCX - centerX, dyF = fCY - centerY;
+        const angleToF = Math.atan2(dyF, dxF) * 180 / Math.PI;
+        rotation = angleToF + 180;
+      } else {
+        const tCX = parseFloat(tTarget.posX) + parseFloat(tTarget.offsetX);
+        const tCY = parseFloat(tTarget.posY) + parseFloat(tTarget.offsetY);
+        const dxT = tCX - centerX, dyT = tCY - centerY;
+        rotation = Math.atan2(dyT, dxT) * 180 / Math.PI;
+      }
+
+      // Normalize to 0-360, round to nearest 5°
+      rotation = ((rotation % 360) + 360) % 360;
+      rotation = Math.round(rotation / 5) * 5;
+      rotation = ((rotation % 360) + 360) % 360;
+      node.rotation = rotation;
+    }
 
   }
 
   updateProgress(90, 'Validating connections');
+
+  // ── Clean up internal annotations (deferred from Step 12) ──
+  for (const node of nodes) {
+    delete node._topoKey;
+    delete node._topoConns;
+    delete node._degree4Partner;
+  }
 
   // ── Step 15: Branch-conflict and link-mismatch validation ──
   // Matches MCP Step 8: validates the single-connection-per-branch principle.
@@ -1845,7 +2129,7 @@ function buildInfrastructureCsv(nodes, networkName) {
         node.posY ?? '0',
         '40',
         '20',
-        '0',
+        node.rotation ?? 0,
         node.flip ? 'True' : 'False',
         'False',
         'True',
