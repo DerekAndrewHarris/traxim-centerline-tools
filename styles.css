@@ -284,6 +284,30 @@ button:disabled {
     opacity: 0.65;
 }
 
+/* Busy/working state — overrides the disabled "not-allowed" cursor so a
+   long-running action (an OSM query that can take minutes) doesn't look
+   like a dead button. */
+.btn-primary:disabled.btn-loading {
+    cursor: wait;
+    opacity: 0.85;
+}
+
+.btn-spinner {
+    display: inline-block;
+    width: 12px;
+    height: 12px;
+    margin-right: 7px;
+    vertical-align: -2px;
+    border: 2px solid rgba(255, 255, 255, 0.35);
+    border-top-color: #fff;
+    border-radius: 50%;
+    animation: btn-spinner-spin 0.7s linear infinite;
+}
+
+@keyframes btn-spinner-spin {
+    to { transform: rotate(360deg); }
+}
+
 .btn-secondary {
     background: #555;
     color: white;
@@ -673,7 +697,7 @@ footer {
 }
 
 .legend-marker.geometry {
-    background: #ff9800;
+    background: #ff1493;
 }
 
 .legend-marker.alt-route {
@@ -685,7 +709,11 @@ footer {
 }
 
 .legend-marker.corridor-buffer {
-    background: #4caf50;
+    background: #3f51b5;
+}
+
+.legend-marker.pinned {
+    background: #00bcd4;
 }
 
 /* ============================================
@@ -1102,12 +1130,106 @@ footer {
     margin-bottom: 0;
 }
 
-.waypoint-item input[type="text"] {
-    width: 100%;
+.waypoint-item.pinned {
+    background: rgba(0, 188, 212, 0.08);
+    border-left: 2px solid #00bcd4;
+    padding-left: 8px;
+    border-radius: 3px;
+}
+
+.waypoint-status {
+    font-size: 12px;
+    color: #888;
+}
+
+.waypoint-item.pinned .waypoint-status {
+    color: #00bcd4;
+}
+
+.btn-pin {
+    background: rgba(0, 0, 0, 0.4);
+    color: #ccc;
+    border: 1px solid rgba(255, 255, 255, 0.15);
+    cursor: pointer;
+    border-radius: 3px;
+    flex-shrink: 0;
+}
+
+.btn-pin:hover {
+    border-color: #00bcd4;
+    color: #00bcd4;
+}
+
+.btn-pin.active {
+    background: #00bcd4;
+    color: #fff;
+    border-color: #00bcd4;
+}
+
+.btn-pin.pinned {
+    background: rgba(0, 188, 212, 0.2);
+    color: #00bcd4;
+    border-color: #00bcd4;
 }
 
 #waypointsList {
     margin-bottom: 12px;
+}
+
+/* ============================================
+   Map Click-to-Pick
+   ============================================ */
+.map.picking {
+    cursor: crosshair;
+}
+
+.map-pick-banner {
+    position: absolute;
+    top: 15px;
+    left: 50%;
+    transform: translateX(-50%);
+    z-index: 1100;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    background: rgba(0, 188, 212, 0.95);
+    color: #06262b;
+    padding: 8px 14px;
+    border-radius: 4px;
+    font-size: 13px;
+    font-weight: 600;
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.4);
+}
+
+.map-pick-banner button {
+    padding: 4px 10px;
+    font-size: 11px;
+    font-weight: 600;
+    background: rgba(0, 0, 0, 0.2);
+    color: #fff;
+    border: none;
+    border-radius: 3px;
+    cursor: pointer;
+}
+
+.map-pick-banner button:hover {
+    background: rgba(0, 0, 0, 0.35);
+}
+
+.waypoint-pin-marker {
+    width: 24px;
+    height: 24px;
+    background: #00bcd4;
+    border: 2px solid #fff;
+    border-radius: 50%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: #06262b;
+    font-weight: 700;
+    font-size: 12px;
+    box-shadow: 0 1px 4px rgba(0, 0, 0, 0.5);
+    cursor: grab;
 }
 
 /* ============================================

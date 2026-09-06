@@ -56,7 +56,8 @@ export function normaliseRouteName(name) {
  *   ref: string,
  *   wayIds: Array<string>,
  *   segmentIndices: Array<number>,
- *   altOsmId?: string
+ *   altOsmId?: string,
+ *   geometry: Array<Array<[number, number]>>
  * }>>}
  */
 export async function queryRailwaySections(bboxes) {
@@ -111,9 +112,9 @@ export async function queryRailwaySections(bboxes) {
     if (el.type === 'relation') relations.push(el);
     else if (el.type === 'way') ways.push(el);
   }
-  
+
   console.log(`[Railway Sections] Found ${relations.length} relations, ${ways.length} ways`);
-  
+
   // Build section candidates map (for deduplication)
   const sectionMap = new Map(); // normalized name → section data
   
@@ -144,6 +145,8 @@ export async function queryRailwaySections(bboxes) {
       ref: rel.tags?.ref || '',
       wayIds,
       segmentIndices
+      // geometry is attached below, after dedup, via a dedicated fetch —
+      // see "Fetch preview geometry" near the end of this function.
     };
     
     // Bidirectional deduplication
@@ -204,7 +207,76 @@ export async function queryRailwaySections(bboxes) {
   
   const sections = Array.from(sectionMap.values());
   console.log(`[Railway Sections] Returning ${sections.length} candidate sections (after deduplication)`);
-  
+
+  // ── Fetch preview geometry for the final section list ──────────────────────
+  // Deliberately a separate pass, using only the wayIds already settled on
+  // above, rather than reusing tags from the discovery query. The discovery
+  // query strips tags from recursed-down ways (`out skel qt;`) — switching it
+  // to `out geom qt;` to get geometry inline was tried and reverted, because it
+  // also un-stripped tags, which reactivated the "standalone named way"
+  // fallback below for essentially every individually-named tunnel/viaduct/track
+  // in the corridor (Italian rail mapping names each one), flooding the
+  // candidate list with ~150 bogus entries. Fetching geometry separately, by ID,
+  // keeps section discovery untouched and only adds the map-preview lines.
+  // Chunk boundaries are aligned to section boundaries — a chunk never mixes
+  // ways from two different sections unless one section alone exceeds CHUNK
+  // (unavoidable then). Overpass is often unstable enough that some chunks
+  // fail outright; with boundary-aligned chunks, a failure means "this section
+  // has no preview line" rather than "this section has a partial, broken one"
+  // (confirmed live: flat chunking split a section's ways across a chunk
+  // boundary, and when one of the two chunks failed, that section rendered
+  // with only some of its ways).
+  const CHUNK = 500;
+  const wayIdChunks = [];
+  const seenWayIds = new Set(); // a way can appear in >1 section (e.g. shared track); fetch it once
+  let currentChunk = [];
+
+  for (const section of sections) {
+    const newWayIds = section.wayIds.filter(wid => !seenWayIds.has(wid));
+    newWayIds.forEach(wid => seenWayIds.add(wid));
+    if (newWayIds.length === 0) continue;
+
+    if (currentChunk.length > 0 && currentChunk.length + newWayIds.length > CHUNK) {
+      wayIdChunks.push(currentChunk);
+      currentChunk = [];
+    }
+
+    if (newWayIds.length > CHUNK) {
+      // This one section alone exceeds the chunk size — split internally,
+      // but still never merged with a neighboring section's ways.
+      for (let i = 0; i < newWayIds.length; i += CHUNK) {
+        wayIdChunks.push(newWayIds.slice(i, i + CHUNK));
+      }
+    } else {
+      currentChunk.push(...newWayIds);
+    }
+  }
+  if (currentChunk.length > 0) wayIdChunks.push(currentChunk);
+
+  if (wayIdChunks.length > 0) {
+    const wayGeometry = new Map();
+    for (let i = 0; i < wayIdChunks.length; i++) {
+      const chunk = wayIdChunks[i];
+      try {
+        const geomData = await overpassFetch(`way(id:${chunk.join(',')});\nout geom;`, 30, 2);
+        for (const el of (geomData.elements ?? [])) {
+          if (el.type === 'way' && Array.isArray(el.geometry) && el.geometry.length >= 2) {
+            wayGeometry.set(String(el.id), el.geometry.map(pt => [pt.lat, pt.lon]));
+          }
+        }
+      } catch (e) {
+        console.warn(`[Railway Sections] Preview geometry chunk ${i + 1}/${wayIdChunks.length} failed: ${e.message}`);
+        // Non-fatal — affected sections just render without a map preview line.
+      }
+    }
+
+    for (const section of sections) {
+      section.geometry = section.wayIds.map(wid => wayGeometry.get(wid)).filter(Boolean);
+    }
+  } else {
+    for (const section of sections) section.geometry = [];
+  }
+
   return { sections, failedBboxCount, totalBboxCount: bboxes.length };
 }
 

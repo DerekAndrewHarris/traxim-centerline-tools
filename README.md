@@ -20,13 +20,15 @@ The backend provides a REST API for automation (agents), while the frontend offe
 - REST API foundation
 - Development server + integration guide
 
-### 🚧 Phase 2 In Progress (OSM Services)
+### ✅ Phase 2 Complete (OSM Services + Frontend)
 **Geography Services (Completed):**
 - ✅ IPv4-only fetch wrapper (prevents Windows IPv6 hangs)
 - ✅ Overpass API client (endpoint failover, rate limiting)
-- ✅ Place name geocoding (admin boundaries + railway stations + Nominatim fallback)
+- ✅ Click-to-place waypoints (primary route-definition mechanism — see Frontend below)
+- ✅ Reverse geocoding for waypoint display names (single Nominatim call per pin, structured-address field priority, never blocks the workflow)
+- ✅ Place name geocoding (admin boundaries + railway stations + Nominatim fallback) — retained as a backend API (`/geocode`) but no longer used by the frontend; proved unreliable enough (wrong-place matches, Overpass rate-limit cascades) that click-to-place replaced it as the supported path. See `OSM_DATA_LOADING_PROCESS.md` for details.
 - ✅ Railway section discovery (bidirectional deduplication, multi-bbox support)
-- ✅ Geography API routes (/geocode, /sections, /confirm)
+- ✅ Geography API routes (/geocode, /reverse-geocode, /sections, /confirm)
 
 **Geometry Generation (Completed):**
 - ✅ OSM geometry fetcher (full way coordinates from Overpass)
@@ -51,8 +53,14 @@ The backend provides a REST API for automation (agents), while the frontend offe
 - ✅ Display position computation
 - ✅ Infrastructure API routes (POST /infrastructure/generate, GET /infrastructure/jobs/:jobId)
 
+**Frontend UI (Completed):**
+- ✅ Leaflet map with click-to-place waypoints (drag to fine-tune, click again to re-place)
+- ✅ Search bounding boxes drawn as soon as waypoints are resolved, before the OSM section query runs
+- ✅ Busy-state indicators (spinner + "wait" cursor) on long-running actions, since Overpass queries can take minutes
+- ✅ Visual section selection, progress tracking for geometry/infrastructure jobs, map overlays
+
 **Next Steps:**
-- Frontend UI for OSM workflow (Leaflet map, visual panels, progress tracking)
+- Additional input files: Regions.csv, Speedboards.csv
 
 ## Features
 
@@ -64,16 +72,16 @@ The backend provides a REST API for automation (agents), while the frontend offe
 - **Client-Side Processing**: All processing happens in your browser - your files never leave your machine
 - **Progress Indication**: Visual feedback during processing
 
-### OSM-Based File Generation (NEW Backend)
+### OSM-Based File Generation
 
-- **Geocoding**: Convert place names to railway station coordinates
+- **Click-to-Place Waypoints**: Define a route by clicking the map; each pin is reverse-geocoded to a display name (e.g. "Sestri Levante") but the coordinate itself is exact and never depends on a name search succeeding
 - **OSM Section Discovery**: Find railway relations and ways in OpenStreetMap
 - **Geometry Generation**: Create centerline CSV files from OSM data with:
   - Curve detection and radius calculation
   - Parallel track deduplication
   - Elevation data integration
   - Configurable point spacing
-- **Infrastructure Generation** (Coming Soon): Generate Infrastructure.csv with junctions and platforms
+- **Infrastructure Generation**: Generate Infrastructure.csv with junctions, platforms, and F/T/D branch connections
 - **Additional Files** (Coming Soon): Regions.csv, Speedboards.csv
 - **REST API**: All functionality available via HTTP API for agent automation
 - **Session Management**: Temporary storage with automatic cleanup (24 hours)

@@ -306,6 +306,53 @@ async function findPlaceViaNominatim(placeName) {
 }
 
 /**
+ * Reverse-geocode a coordinate to a short, human-friendly place label.
+ * Used to name waypoints placed by clicking the map, where we already have
+ * the exact coordinate and just want a display name for it — not a place
+ * search, so this never touches Overpass and only makes a single Nominatim
+ * call, with a single fast attempt (best-effort: a slow/failed lookup should
+ * never block the caller, which falls back to a generic label instead).
+ *
+ * Uses Nominatim's structured `address` fields rather than splitting
+ * `display_name`, since the free-text string's component order/count shifts
+ * depending on what was hit (a street address inserts road/house-number at
+ * the front; a rural point skips straight to hamlet/county) — the address
+ * object lets us pick "the settlement" regardless of what the exact point
+ * landed on.
+ *
+ * @param {number} lat
+ * @param {number} lon
+ * @returns {Promise<{label: string, displayName: string}|null>}
+ */
+export async function reverseGeocodePlace(lat, lon) {
+  const url = `https://nominatim.openstreetmap.org/reverse?` +
+    `lat=${lat}&lon=${lon}&format=json&addressdetails=1`;
+
+  try {
+    const res = await ipv4Fetch(url, {
+      headers: { 'User-Agent': 'TraximFileGenerator/1.0 (traximrail.com)' },
+      socketTimeout: 7000
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+
+    const data = await res.json();
+    const addr = data.address || {};
+
+    const label = addr.town || addr.city || addr.village || addr.hamlet ||
+      addr.suburb || addr.municipality || addr.county ||
+      (data.display_name ? data.display_name.split(',')[0].trim() : null);
+
+    if (!label) return null;
+
+    console.log(`[Geocoding] Reverse geocoded (${lat}, ${lon}) -> "${label}"`);
+    return { label, displayName: data.display_name || label };
+  } catch (e) {
+    console.warn(`[Geocoding] Reverse geocode failed for (${lat}, ${lon}): ${e.message}`);
+    return null;
+  }
+}
+
+/**
  * Geocode a place name to coordinates
  * 
  * Strategy 1 (fast): Nominatim → smallest bbox result → admin_centre via direct ID → nearby station

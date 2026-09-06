@@ -31,7 +31,11 @@ import {
   chainWaysViaGraph,
   splitWaysAtIntermediateJunctions,
   detectAlternativeRoutes,
-  calculateRouteLengthMeters
+  calculateRouteLengthMeters,
+  buildCumulativeDistances,
+  extractTaggedIntervals,
+  mapPointsToChainage,
+  applyPortalElevationInterpolation
 } from './processor.js';
 import { fetchElevations } from '../elevation.js';
 import path from 'path';
@@ -54,9 +58,15 @@ import { promises as fs } from 'fs';
  * @param {Array<{osmId: string, osmType: string, name: string, altOsmId?: string}>} [sections] - Confirmed sections covering this segment (for relation-based queries)
  * @param {Map<string, string[]>} [relationWayIdCache] - Pre-fetched relation→wayIds cache shared across all segments
  * @param {string} [sessionPath] - Session directory path; if provided, writes osm_topology.json for infrastructure reuse
- * @returns {Promise<{filePath: string, pointCount: number, lengthKm: number, alternativeCount: number, alternativeFiles: string[], warnings: string[]}>}
+ * @param {Array<{lat: number, lon: number}[]>} [priorCenterlines] - Raw (untruncated) centerlines of
+ *   already-generated segments in this route, in order. Segments are generated one at a time (see
+ *   routes/geometry.js), so a later segment's alt-route detection has no way to know what an earlier
+ *   segment's confirmed line looks like unless it's passed in explicitly — without this, a candidate
+ *   that's actually just the previous segment's own mainline (walked backward past the shared waypoint)
+ *   reads as "far from my own centerline" and gets accepted as a bogus alt route.
+ * @returns {Promise<{filePath: string, pointCount: number, lengthKm: number, alternativeCount: number, alternativeFiles: string[], warnings: string[], rawCoords: {lat: number, lon: number}[]}>}
  */
-export async function generateGeometryForSegment(segmentLabel, segmentBbox, outputDir, spacingMetres = 25, startPoint = null, endPoint = null, progressCallback = null, sections = null, relationWayIdCache = null, sessionPath = null) {
+export async function generateGeometryForSegment(segmentLabel, segmentBbox, outputDir, spacingMetres = 25, startPoint = null, endPoint = null, progressCallback = null, sections = null, relationWayIdCache = null, sessionPath = null, priorCenterlines = []) {
   const warnings = [];
   const safeName = segmentLabel.replace(/[^a-zA-Z0-9_\-]/g, '_');
 
@@ -89,20 +99,21 @@ export async function generateGeometryForSegment(segmentLabel, segmentBbox, outp
     // ── 1b. Fetch tagged junction nodes + split ways (15-20%) ─────────────────
     if (progressCallback) progressCallback(15, 'Fetching junction nodes...');
 
-    let splitWayIds, splitWayGeometry, splitWayNodes;
+    let splitWayIds, splitWayGeometry, splitWayNodes, splitWayTags;
     let taggedNodes = [];
     try {
       taggedNodes = await fetchRailwayTaggedNodes(segmentBbox);
       console.log(`[Geometry Generator] Fetched ${taggedNodes.length} tagged junction nodes`);
 
-      ({ splitWayIds, splitWayGeometry, splitWayNodes } =
-        splitWaysAtIntermediateJunctions(wayIds, wayGeometry, wayNodes, taggedNodes));
+      ({ splitWayIds, splitWayGeometry, splitWayNodes, splitWayTags } =
+        splitWaysAtIntermediateJunctions(wayIds, wayGeometry, wayNodes, taggedNodes, wayTags));
       console.log(`[Geometry Generator] After junction splitting: ${wayIds.length} → ${splitWayIds.length} ways`);
     } catch (junctionErr) {
       console.warn(`[Geometry Generator] Junction splitting failed, proceeding with unsplit ways: ${junctionErr.message}`);
       splitWayIds = wayIds;
       splitWayGeometry = wayGeometry;
       splitWayNodes = wayNodes;
+      splitWayTags = wayTags;
     }
     if (progressCallback) progressCallback(20, `Split to ${splitWayIds.length} way segments`);
 
@@ -139,7 +150,7 @@ export async function generateGeometryForSegment(segmentLabel, segmentBbox, outp
     // ── 5. Chain ways via graph traversal (30-45%) ────────────────────────────
     if (progressCallback) progressCallback(30, 'Building centreline path...');
 
-    const { coords: rawCoords, visitedIds: mainChainWayIds } = chainWaysViaGraph(
+    const { coords: rawCoords, visitedIds: mainChainWayIds, coordWayIds: rawCoordWayIds } = chainWaysViaGraph(
       dedupedWayIds, splitWayGeometry, warnings, startPoint, endPoint
     );
 
@@ -150,6 +161,17 @@ export async function generateGeometryForSegment(segmentLabel, segmentBbox, outp
     }
 
     console.log(`[Geometry Generator] Chained ${rawCoords.length} coordinates from ${mainChainWayIds.size} ways`);
+
+    // Record tunnel/bridge sections as distance-along-track intervals, while
+    // points are still 1:1 with source ways (spline-smoothing below destroys
+    // that correspondence). See processor.js's "Tunnel/Bridge Elevation
+    // Correction" section for why this is needed and how it's applied.
+    const rawChainageM = buildCumulativeDistances(rawCoords);
+    const tunnelIntervals = extractTaggedIntervals(rawCoordWayIds, rawChainageM, splitWayTags, 'tunnel');
+    const bridgeIntervals = extractTaggedIntervals(rawCoordWayIds, rawChainageM, splitWayTags, 'bridge');
+    if (tunnelIntervals.length > 0 || bridgeIntervals.length > 0) {
+      console.log(`[Geometry Generator] Found ${tunnelIntervals.length} tunnel section(s), ${bridgeIntervals.length} bridge section(s) for elevation correction`);
+    }
     if (progressCallback) progressCallback(40, `Chained ${rawCoords.length} points`);
 
     // ── 5b. Prune overflow main-chain ways ────────────────────────────────────────
@@ -158,10 +180,17 @@ export async function generateGeometryForSegment(segmentLabel, segmentBbox, outp
     // alt-route candidate pool. This prevents pre-start overflow ways (e.g. a tunnel
     // approach the chain traverses before reaching the startPoint station) from being
     // permanently marked as mainline and invisible to alt-route detection.
-    // Also clip the centerline reference used by alt-route distance checks.
+    //
+    // Alt-route divergence is deliberately measured against the FULL, untruncated
+    // rawCoords below (not a clipped window around [startPoint, endPoint]) — a
+    // released overflow way is, by definition, part of that raw chain (the
+    // traversal already walked it), so it correctly measures as ~0m from it and
+    // gets rejected as "not actually diverging". Using a clipped reference here
+    // previously made "the same track, just continuing past this segment's
+    // waypoint toward the next one" look like a divergent alt route once it fell
+    // outside the clipped window (2026-08-23; see below for the case this fixed).
     const TRUNCATE_OVERSHOOT_M = 1000;
     let prunedMainChainWayIds = mainChainWayIds;
-    let altDetectionCoords = rawCoords;
 
     if ((startPoint || endPoint) && rawCoords.length >= 2) {
       let rawStartIdx = 0, rawEndIdx = rawCoords.length - 1;
@@ -197,7 +226,6 @@ export async function generateGeometryForSegment(segmentLabel, segmentBbox, outp
       }
 
       if (rawStartIdx < rawEndIdx) {
-        altDetectionCoords = rawCoords.slice(rawStartIdx, rawEndIdx + 1);
         prunedMainChainWayIds = new Set(mainChainWayIds);
         for (const wid of mainChainWayIds) {
           const pts = splitWayGeometry.get(wid);
@@ -221,9 +249,18 @@ export async function generateGeometryForSegment(segmentLabel, segmentBbox, outp
     // ── 5c. Alternative route detection (45-50%) ──────────────────────────────────
     if (progressCallback) progressCallback(45, 'Detecting alternative routes...');
 
-    // Use full splitWayIds (not dedupedWayIds) so alternatives can choose between parallel options
+    // Use full splitWayIds (not dedupedWayIds) so alternatives can choose between parallel options.
+    // The divergence reference is this segment's own full, untruncated chain (see the note on
+    // prunedMainChainWayIds above for why it must not be clipped to the output window) PLUS every
+    // already-generated prior segment's own raw chain, concatenated on — otherwise a candidate that
+    // walks backward past the shared waypoint into an earlier segment's territory reads as "far from
+    // my own centerline" (it is) without ever being checked against the line it's actually
+    // duplicating. Concatenating introduces a short "phantom" segment between each pair of adjacent
+    // centerlines' endpoints, but adjacent segments already end near the same shared waypoint, so
+    // that phantom segment is short and low-risk in practice.
+    const knownCenterlineCoords = [...priorCenterlines.flat(), ...rawCoords];
     const alternativeRoutes = detectAlternativeRoutes(
-      splitWayIds, splitWayGeometry, prunedMainChainWayIds, altDetectionCoords, segmentBbox
+      splitWayIds, splitWayGeometry, prunedMainChainWayIds, knownCenterlineCoords
     );
 
     if (alternativeRoutes.length > 0) {
@@ -326,6 +363,16 @@ export async function generateGeometryForSegment(segmentLabel, segmentBbox, outp
       const elevResults = await fetchElevations(elevPts, (pct, msg) => {
         if (progressCallback) progressCallback(60 + Math.round(pct * 0.1), msg);
       });
+
+      // Ground-surface DEM data is wrong inside tunnels/on bridges — override
+      // with a straight-line interpolation between portal elevations for any
+      // point falling in a tunnel/bridge interval (see processor.js).
+      if (tunnelIntervals.length > 0 || bridgeIntervals.length > 0) {
+        const finalChainageM = mapPointsToChainage(elevPts, rawCoords, rawChainageM);
+        applyPortalElevationInterpolation(elevResults, finalChainageM, tunnelIntervals);
+        applyPortalElevationInterpolation(elevResults, finalChainageM, bridgeIntervals);
+      }
+
       for (let i = 0; i < finalPoints.length; i++) {
         finalPoints[i].altitude = elevResults[i].elevation;
       }
@@ -533,7 +580,11 @@ export async function generateGeometryForSegment(segmentLabel, segmentBbox, outp
       warnings,
       infraTopology,
       corridorBbox,
-      bufferPolygon
+      bufferPolygon,
+      // For the caller to accumulate into priorCenterlines for subsequent segments'
+      // alt-route detection (see the priorCenterlines param doc above). Not meant for
+      // the client-facing job result — strip it out before it's included there.
+      rawCoords
     };
 
   } catch (error) {

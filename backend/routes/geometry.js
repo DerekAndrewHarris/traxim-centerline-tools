@@ -105,16 +105,21 @@ router.post('/generate', asyncHandler(async (req, res) => {
         ? await prefetchRelationWayIds(allSections)
         : null;
 
-      // Process each segment (pair of adjacent places)
+      // Process each segment (pair of adjacent places). Segments are generated in
+      // route order, one at a time — priorCenterlines accumulates each completed
+      // segment's own raw chain so later segments' alt-route detection can recognise
+      // "this candidate is just an earlier segment's mainline, walked backward past
+      // our shared waypoint" (see priorCenterlines doc in generator.js).
+      const priorCenterlines = [];
       for (let i = 0; i < segments.length; i++) {
         const segment = segments[i];
-        
+
         const segProgress = Math.floor((i / segments.length) * 100);
         await updateProgress(
           segProgress,
           `Processing segment ${i + 1}/${segments.length}: ${segment.label}`
         );
-        
+
         try {
           const result = await generateGeometryForSegment(
             segment.label,
@@ -129,14 +134,20 @@ router.post('/generate', asyncHandler(async (req, res) => {
             },
             segment.sections,
             relationWayIdCache,
-            session.path
+            session.path,
+            priorCenterlines
           );
-          
+
+          // rawCoords is only for the next segments' alt-route detection — keep it
+          // out of the client-facing job result (it can be thousands of points).
+          const { rawCoords, ...publicResult } = result;
+          if (rawCoords) priorCenterlines.push(rawCoords);
+
           results.push({
             section: segment.label,
-            ...result
+            ...publicResult
           });
-          
+
         } catch (error) {
           console.error(`[Geometry API] Failed to generate geometry for segment '${segment.label}':`, error.message);
           results.push({

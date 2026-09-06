@@ -44,10 +44,15 @@
                     <!-- Map Container (Left Side) -->
                     <div class="map-container">
                         <div id="map" class="map"></div>
+                        <div id="mapPickBanner" class="map-pick-banner" style="display: none;">
+                            <span id="mapPickBannerText">Click the map to place this waypoint</span>
+                            <button id="btnCancelPick">Cancel</button>
+                        </div>
                         <div class="map-controls">
                             <button id="btnClearMap" class="btn-map-control">Clear Map</button>
                             <div class="map-legend">
-                                <div class="legend-item"><span class="legend-marker geocoded"></span> Geocoded Points</div>
+                                <div class="legend-item"><span class="legend-marker pinned"></span> Pinned Waypoints</div>
+                                <div class="legend-item"><span class="legend-marker geocoded"></span> Resolved Waypoints</div>
                                 <div class="legend-item"><span class="legend-marker section"></span> Search Bboxes / Corridors</div>
                                 <div class="legend-item"><span class="legend-marker geometry"></span> Generated Geometry</div>
                                 <div class="legend-item"><span class="legend-marker alt-route"></span> Alternative Routes</div>
@@ -73,41 +78,37 @@
                             </div>
                             <div class="panel-content">
                                 <div class="instruction-box">
-                                    <p>Add waypoints along your route (minimum 2 locations). Each waypoint creates a focused search area.</p>
+                                    <p>Waypoints define a bounding box within which a search is done for all rail lines (defined as "relations" in OpenStreetMap). The optimum distance between waypoints is therefore context specific. Use a minimal number of waypoints, but select locations to filter out irrelevant rail lines as best as possible. Further filtering is possible at step 2, but good waypoint selection at step 1 minimises effort.</p>
+                                    <p>The bounding box does not need to fully enclose your target rail line — provided the line passes through the box at some point it will return the OSM relation.</p>
+                                    <p>Click <strong>📍</strong> next to a waypoint, then click the map to place it. Drag a placed pin to fine-tune its position, or click the button again to re-place it elsewhere.</p>
                                 </div>
-                                
+
                                 <!-- Two-column layout: inputs on left, results on right -->
                                 <div class="route-step-layout">
                                     <div class="route-inputs">
                                         <div id="waypointsList">
                                             <!-- Waypoints will be added here dynamically -->
                                         </div>
-                                        
+
                                         <button id="btnAddWaypoint" class="btn-secondary btn-small" style="margin-bottom: 15px;">+ Add Waypoint</button>
-                                        
-                                        <div class="form-group">
-                                            <label for="inputSearchRadius">Search Radius (km)</label>
-                                            <input type="number" id="inputSearchRadius" value="10" min="5" max="50" />
-                                        </div>
-                                        
-                                        <button id="btnGeocode" class="btn-primary">Geocode Locations</button>
+
+                                        <button id="btnGeocode" class="btn-primary">Resolve Waypoints</button>
                                     </div>
-                                    
+
                                     <div class="route-results">
                                         <div id="geocodedSummary" style="display: none;" class="results-box">
-                                            <h4>Geocoded Waypoints</h4>
+                                            <h4>Resolved Waypoints</h4>
                                             <div id="geocodedList"></div>
-                                            <p style="margin-top: 10px; font-size: 11px; color: #aaa;">If a location is wrong, adjust your search term in the left panel and re-geocode.</p>
+                                            <p style="margin-top: 10px; font-size: 11px; color: #aaa;">If a location is wrong, drag its pin or re-place it on the map, then Resolve Waypoints again.</p>
                                         </div>
                                     </div>
                                 </div>
-                                
+
                                 <div class="instruction-box" id="queryInstructions" style="display: none; margin-top: 15px;">
-                                    <p><strong>Next step:</strong> Search OpenStreetMap for railway relations (lines/routes) that connect your waypoints.</p>
-                                    <p><strong>Search strategy:</strong> Creates tight bounding boxes between consecutive pairs of waypoints and queries for railway sections that connect them.</p>
+                                    <p><strong>Next step:</strong> Search OpenStreetMap for railway relations (lines/routes) using the bounding boxes shown on the map.</p>
                                 </div>
                                 
-                                <button id="btnQuerySections" class="btn-primary" style="display: none; margin-top: 15px;" disabled>Query OSM Sections</button>
+                                <button id="btnQuerySections" class="btn-primary" style="display: none; margin-top: 15px;" disabled>Query OSM Sections (this may take a few minutes)</button>
                             </div>
                         </section>
 
@@ -120,17 +121,16 @@
                             </div>
                             <div class="panel-content">
                                 <div class="instruction-box">
-                                    <p><strong>Select routes:</strong> Check the railway lines/routes you want to include in your network. Typically you'll want to select all sections that form your route. Uncheck any that are unrelated branches or metro lines.</p>
-                                    <p class="osm-note"><strong>Note:</strong> Geometry generation relies on OpenStreetMap queries. Due to query rate limits this process can sometimes take a few minutes.</p>
+                                    <p><strong>Select routes:</strong> Check the railway lines/routes you want to include in your network. All sections are selected by default — uncheck any that are unrelated branches or metro lines. Each checked section is drawn on the map in its own colour; hover a line to see which relation it is.</p>
                                 </div>
-                                
+
                                 <div id="sectionsResults" class="results-box" style="display: none;"></div>
-                                
+
                                 <div class="form-group" id="spacingGroup" style="display: none; margin-top: 15px;">
                                     <label for="inputSpacing">Point Spacing (meters)</label>
                                     <input type="number" id="inputSpacing" value="25" min="10" max="100" />
                                 </div>
-                                <button id="btnGenerateGeometry" class="btn-primary" style="display: none; margin-top: 10px;" disabled>Confirm routes and generate geometry</button>
+                                <button id="btnGenerateGeometry" class="btn-primary" style="display: none; margin-top: 10px;" disabled>Confirm routes and generate geometry (this may take a few minutes)</button>
 
                                 <div class="progress-container" id="progressGeometry" style="display: none; margin-top: 15px;">
                                     <div class="progress-bar">

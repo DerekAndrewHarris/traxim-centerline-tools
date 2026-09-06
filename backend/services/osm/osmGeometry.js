@@ -508,7 +508,7 @@ export async function fetchSectionGeometryFromOSM(section, bbox) {
  * Simple bbox-only approach — used as fallback when no confirmed sections available.
  *
  * @param {{minLat, minLon, maxLat, maxLon}} bbox
- * @returns {Promise<{wayIds: string[], wayGeometry: Map<string, Array<{lat,lon}>>, wayNodes: Map<string, Array<string>>}>}
+ * @returns {Promise<{wayIds: string[], wayGeometry: Map<string, Array<{lat,lon}>>, wayNodes: Map<string, Array<string>>, wayTags: Map<string, object>}>}
  */
 export async function fetchSegmentGeometryFromOSM(bbox) {
   console.log(`[OSM Geometry] Fetching all railway ways in segment bbox`);
@@ -533,6 +533,7 @@ export async function fetchSegmentGeometryFromOSM(bbox) {
     const wayIds = [];
     const wayGeometry = new Map();
     const wayNodes = new Map();
+    const wayTags = new Map();
 
     for (const el of data.elements) {
       if (el.type === 'way' && Array.isArray(el.geometry) && el.geometry.length >= 2) {
@@ -542,12 +543,15 @@ export async function fetchSegmentGeometryFromOSM(bbox) {
         if (Array.isArray(el.nodes)) {
           wayNodes.set(elId, el.nodes.map(String));
         }
+        if (el.tags) {
+          wayTags.set(elId, el.tags);
+        }
       }
     }
 
     console.log(`[OSM Geometry] Segment: ${wayIds.length} ways, ${wayGeometry.size} geometries`);
 
-    return { wayIds, wayGeometry, wayNodes };
+    return { wayIds, wayGeometry, wayNodes, wayTags };
 
   } catch (error) {
     console.error(`[OSM Geometry] Failed to fetch segment geometry: ${error.message}`);

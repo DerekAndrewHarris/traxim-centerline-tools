@@ -13,7 +13,7 @@ import { getSession, getSessionFilePath, updateSessionMetadata } from '../utils/
 import { promises as fsAsync } from 'fs';
 import jobQueue from '../utils/jobQueue.js';
 import { asyncHandler, AppError } from '../utils/errorHandler.js';
-import { generateInfrastructureForSections } from '../services/infrastructure/generator.js';
+import { generateInfrastructureForSections, buildRegionsCsv } from '../services/infrastructure/generator.js';
 
 const router = express.Router();
 
@@ -130,10 +130,18 @@ router.post('/generate', asyncHandler(async (req, res) => {
       const outputPath = path.join(sessionPath, 'Infrastructure.csv');
       fs.writeFileSync(outputPath, result.csv, 'utf-8');
 
+      // Write Regions.csv alongside it, one row per confirmed section in the
+      // same order they were reported to the UI, plus the fixed blank-region
+      // boilerplate row the Traxim file format requires.
+      const regionsCsv = buildRegionsCsv(confirmedSections);
+      const regionsOutputPath = path.join(sessionPath, 'Regions.csv');
+      fs.writeFileSync(regionsOutputPath, regionsCsv, 'utf-8');
+
       // Update session metadata
       await updateSessionMetadata(sessionId, {
         infrastructureGenerated: true,
         infrastructureFile: 'Infrastructure.csv',
+        regionsFile: 'Regions.csv',
         infrastructureTimestamp: new Date().toISOString(),
         infrastructureNodeCount: result.nodeCount,
         infrastructureConnectionCount: result.connectionCount,
@@ -143,6 +151,7 @@ router.post('/generate', asyncHandler(async (req, res) => {
       return {
         filePath: outputPath,
         fileName: 'Infrastructure.csv',
+        regionsFile: 'Regions.csv',
         nodeCount: result.nodeCount,
         connectionCount: result.connectionCount,
         warnings: result.warnings

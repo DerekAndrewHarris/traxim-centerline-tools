@@ -4,9 +4,10 @@
 
 Backend infrastructure for the Traxim File Generator, providing REST API endpoints for:
 - Temporary session management
-- OSM-based geometry generation (coming soon)
-- Infrastructure generation (coming soon)
-- Centerline KML/CSV conversion (coming soon)
+- OSM geography services (waypoint reverse-geocoding, railway section discovery)
+- OSM-based geometry generation
+- Infrastructure generation
+- Centerline KML/CSV conversion (not yet ported to the backend — still client-side only, see the main README)
 - ZIP file downloads
 
 ## Architecture
@@ -24,16 +25,20 @@ backend/
 ├── routes/
 │   ├── index.js           # Route aggregator
 │   ├── sessions.js        # Session management endpoints
-│   ├── geography.js       # (TODO) OSM geocoding & sections
-│   ├── geometry.js        # (TODO) Geometry generation
-│   ├── infrastructure.js  # (TODO) Infrastructure generation
-│   └── centerline.js      # (TODO) KML/CSV conversion
+│   ├── geography.js       # OSM geocode/reverse-geocode & section discovery
+│   ├── geometry.js        # Geometry generation (job-queue backed)
+│   ├── infrastructure.js  # Infrastructure generation (job-queue backed)
+│   └── centerline.js      # (TODO) KML/CSV conversion — still client-side only (lib/)
 ├── services/
-│   └── (TODO: OSM, geometry, infrastructure services)
+│   ├── osm/                # ipv4fetch, overpass, geocoding, sections, osmGeometry
+│   ├── geometry/            # generator.js, processor.js
+│   ├── infrastructure/      # generator.js, processor.js
+│   └── elevation.js         # Open-Elevation API integration
 ├── utils/
 │   ├── tempFiles.js       # Session creation & cleanup
 │   ├── zipGenerator.js    # ZIP archive generation
 │   ├── jobQueue.js        # In-memory job queue
+│   ├── kmlGenerator.js    # KML output for map overlays
 │   └── errorHandler.js    # Error handling middleware
 └── server.js              # Development server
 ```
@@ -126,6 +131,52 @@ GET /api/file-generator/files/:sessionId/:filename
 Response: File download
 ```
 
+### Geography (Waypoints & Sections)
+
+The frontend defines waypoints by clicking the map (exact coordinates, no lookup needed)
+and uses `/reverse-geocode` purely to attach a display name. `/geocode` (name → coordinates)
+still exists and works, but the frontend no longer calls it — it turned out to be
+unreliable enough (wrong-place matches from a naive bbox-area heuristic, and Overpass
+rate-limit cascades on the admin-boundary/station-search fallback chain) that click-to-place
+replaced it as the supported path. See `OSM_DATA_LOADING_PROCESS.md` for the full story.
+
+```bash
+# Give a clicked point a display name; also records it in the session's
+# geocodedPlaces list (same shape /geocode uses) so later steps (e.g. geometry
+# segment labels) see a real name instead of a generic placeholder.
+POST /api/file-generator/geography/reverse-geocode
+Body: { sessionId, lat, lon, appendToSession? }
+Response: { sessionId, result: { place, lat, lon, displayName, source: "map_click" } }
+
+# Name → coordinates (kept for API compatibility; not used by the current frontend)
+POST /api/file-generator/geography/geocode
+Body: { sessionId, places: string[], appendToSession? }
+
+# Find railway route relations within bounding boxes between waypoints
+POST /api/file-generator/geography/sections
+Body: { sessionId, bboxes: [{minLat, minLon, maxLat, maxLon}, ...] }
+
+# Confirm which candidate sections to carry into geometry generation
+POST /api/file-generator/geography/confirm
+Body: { sessionId, selectedSections: [{osmId, osmType}, ...] }
+```
+
+### Geometry & Infrastructure Generation
+
+Both are job-queue backed (see Job Queue below) — the generate endpoint returns a
+`jobId`, poll the jobs endpoint for progress:
+
+```bash
+POST /api/file-generator/geometry/generate        Body: { sessionId, spacingMetres? }
+GET  /api/file-generator/geometry/jobs/:jobId
+
+POST /api/file-generator/infrastructure/generate   Body: { sessionId, networkName }
+GET  /api/file-generator/infrastructure/jobs/:jobId
+```
+
+These can each take a few minutes — the OSM queries behind them (Overpass relation/way
+fetches) are the bottleneck, not the local processing.
+
 ## Integration with Traxim Controller
 
 For production deployment, import routes into `../Traxim-Live-Control-Interface-for-Web/server.js`:
@@ -206,11 +257,10 @@ curl http://localhost:3001/api/file-generator/health
 
 ## Next Steps
 
-Phase 2 will add:
-- OSM geography services (geocoding, section finding)
-- Geometry generation (port from MCP)
-- Infrastructure generation (port from MCP)
-- Centerline conversion (port from existing frontend)
+Geography, geometry, and infrastructure generation are all built (see Geography and
+Geometry & Infrastructure Generation above). Remaining:
+- Regions.csv and Speedboards.csv generation
+- Centerline conversion as a backend API (currently client-side only, see main README)
 
 ## Environment Variables
 

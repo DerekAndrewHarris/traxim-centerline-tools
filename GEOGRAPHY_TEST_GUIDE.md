@@ -3,6 +3,11 @@
 ## Overview
 This guide demonstrates how to test the geography endpoints (geocoding and railway section discovery) in the Traxim File Generator.
 
+**Current frontend path:** waypoints are placed by clicking the map, then `/reverse-geocode`
+gives each one a display name (Step 2 below). `/geocode` — name → coordinates — still exists
+and is tested here (Step 2b) for API completeness, but the frontend UI no longer uses it; see
+`OSM_DATA_LOADING_PROCESS.md` for why.
+
 ## Prerequisites
 - Backend server running on http://localhost:3001 (or your configured port)
 - PowerShell or curl available for making HTTP requests
@@ -11,19 +16,61 @@ This guide demonstrates how to test the geography endpoints (geocoding and railw
 
 ### Step 1: Create a Session
 ```powershell
-$response = Invoke-RestMethod -Uri "http://localhost:3001/api/sessions" -Method POST
-$sessionId = $response.id
+$response = Invoke-RestMethod -Uri "http://localhost:3001/api/file-generator/sessions" -Method POST
+$sessionId = $response.session.id
 Write-Host "Session created: $sessionId"
 ```
 
 Or with curl:
 ```bash
-SESSION_RESPONSE=$(curl -X POST http://localhost:3001/api/sessions)
-SESSION_ID=$(echo $SESSION_RESPONSE | jq -r '.id')
+SESSION_RESPONSE=$(curl -X POST http://localhost:3001/api/file-generator/sessions)
+SESSION_ID=$(echo $SESSION_RESPONSE | jq -r '.session.id')
 echo "Session created: $SESSION_ID"
 ```
 
-### Step 2: Geocode Places
+### Step 2: Reverse-Geocode a Waypoint (current frontend path)
+
+The frontend defines a waypoint by clicking the map, then calls `/reverse-geocode` purely
+to attach a display name to the coordinate it already has:
+
+```powershell
+$body = @{
+    sessionId = $sessionId
+    lat = 44.2762305
+    lon = 9.3975793
+    appendToSession = $false
+} | ConvertTo-Json
+
+$reverseResponse = Invoke-RestMethod `
+    -Uri "http://localhost:3001/api/file-generator/geography/reverse-geocode" `
+    -Method POST `
+    -Body $body `
+    -ContentType "application/json"
+
+Write-Host "Reverse geocode result: $($reverseResponse.result.place)"
+```
+
+Or with curl:
+```bash
+curl -X POST http://localhost:3001/api/file-generator/geography/reverse-geocode \
+  -H "Content-Type: application/json" \
+  -d "{\"sessionId\": \"$SESSION_ID\", \"lat\": 44.2762305, \"lon\": 9.3975793}" | jq .
+```
+
+**Expected Result:** `result.place` should be `"Sestri Levante"` — a short settlement name,
+not a street address, and not the wrong place entirely. This is fast (one Nominatim call,
+no Overpass) and should complete in well under a second in normal conditions.
+
+### Step 2b: Geocode Places by Name (legacy path — kept for API compatibility only)
+
+**Not used by the current frontend.** Testing here is about the backend API surface, not
+about validating the UI, since the UI no longer offers name search. See
+`OSM_DATA_LOADING_PROCESS.md` for why this was retired as the primary mechanism: a
+smallest-bbox-area heuristic could pick the wrong place entirely (e.g. a same-named hamlet
+over the intended city), and the admin-boundary/station-search fallback chain makes several
+sequential Overpass calls per place, which is exposed to Overpass's shared rate limit and
+can turn a few-second lookup into a 60–120+ second one.
+
 Test geocoding for Italian cities (Genoa and Pisa):
 
 ```powershell
@@ -33,7 +80,7 @@ $body = @{
 } | ConvertTo-Json
 
 $geocodeResponse = Invoke-RestMethod `
-    -Uri "http://localhost:3001/api/geography/geocode" `
+    -Uri "http://localhost:3001/api/file-generator/geography/geocode" `
     -Method POST `
     -Body $body `
     -ContentType "application/json"
@@ -46,7 +93,7 @@ $geocodeResponse.results | ForEach-Object {
 
 Or with curl:
 ```bash
-curl -X POST http://localhost:3001/api/geography/geocode \
+curl -X POST http://localhost:3001/api/file-generator/geography/geocode \
   -H "Content-Type: application/json" \
   -d "{
     \"sessionId\": \"$SESSION_ID\",
@@ -83,7 +130,7 @@ $body = @{
 } | ConvertTo-Json -Depth 10
 
 $sectionsResponse = Invoke-RestMethod `
-    -Uri "http://localhost:3001/api/geography/sections" `
+    -Uri "http://localhost:3001/api/file-generator/geography/sections" `
     -Method POST `
     -Body $body `
     -ContentType "application/json"
@@ -99,7 +146,7 @@ $sectionsResponse.sections | ForEach-Object {
 
 Or with curl:
 ```bash
-curl -X POST http://localhost:3001/api/geography/sections \
+curl -X POST http://localhost:3001/api/file-generator/geography/sections \
   -H "Content-Type: application/json" \
   -d "{
     \"sessionId\": \"$SESSION_ID\",
@@ -130,7 +177,7 @@ $body = @{
 } | ConvertTo-Json -Depth 10
 
 $confirmResponse = Invoke-RestMethod `
-    -Uri "http://localhost:3001/api/geography/confirm" `
+    -Uri "http://localhost:3001/api/file-generator/geography/confirm" `
     -Method POST `
     -Body $body `
     -ContentType "application/json"
@@ -140,7 +187,7 @@ Write-Host "`n$($confirmResponse.message)"
 
 Or with curl:
 ```bash
-curl -X POST http://localhost:3001/api/geography/confirm \
+curl -X POST http://localhost:3001/api/file-generator/geography/confirm \
   -H "Content-Type: application/json" \
   -d "{
     \"sessionId\": \"$SESSION_ID\",
@@ -155,20 +202,13 @@ curl -X POST http://localhost:3001/api/geography/confirm \
 - Session metadata updated with confirmed sections
 
 ### Step 5: Verify Session Metadata
-Check that geography data is stored in session:
-
-```powershell
-$sessionInfo = Invoke-RestMethod -Uri "http://localhost:3001/api/sessions/$sessionId"
-Write-Host "`nSession metadata:"
-Write-Host "  - Geocoded places: $($sessionInfo.metadata.geocodedPlaces.Count)"
-Write-Host "  - Candidate sections: $($sessionInfo.metadata.candidateSections.Count)"
-Write-Host "  - Confirmed sections: $($sessionInfo.metadata.confirmedSections.Count)"
-```
-
-Or with curl:
-```bash
-curl http://localhost:3001/api/sessions/$SESSION_ID | jq '.metadata'
-```
+Geography data (`geocodedPlaces`, `candidateSections`, `confirmedSections`, etc.) is
+written into the session's `session.json` on disk by every geography endpoint above, but
+**`GET /sessions/:id` does not currently expose it** — that endpoint only returns
+`{id, createdAt, expiresAt, files}`, no `metadata` field. This section's original example
+(reading `$sessionInfo.metadata.*`) doesn't work against the current API; there's no
+endpoint that surfaces this. To inspect it today, read the `session.json` file directly
+from the session's temp directory (`TEMP_FILES_DIR`, see `.env` / `tempFiles.js`).
 
 ## Real-World Test Cases
 
@@ -180,7 +220,7 @@ $body = @{
     places = @("Genova", "Pisa")
 } | ConvertTo-Json
 
-Invoke-RestMethod -Uri "http://localhost:3001/api/geography/geocode" `
+Invoke-RestMethod -Uri "http://localhost:3001/api/file-generator/geography/geocode" `
     -Method POST -Body $body -ContentType "application/json"
 
 # Expected: Genova Piazza Principe (44.407, 8.934), Pisa Centrale (43.708, 10.398)
@@ -197,7 +237,7 @@ $body = @{
     )
 } | ConvertTo-Json -Depth 10
 
-$sections = Invoke-RestMethod -Uri "http://localhost:3001/api/geography/sections" `
+$sections = Invoke-RestMethod -Uri "http://localhost:3001/api/file-generator/geography/sections" `
     -Method POST -Body $body -ContentType "application/json"
 
 # Expected: "Lucca – Viareggio" (normalized, deduplicated)
@@ -211,7 +251,7 @@ $body = @{
     places = @("Roma", "Firenze", "Bologna", "Milano")
 } | ConvertTo-Json
 
-Invoke-RestMethod -Uri "http://localhost:3001/api/geography/geocode" `
+Invoke-RestMethod -Uri "http://localhost:3001/api/file-generator/geography/geocode" `
     -Method POST -Body $body -ContentType "application/json"
 
 # Expected: All major stations (Roma Termini, Firenze SMN, Bologna Centrale, Milano Centrale)
@@ -269,5 +309,5 @@ After confirming geography endpoints work:
 ## Cleanup
 ```powershell
 # Delete test session
-Invoke-RestMethod -Uri "http://localhost:3001/api/sessions/$sessionId" -Method DELETE
+Invoke-RestMethod -Uri "http://localhost:3001/api/file-generator/sessions/$sessionId" -Method DELETE
 ```

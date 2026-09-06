@@ -5,7 +5,7 @@
 
 import express from 'express';
 import fs from 'fs/promises';
-import { geocodePlace } from '../services/osm/geocoding.js';
+import { geocodePlace, reverseGeocodePlace } from '../services/osm/geocoding.js';
 import { queryRailwaySections } from '../services/osm/sections.js';
 import { asyncHandler } from '../utils/errorHandler.js';
 import { getSession, getSessionFilePath, updateSessionMetadata } from '../utils/tempFiles.js';
@@ -89,6 +89,70 @@ router.post('/geocode', asyncHandler(async (req, res) => {
     sessionId,
     results
   });
+}));
+
+/**
+ * POST /geography/reverse-geocode
+ * Give a map-clicked waypoint a display name, and record it in the session's
+ * geocodedPlaces (same shape /geocode writes) so downstream segment labels
+ * use it instead of a generic placeholder.
+ *
+ * Body: {
+ *   sessionId: string,
+ *   lat: number,
+ *   lon: number,
+ *   appendToSession?: boolean
+ * }
+ *
+ * Response: {
+ *   sessionId: string,
+ *   result: { place, lat, lon, displayName, source }
+ * }
+ */
+router.post('/reverse-geocode', asyncHandler(async (req, res) => {
+  const { sessionId, lat, lon, appendToSession } = req.body;
+
+  if (!sessionId) {
+    return res.status(400).json({ error: 'sessionId is required' });
+  }
+
+  if (typeof lat !== 'number' || typeof lon !== 'number') {
+    return res.status(400).json({ error: 'lat and lon must be numbers' });
+  }
+
+  const session = await getSession(sessionId);
+  if (!session) {
+    return res.status(404).json({ error: 'Session not found' });
+  }
+
+  console.log(`[Geography API] Reverse geocoding (${lat}, ${lon}) for session ${sessionId}`);
+
+  const reverse = await reverseGeocodePlace(lat, lon);
+  const label = reverse ? reverse.label : `Pinned (${lat.toFixed(4)}, ${lon.toFixed(4)})`;
+
+  const result = {
+    place: label,
+    lat,
+    lon,
+    displayName: reverse ? reverse.displayName : `Pinned at ${lat.toFixed(5)}, ${lon.toFixed(5)}`,
+    source: 'map_click'
+  };
+
+  // Store in session metadata, same append/reset contract as /geocode, so
+  // pinned and searched waypoints share one correctly-ordered list.
+  let geocodedPlaces = [result];
+  if (appendToSession) {
+    const sessionPath = getSessionFilePath(sessionId, 'session.json');
+    const sessionData = JSON.parse(await fs.readFile(sessionPath, 'utf-8'));
+    geocodedPlaces = [...(sessionData.geocodedPlaces || []), result];
+  }
+
+  await updateSessionMetadata(sessionId, {
+    geocodedPlaces,
+    lastGeocodeTimestamp: new Date().toISOString()
+  });
+
+  res.json({ sessionId, result });
 }));
 
 /**

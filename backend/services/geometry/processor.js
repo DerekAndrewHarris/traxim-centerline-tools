@@ -158,7 +158,7 @@ export function deduplicateByGroup(wayIds, groups) {
  */
 export function chainWaysViaGraph(wayIds, wayGeometry, warnings = [], startPoint = null, endPoint = null) {
   if (wayIds.length === 0) {
-    return { coords: [], visitedIds: new Set() };
+    return { coords: [], visitedIds: new Set(), coordWayIds: [] };
   }
   
   const endpointIndex = buildEndpointIndex(wayIds, wayGeometry);
@@ -219,19 +219,20 @@ export function chainWaysViaGraph(wayIds, wayGeometry, warnings = [], startPoint
   // is long, when the correct chain starts from a terminus near endPoint.
   let bestChain = [];
   let bestVisited = new Set();
+  let bestWayIdOfCoord = [];
   let bestStartDist = Infinity;
   let bestScore = -Infinity;
   const CHAIN_DIST_PENALTY_M = 3000; // 3km: coverage beyond this penalises the score
-  
+
   for (const start of startCandidates) {
-    const { chain, visited } = singleTraversal(
+    const { chain, visited, wayIdOfCoord } = singleTraversal(
       start.wayId,
       start.isForward,
       endpointIndex,
       wayGeometry,
       wayIds.length
     );
-    
+
     if (startPoint) {
       if (chain.length < 2) continue;
       const p0 = chain[0], pN = chain[chain.length - 1];
@@ -246,16 +247,18 @@ export function chainWaysViaGraph(wayIds, wayGeometry, warnings = [], startPoint
         bestScore = score;
         bestChain = chain;
         bestVisited = visited;
+        bestWayIdOfCoord = wayIdOfCoord;
         bestStartDist = Math.min(d1, d3);
       }
     } else {
       if (chain.length > bestChain.length) {
         bestChain = chain;
         bestVisited = visited;
+        bestWayIdOfCoord = wayIdOfCoord;
       }
     }
   }
-  
+
   // Report unvisited ways
   const unvisitedCount = wayIds.length - bestVisited.size;
   if (unvisitedCount > 0) {
@@ -263,12 +266,13 @@ export function chainWaysViaGraph(wayIds, wayGeometry, warnings = [], startPoint
     console.log(`[Geometry Processor] ${warning}`);
     warnings.push(warning);
   }
-  
+
   console.log(`[Geometry Processor] Best chain: ${bestChain.length} coordinates from ${bestVisited.size} ways`);
-  
+
   return {
     coords: bestChain,
-    visitedIds: bestVisited
+    visitedIds: bestVisited,
+    coordWayIds: bestWayIdOfCoord
   };
 }
 
@@ -285,7 +289,11 @@ function singleTraversal(startWayId, startForward, endpointIndex, wayGeometry, t
   const startPts = wayGeometry.get(startWayId) ?? [];
   const visited = new Set([startWayId]);
   let chain = startForward ? [...startPts] : [...startPts].reverse();
-  
+  // Parallel to `chain`: which way each coordinate came from (needed to look up
+  // tunnel/bridge tags later — resampling destroys this correspondence, so it
+  // must be captured here while points are still 1:1 with source ways).
+  let wayIdOfCoord = new Array(chain.length).fill(startWayId);
+
   let tailKey = coordKey(chain[chain.length - 1]);
   let incomingDir = directionFromChainTail(chain);
   
@@ -358,6 +366,7 @@ function singleTraversal(startWayId, startForward, endpointIndex, wayGeometry, t
         const finalOrdered = bestGapForward ? finalPts : [...finalPts].reverse();
         console.log(`[Chain Gap Bridge] Jumped ${(bestGapDist * 111000).toFixed(1)}m to way ${bestGapWay} at ${visited.size} ways`);
         chain.push(...finalOrdered.slice(1));
+        wayIdOfCoord.push(...new Array(finalOrdered.length - 1).fill(bestGapWay));
         visited.add(bestGapWay);
         tailKey = coordKey(chain[chain.length - 1]);
         incomingDir = directionFromChainTail(chain);
@@ -382,16 +391,160 @@ function singleTraversal(startWayId, startForward, endpointIndex, wayGeometry, t
     
     const isForward = coordKey(pts[0]) === tailKey;
     const ordered = isForward ? pts : [...pts].reverse();
-    
+
     // Append new points (skip first - already in chain)
     chain.push(...ordered.slice(1));
+    wayIdOfCoord.push(...new Array(ordered.length - 1).fill(nextWayId));
     visited.add(nextWayId);
-    
+
     tailKey = coordKey(chain[chain.length - 1]);
     incomingDir = directionFromChainTail(chain);
   }
-  
-  return { chain, visited };
+
+  return { chain, visited, wayIdOfCoord };
+}
+
+/**
+ * Tunnel/Bridge Elevation Correction
+ *
+ * Digital elevation models (Open-Elevation) return ground-surface height at a
+ * lat/lon, which is wrong for a point inside a tunnel (returns the hill above
+ * it) or on a bridge/viaduct (returns the valley/river below it). OSM tags
+ * ways with `tunnel`/`bridge` when this applies. This can't be corrected with
+ * a per-point flag, because spline-smoothing + resampling (processTrackPoints)
+ * generates entirely new synthetic points that no longer correspond 1:1 to
+ * original OSM points or ways. Instead, tunnel/bridge sections are recorded as
+ * *distance-along-track intervals* (using the pre-smoothing chain, while
+ * points are still 1:1 with source ways) — resampling doesn't disturb
+ * cumulative distance, so any later point can still be tested against these
+ * intervals by its own chainage.
+ */
+
+/**
+ * Cumulative distance (metres) from the first point, one entry per input point.
+ * Uses haversine (not full Vincenty) — adequate for locating tunnel/bridge
+ * boundaries, not used for the geometry's output kilometerage.
+ * @param {Array<{lat: number, lon: number}>} coords
+ * @returns {number[]}
+ */
+export function buildCumulativeDistances(coords) {
+  const distM = new Array(coords.length).fill(0);
+  for (let i = 1; i < coords.length; i++) {
+    distM[i] = distM[i - 1] + haversineMeters(coords[i - 1].lat, coords[i - 1].lon, coords[i].lat, coords[i].lon);
+  }
+  return distM;
+}
+
+/**
+ * Extract contiguous [startM, endM] intervals (in the same distance frame as
+ * `chainageM`) where the segment's source way carries a truthy OSM tag
+ * (anything other than absent or "no" — covers `tunnel=yes`, `bridge=viaduct`, etc).
+ *
+ * The segment between coord[i-1] and coord[i] is attributed to `coordWayIds[i]`
+ * (the way that contributed coord[i] to the chain).
+ *
+ * @param {Array<string>} coordWayIds - Source way id per coordinate (from chainWaysViaGraph)
+ * @param {number[]} chainageM - Cumulative distance per coordinate (from buildCumulativeDistances)
+ * @param {Map<string, object>} wayTags - wayId -> OSM tags
+ * @param {string} tagKey - 'tunnel' or 'bridge'
+ * @returns {Array<{startM: number, endM: number}>}
+ */
+export function extractTaggedIntervals(coordWayIds, chainageM, wayTags, tagKey) {
+  const isTagged = (wayId) => {
+    const v = wayTags?.get(wayId)?.[tagKey];
+    return v !== undefined && v !== 'no' && v !== false;
+  };
+
+  const intervals = [];
+  let curStart = null;
+
+  for (let i = 1; i < coordWayIds.length; i++) {
+    const segTagged = isTagged(coordWayIds[i]);
+    if (segTagged && curStart === null) {
+      curStart = chainageM[i - 1];
+    } else if (!segTagged && curStart !== null) {
+      intervals.push({ startM: curStart, endM: chainageM[i - 1] });
+      curStart = null;
+    }
+  }
+  if (curStart !== null) {
+    intervals.push({ startM: curStart, endM: chainageM[chainageM.length - 1] });
+  }
+
+  return intervals;
+}
+
+/**
+ * Map each of a sequence of points to its approximate chainage in a reference
+ * chain's distance frame, by nearest-point lookup. Assumes both sequences
+ * traverse the same path in the same direction (true for a resampled/truncated
+ * version of a chain) — a forward-only pointer walk keeps this O(N+M).
+ *
+ * @param {Array<{lat: number, lon: number}>} points - Points needing a chainage (lat/lon shape)
+ * @param {Array<{lat: number, lon: number}>} refCoords - Reference chain (e.g. the pre-smoothing raw chain)
+ * @param {number[]} refChainageM - Cumulative distance per refCoords point
+ * @returns {number[]} Chainage (metres, in refCoords' frame) per input point
+ */
+export function mapPointsToChainage(points, refCoords, refChainageM) {
+  const result = new Array(points.length).fill(0);
+  let refIdx = 0;
+
+  for (let i = 0; i < points.length; i++) {
+    const p = points[i];
+    while (
+      refIdx < refCoords.length - 1 &&
+      haversineMeters(p.lat, p.lon, refCoords[refIdx + 1].lat, refCoords[refIdx + 1].lon) <
+      haversineMeters(p.lat, p.lon, refCoords[refIdx].lat, refCoords[refIdx].lon)
+    ) {
+      refIdx++;
+    }
+    result[i] = refChainageM[refIdx];
+  }
+
+  return result;
+}
+
+/**
+ * Override DEM-derived elevations with a straight-line interpolation between
+ * portal elevations for any point falling inside a tunnel/bridge interval.
+ * Portal elevations are themselves taken from the DEM data (interpolated to
+ * the exact portal chainage) — trustworthy since a portal is ordinary ground
+ * level by definition, unlike the tunnel/bridge interior.
+ *
+ * Mutates `elevations` in place (array of {elevation, ...}, same length/order
+ * as `pointChainageM`).
+ *
+ * @param {Array<{elevation: number}>} elevations
+ * @param {number[]} pointChainageM - Chainage per point, same frame as `intervals`
+ * @param {Array<{startM: number, endM: number}>} intervals
+ */
+export function applyPortalElevationInterpolation(elevations, pointChainageM, intervals) {
+  if (!intervals || intervals.length === 0) return;
+
+  const elevationAtChainage = (targetM) => {
+    if (targetM <= pointChainageM[0]) return elevations[0].elevation;
+    if (targetM >= pointChainageM[pointChainageM.length - 1]) return elevations[elevations.length - 1].elevation;
+    for (let i = 1; i < pointChainageM.length; i++) {
+      if (pointChainageM[i] >= targetM) {
+        const lowM = pointChainageM[i - 1], highM = pointChainageM[i];
+        const frac = highM > lowM ? (targetM - lowM) / (highM - lowM) : 0;
+        return elevations[i - 1].elevation + frac * (elevations[i].elevation - elevations[i - 1].elevation);
+      }
+    }
+    return elevations[elevations.length - 1].elevation;
+  };
+
+  for (const { startM, endM } of intervals) {
+    const startElev = elevationAtChainage(startM);
+    const endElev = elevationAtChainage(endM);
+    for (let i = 0; i < pointChainageM.length; i++) {
+      const ch = pointChainageM[i];
+      if (ch >= startM && ch <= endM) {
+        const frac = endM > startM ? (ch - startM) / (endM - startM) : 0;
+        elevations[i].elevation = startElev + frac * (endElev - startElev);
+      }
+    }
+  }
 }
 
 /**
@@ -567,7 +720,7 @@ export function calculateRouteLengthMeters(coords) {
  * @param {Array<{id: string, lat: number, lon: number, tags: object}>} taggedNodes
  * @returns {{splitWayIds: string[], splitWayGeometry: Map, splitWayNodes: Map}}
  */
-export function splitWaysAtIntermediateJunctions(wayIds, wayGeometry, wayNodes, taggedNodes) {
+export function splitWaysAtIntermediateJunctions(wayIds, wayGeometry, wayNodes, taggedNodes, wayTags = null) {
   // Build set of explicitly tagged junction node IDs
   const junctionNodeSet = new Set();
   for (const tn of (taggedNodes ?? [])) {
@@ -596,7 +749,7 @@ export function splitWaysAtIntermediateJunctions(wayIds, wayGeometry, wayNodes, 
   }
 
   if (sharedJunctions.size === 0) {
-    return { splitWayIds: wayIds, splitWayGeometry: wayGeometry, splitWayNodes: wayNodes };
+    return { splitWayIds: wayIds, splitWayGeometry: wayGeometry, splitWayNodes: wayNodes, splitWayTags: wayTags };
   }
 
   console.log(`[Geometry Processor] Found ${sharedJunctions.size} shared junction nodes for splitting`);
@@ -604,11 +757,13 @@ export function splitWaysAtIntermediateJunctions(wayIds, wayGeometry, wayNodes, 
   const newWayIds = [];
   const newWayGeometry = new Map();
   const newWayNodes = new Map();
+  const newWayTags = new Map();
   let virtualIdCounter = 9000000000;
 
   for (const wid of wayIds) {
     const nodes = wayNodes.get(wid) || [];
     const geom = wayGeometry.get(wid) || [];
+    const tags = wayTags?.get(wid);
 
     // Find shared junction nodes within this way (excluding endpoints)
     const junctionIndices = [];
@@ -622,6 +777,7 @@ export function splitWaysAtIntermediateJunctions(wayIds, wayGeometry, wayNodes, 
       newWayIds.push(wid);
       newWayGeometry.set(wid, geom);
       newWayNodes.set(wid, nodes);
+      if (tags) newWayTags.set(wid, tags);
       continue;
     }
 
@@ -638,12 +794,16 @@ export function splitWaysAtIntermediateJunctions(wayIds, wayGeometry, wayNodes, 
       newWayIds.push(segId);
       newWayGeometry.set(segId, segGeom);
       newWayNodes.set(segId, segNodes);
+      // A split segment is just a piece of its parent way — it inherits the
+      // same tags (in particular tunnel/bridge), which is what lets tunnel
+      // detection work after splitting.
+      if (tags) newWayTags.set(segId, tags);
     }
   }
 
   console.log(`[Geometry Processor] Split ${wayIds.length} ways → ${newWayIds.length} segments (${newWayIds.length - wayIds.length} virtual)`);
 
-  return { splitWayIds: newWayIds, splitWayGeometry: newWayGeometry, splitWayNodes: newWayNodes };
+  return { splitWayIds: newWayIds, splitWayGeometry: newWayGeometry, splitWayNodes: newWayNodes, splitWayTags: newWayTags };
 }
 
 /**
@@ -653,10 +813,9 @@ export function splitWaysAtIntermediateJunctions(wayIds, wayGeometry, wayNodes, 
  * @param {Map<string, {lat,lon}[]>} wayGeometry
  * @param {Set<string>} mainChainWayIds - Ways used in main centerline
  * @param {{lat,lon}[]} mainCenterlineCoords
- * @param {{minLat, maxLat, minLon, maxLon}} bbox
  * @returns {Array<{wayIds: string[], coords: {lat,lon}[], divergencePoint: {lat,lon}, convergencePoint: {lat,lon}|null, lengthKm: number, maxDeviationM: number, reconverged: boolean}>}
  */
-export function detectAlternativeRoutes(allWayIds, wayGeometry, mainChainWayIds, mainCenterlineCoords, bbox) {
+export function detectAlternativeRoutes(allWayIds, wayGeometry, mainChainWayIds, mainCenterlineCoords) {
   const DIVERGENCE_THRESHOLD_M = 50;
   const CONVERGENCE_THRESHOLD_M = 8;
   const MAX_CORRIDOR_DEVIATION_M = 5000;
@@ -775,21 +934,17 @@ export function detectAlternativeRoutes(allWayIds, wayGeometry, mainChainWayIds,
     if (reconverged && avgSep < 75) { console.log(`[Alt Routes P${passLabel}]   → reconverged parallel (avgSep=${avgSep.toFixed(0)}m)`); return; }
     if (routeLengthM < 2000 && visited.size < 5 && !reconverged) { console.log(`[Alt Routes P${passLabel}]   → short non-reconverging (${(routeLengthM/1000).toFixed(2)}km, ${visited.size} ways)`); return; }
 
-    // Filter out alt routes whose centroid falls outside the segment bbox
-    if (bbox) {
-      const margin = 0.01; // ~1.1 km
-      const sStep = Math.max(1, Math.floor(chain.length / 20));
-      let sLat = 0, sLon = 0, sCnt = 0;
-      for (let j = 0; j < chain.length; j += sStep) {
-        sLat += chain[j].lat; sLon += chain[j].lon; sCnt++;
-      }
-      const cLat = sLat / sCnt, cLon = sLon / sCnt;
-      if (cLat < bbox.minLat - margin || cLat > bbox.maxLat + margin ||
-          cLon < bbox.minLon - margin || cLon > bbox.maxLon + margin) {
-        console.log(`[Alt Routes P${passLabel}]   → centroid outside bbox`);
-        return;
-      }
-    }
+    // NOTE: previously rejected candidates whose centroid fell outside the
+    // segment bbox (with a ~1.1km margin). Removed 2026-08-23: a coastal or
+    // curving alt route can legitimately have its centroid outside the
+    // straight-line bbox between waypoints (the same issue tight bboxes cause
+    // for the main-line section query) — confirmed live, this discarded a
+    // correctly-traced 6.81km/17-way candidate whose centroid missed the bbox
+    // edge by ~150m. maxAllowedDeviation (checked inside buildAlternativeCenterline,
+    // relative to the main centerline rather than an arbitrary rectangle) already
+    // guards against a runaway/mis-bridged candidate wandering off to an
+    // unrelated line, so this check added a false-rejection risk without a
+    // corresponding real safeguard.
 
     const startPoint = chain[0];
     const endPoint = chain[chain.length - 1];
@@ -891,7 +1046,8 @@ export function detectAlternativeRoutes(allWayIds, wayGeometry, mainChainWayIds,
   // the onward chain through the parent alt route).
   {
     const MIN_SPUR_LENGTH_M = 150;
-    const SPUR_PROXIMITY_M = 25;
+    const SPUR_JUNCTION_TOUCH_M = 25; // is the spur's start actually attached to known track?
+    const SPUR_DIVERGENCE_M = 75;     // must diverge by this much to count as a real spur, not just track width (large yards can legitimately be ~50m wide)
     const pass2Count = alternatives.length;
 
     for (const [key, wids] of excludedEndpointIndex) {
@@ -909,10 +1065,10 @@ export function detectAlternativeRoutes(allWayIds, wayGeometry, mainChainWayIds,
       // Check if the junction end is near any accepted alt route OR mainline
       let nearGeometry = false;
       for (const alt of alternatives) {
-        if (minDistanceToLineMeters(junctionPt, alt.coords) < SPUR_PROXIMITY_M) { nearGeometry = true; break; }
+        if (minDistanceToLineMeters(junctionPt, alt.coords) < SPUR_JUNCTION_TOUCH_M) { nearGeometry = true; break; }
       }
       if (!nearGeometry) {
-        nearGeometry = minDistanceToLineMeters(junctionPt, mainCenterlineCoords) < SPUR_PROXIMITY_M;
+        nearGeometry = minDistanceToLineMeters(junctionPt, mainCenterlineCoords) < SPUR_JUNCTION_TOUCH_M;
       }
       if (!nearGeometry) continue;
 
@@ -923,12 +1079,29 @@ export function detectAlternativeRoutes(allWayIds, wayGeometry, mainChainWayIds,
       const spurVisited = new Set([wayId]);
       let spurTailKey = coordKey(spurChain[spurChain.length - 1]);
 
-      // Follow onward dead-end ways (single-connection continuations)
-      for (let step = 0; step < 20; step++) {
+      // Follow onward ways, choosing the best continuation at junctions (same
+      // direction logic as the main alt-route traversal) instead of stopping
+      // at the first junction — a real spur can pass through a junction on its
+      // way to reconvergence, not just run as an unbranched dead-end chain.
+      const spurMaxSteps = excludedWayIds.length + 10;
+      for (let step = 0; step < spurMaxSteps; step++) {
         const nextIds = excludedEndpointIndex.get(spurTailKey) ?? new Set();
         const candidates = [...nextIds].filter(w => !spurVisited.has(w));
-        if (candidates.length !== 1) break; // Stop at junctions or dead ends
-        const nextId = candidates[0];
+        if (candidates.length === 0) break; // True dead end
+
+        let nextId;
+        if (candidates.length === 1) {
+          nextId = candidates[0];
+        } else {
+          const dirRefIdx = Math.max(0, spurChain.length - 5);
+          const spurDir = spurChain.length >= 2
+            ? { dlat: spurChain[spurChain.length - 1].lat - spurChain[dirRefIdx].lat,
+                dlon: spurChain[spurChain.length - 1].lon - spurChain[dirRefIdx].lon }
+            : null;
+          nextId = chooseThroughWay(candidates, spurTailKey, spurDir, wayGeometry, true);
+          if (nextId === null) break; // No sensible through-path — leave it a dead end
+        }
+
         const npts = wayGeometry.get(nextId);
         if (!npts || npts.length < 2) break;
         const nForward = coordKey(npts[0]) === spurTailKey;
@@ -957,8 +1130,8 @@ export function detectAlternativeRoutes(allWayIds, wayGeometry, mainChainWayIds,
         spurSepCount++;
       }
       const spurAvgSep = spurSepCount > 0 ? spurTotalSep / spurSepCount : 0;
-      if (spurAvgSep < SPUR_PROXIMITY_M) {
-        console.log(`[Alt Routes P3] Skipped spur way ${wayId}: avg separation ${spurAvgSep.toFixed(0)}m < ${SPUR_PROXIMITY_M}m`);
+      if (spurAvgSep < SPUR_DIVERGENCE_M) {
+        console.log(`[Alt Routes P3] Skipped spur way ${wayId}: avg separation ${spurAvgSep.toFixed(0)}m < ${SPUR_DIVERGENCE_M}m`);
         continue;
       }
 

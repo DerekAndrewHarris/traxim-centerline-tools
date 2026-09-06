@@ -1725,11 +1725,19 @@ async function generateInfrastructureForSections(confirmedSections, networkName,
     const maxLat = Math.max(...allLats);
     const minLon = Math.min(...allLons);
     const maxLon = Math.max(...allLons);
-    // Constant geographic scale: calibrated so ~0.15° extent (Livorno-Pisa)
-    // produces ~40,000 canvas units, allowing the Network Editor to open at
-    // default zoom (10) instead of requiring 100. Larger areas get proportionally
-    // larger canvases, maintaining consistent node-to-canvas ratio.
-    const scale = 250000;
+    // Geographic-to-canvas conversion matching Network Editor's own convention
+    // (CentrelineDataPoint.LatitudeToY / LongitudeToX + GeopositionNodes'
+    // default ScaleFactor of 30 canvas-units-per-km), rather than an
+    // independently-calibrated constant. Positions are equirectangular —
+    // metres from the northern/western bounding edge, with longitude
+    // corrected by cos(latitude) at each point — then scaled at 30
+    // canvas-units/km, exactly as the editor scales positions it geopositions
+    // itself. This keeps generator-authored files behaving the same way under
+    // the editor's familiar scale-field habits (10 for sparse mainlines, up to
+    // 100 for dense yards) regardless of route length or orientation.
+    const METERS_PER_DEGREE_LAT = 111319.5;
+    const CANVAS_UNITS_PER_KM = 30; // must match Network Editor's DEFAULT_SCALE
+    const CANVAS_UNITS_PER_DEGREE_LAT = (METERS_PER_DEGREE_LAT / 1000) * CANVAS_UNITS_PER_KM;
 
     const nodeByName = new Map(nodes.map(n => [n.name, n]));
     for (const node of nodes) {
@@ -1742,13 +1750,18 @@ async function generateInfrastructureForSections(confirmedSections, networkName,
         projLon = proj.projLon;
       }
 
+      // Longitude scale depends on latitude (degrees of longitude shrink in
+      // real distance away from the equator) — use this point's own latitude,
+      // matching Network Editor's LongitudeToX.
+      const lonScale = CANVAS_UNITS_PER_DEGREE_LAT * Math.cos(projLat * Math.PI / 180);
+
       // Centerline position on canvas
-      node.posX = ((projLon - minLon) * scale).toFixed(4);
-      node.posY = ((maxLat - projLat) * scale).toFixed(4);
+      node.posX = ((projLon - minLon) * lonScale).toFixed(4);
+      node.posY = ((maxLat - projLat) * CANVAS_UNITS_PER_DEGREE_LAT).toFixed(4);
 
       // Offset = actual geographic position minus centerline position
-      node.offsetX = (((node.lon - projLon)) * scale).toFixed(4);
-      node.offsetY = (((projLat - node.lat)) * scale).toFixed(4);
+      node.offsetX = ((node.lon - projLon) * lonScale).toFixed(4);
+      node.offsetY = ((projLat - node.lat) * CANVAS_UNITS_PER_DEGREE_LAT).toFixed(4);
 
       // Turnout flip: determine whether the diverge is left or right when
       // looking along the through route from the node toward T.
@@ -2144,11 +2157,47 @@ function buildInfrastructureCsv(nodes, networkName) {
   return lines.join('\n') + '\n';
 }
 
+// Hand-picked, high-contrast colour names matching Network-Editor's own
+// region palette (see CreateRandomColorSequence's priorityColors in
+// Network-Editor/NetworkEditorWebAssembly/Pages/Home.razor) — chosen there to
+// stand out against a black background and to avoid red (used there as an
+// error indicator). Network-Editor falls back to a much larger stride-based
+// palette beyond ~12 regions; that fallback isn't ported here, so this simply
+// cycles back to the start for any additional regions.
+const REGION_COLOURS = [
+  'Lime', 'Cyan', 'Gold', 'DeepSkyBlue', 'Magenta', 'SpringGreen',
+  'Orange', 'DodgerBlue', 'Yellow', 'Aqua', 'Chartreuse', 'Violet'
+];
+
+/**
+ * Build Regions.csv content from the confirmed sections list.
+ * Row 2 is a fixed blank-region boilerplate row required by the Traxim
+ * Regions file format; every column besides Region Name, Colour and Train
+ * Graph Order is a fixed default, matching the standard Traxim template.
+ * @param {Array<{name: string}>} confirmedSections - in UI display order
+ * @returns {string} CSV content
+ */
+function buildRegionsCsv(confirmedSections) {
+  const lines = [
+    '#Region Name, Colour, Train Graph Order,Opposing delay,Following Delay,Reverse Section,Nominal Superelevation,Nominal cant deficiency,',
+    ',White,1,0,0,FALSE,,Normal,Passenger'
+  ];
+
+  confirmedSections.forEach((section, i) => {
+    const colour = REGION_COLOURS[i % REGION_COLOURS.length];
+    const order = i + 2; // row 2 (blank region) occupies order 1
+    lines.push(`${section.name},${colour},${order},90,90,FALSE,120,75,110`);
+  });
+
+  return lines.join('\n') + '\n';
+}
+
 export {
   generateInfrastructureForSections,
   fetchStationsFromOverpass,
   fetchPlatformsFromOverpass,
   fetchRailwayTopologyFromOverpass,
   parseGeometryCsv,
-  buildInfrastructureCsv
+  buildInfrastructureCsv,
+  buildRegionsCsv
 };
