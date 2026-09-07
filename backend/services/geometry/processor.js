@@ -485,37 +485,61 @@ export function extractTaggedIntervals(coordWayIds, chainageM, wayTags, tagKey) 
  * @param {number[]} refChainageM - Cumulative distance per refCoords point
  * @returns {number[]} Chainage (metres, in refCoords' frame) per input point
  */
-// How far ahead (in metres of raw chainage, not vertex count — raw vertex
-// spacing is uneven) a single point's search is allowed to look. The original
-// "advance while the next vertex is closer" walk had no such bound: on a
+// Starting size (metres of raw chainage, not vertex count — raw vertex
+// spacing is uneven) of the search window described below. The original
+// "advance while the next vertex is closer" walk had no bound at all: on a
 // tight curve where the raw path loops close to itself (exactly the shape of
-// a headland tunnel portal on a curvy coastal line), a resampled point can
+// a headland tunnel portal on a curvy coastal line), a resampled point could
 // spuriously find a raw vertex much further down the route geometrically
 // closer than its true nearby match. Since refIdx never decreases, one such
-// overshoot permanently desyncs the mapping for every later point too — not
-// just a local glitch. 500m is generously larger than the ~25m spacing
-// between resampled points (ample slack for uneven raw vertex density) while
-// being far too tight for a spurious match from an unrelated, distant loop
-// of the route.
+// overshoot permanently desynced the mapping for every later point too — not
+// just a local glitch.
+//
+// A single fixed-size window (tried first, 2026-09) turned out to be its own
+// hazard: rawCoords/rawChainageM are the FULL, untruncated chained way graph
+// (deliberately kept untruncated — see generator.js's note on
+// prunedMainChainWayIds), but the points being mapped here are the TRUNCATED
+// output, clipped to the confirmed start/end waypoints. generator.js's
+// TRUNCATE_OVERSHOOT_M means the raw chain can lead with up to ~1000m of
+// overflow before the section's real start — so the very first output point
+// can legitimately need to "catch up" well beyond a small fixed window, and
+// once no candidate is found even once, refIdx can never search further,
+// ever again (confirmed live: elevation froze at a single value for the
+// entire remainder of a real Genova-Sestri Levante export). Expanding the
+// window on failure keeps the tight-by-default behaviour that guards against
+// hairpin overshoot in the steady state, while guaranteeing forward progress
+// can never permanently stall.
 const CHAINAGE_MAP_LOOKAHEAD_M = 500;
 
 export function mapPointsToChainage(points, refCoords, refChainageM) {
   const result = new Array(points.length).fill(0);
   let refIdx = 0;
+  const lastRefIdx = refCoords.length - 1;
+  const totalRawM = refChainageM[lastRefIdx];
 
   for (let i = 0; i < points.length; i++) {
     const p = points[i];
-    const windowEndM = refChainageM[refIdx] + CHAINAGE_MAP_LOOKAHEAD_M;
+    let windowM = CHAINAGE_MAP_LOOKAHEAD_M;
+    let bestIdx, bestDist;
 
-    let bestIdx = refIdx;
-    let bestDist = haversineMeters(p.lat, p.lon, refCoords[refIdx].lat, refCoords[refIdx].lon);
+    for (;;) {
+      const windowEndM = refChainageM[refIdx] + windowM;
+      bestIdx = refIdx;
+      bestDist = haversineMeters(p.lat, p.lon, refCoords[refIdx].lat, refCoords[refIdx].lon);
 
-    for (let j = refIdx + 1; j < refCoords.length && refChainageM[j] <= windowEndM; j++) {
-      const d = haversineMeters(p.lat, p.lon, refCoords[j].lat, refCoords[j].lon);
-      if (d < bestDist) {
-        bestDist = d;
-        bestIdx = j;
+      for (let j = refIdx + 1; j <= lastRefIdx && refChainageM[j] <= windowEndM; j++) {
+        const d = haversineMeters(p.lat, p.lon, refCoords[j].lat, refCoords[j].lon);
+        if (d < bestDist) {
+          bestDist = d;
+          bestIdx = j;
+        }
       }
+
+      // Stop once we've made real progress, exhausted the chain, or the
+      // window already covers everything remaining (widening further
+      // couldn't possibly find anything new) — otherwise widen and retry.
+      if (bestIdx > refIdx || refIdx === lastRefIdx || windowEndM >= totalRawM) break;
+      windowM *= 2;
     }
 
     refIdx = bestIdx;
