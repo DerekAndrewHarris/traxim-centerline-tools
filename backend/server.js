@@ -4,9 +4,16 @@
  * In production, routes are imported into ../Traxim-Live-Control-Interface-for-Web/server.js
  */
 
+// Must run before any other import: ES module imports are hoisted and fully
+// evaluated before this file's own top-level code, so a plain `import dotenv
+// from 'dotenv'` + later `dotenv.config()` call runs too late for any module
+// this file imports (e.g. fileGeneratorRoutes -> ... -> overpass.js) that
+// reads process.env at its own module-load time. This side-effect import
+// loads .env immediately, as part of module evaluation, before anything else.
+import 'dotenv/config';
+
 import express from 'express';
 import cors from 'cors';
-import dotenv from 'dotenv';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import cron from 'node-cron';
@@ -14,9 +21,6 @@ import fileGeneratorRoutes from './routes/index.js';
 import { cleanupOldSessions } from './utils/tempFiles.js';
 import { errorHandler, notFoundHandler } from './utils/errorHandler.js';
 import jobQueue from './utils/jobQueue.js';
-
-// Load environment variables
-dotenv.config();
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
