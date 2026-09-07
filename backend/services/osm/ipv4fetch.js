@@ -9,6 +9,7 @@
  * Ported from: Traxim-MCP-Servers/traxim-input-creator-mcp/lib/ipv4fetch.js
  */
 
+import http from 'http';
 import https from 'https';
 import dns from 'dns';
 import { promisify } from 'util';
@@ -81,10 +82,13 @@ export async function ipv4Fetch(url, options = {}) {
       bodyStr = JSON.stringify(options.body);
     }
     
+    const isHttps = parsed.protocol === 'https:';
+    const client = isHttps ? https : http;
+
     const reqOptions = {
       hostname: ipv4Address,           // Connect to IP directly
-      servername: parsed.hostname,     // TLS SNI with original hostname
-      port: parsed.port || 443,
+      ...(isHttps ? { servername: parsed.hostname } : {}), // TLS SNI, https-only
+      port: parsed.port || (isHttps ? 443 : 80),
       path: parsed.pathname + parsed.search,
       method: options.method || (bodyStr ? 'POST' : 'GET'),
       headers: {
@@ -93,9 +97,9 @@ export async function ipv4Fetch(url, options = {}) {
         ...(bodyStr ? { 'Content-Length': Buffer.byteLength(bodyStr) } : {})
       }
     };
-    
+
     return new Promise((resolve, reject) => {
-      const req = https.request(reqOptions, (res) => {
+      const req = client.request(reqOptions, (res) => {
         let data = '';
         res.on('data', (chunk) => { data += chunk; });
         res.on('end', () => {
