@@ -485,19 +485,40 @@ export function extractTaggedIntervals(coordWayIds, chainageM, wayTags, tagKey) 
  * @param {number[]} refChainageM - Cumulative distance per refCoords point
  * @returns {number[]} Chainage (metres, in refCoords' frame) per input point
  */
+// How far ahead (in metres of raw chainage, not vertex count — raw vertex
+// spacing is uneven) a single point's search is allowed to look. The original
+// "advance while the next vertex is closer" walk had no such bound: on a
+// tight curve where the raw path loops close to itself (exactly the shape of
+// a headland tunnel portal on a curvy coastal line), a resampled point can
+// spuriously find a raw vertex much further down the route geometrically
+// closer than its true nearby match. Since refIdx never decreases, one such
+// overshoot permanently desyncs the mapping for every later point too — not
+// just a local glitch. 500m is generously larger than the ~25m spacing
+// between resampled points (ample slack for uneven raw vertex density) while
+// being far too tight for a spurious match from an unrelated, distant loop
+// of the route.
+const CHAINAGE_MAP_LOOKAHEAD_M = 500;
+
 export function mapPointsToChainage(points, refCoords, refChainageM) {
   const result = new Array(points.length).fill(0);
   let refIdx = 0;
 
   for (let i = 0; i < points.length; i++) {
     const p = points[i];
-    while (
-      refIdx < refCoords.length - 1 &&
-      haversineMeters(p.lat, p.lon, refCoords[refIdx + 1].lat, refCoords[refIdx + 1].lon) <
-      haversineMeters(p.lat, p.lon, refCoords[refIdx].lat, refCoords[refIdx].lon)
-    ) {
-      refIdx++;
+    const windowEndM = refChainageM[refIdx] + CHAINAGE_MAP_LOOKAHEAD_M;
+
+    let bestIdx = refIdx;
+    let bestDist = haversineMeters(p.lat, p.lon, refCoords[refIdx].lat, refCoords[refIdx].lon);
+
+    for (let j = refIdx + 1; j < refCoords.length && refChainageM[j] <= windowEndM; j++) {
+      const d = haversineMeters(p.lat, p.lon, refCoords[j].lat, refCoords[j].lon);
+      if (d < bestDist) {
+        bestDist = d;
+        bestIdx = j;
+      }
     }
+
+    refIdx = bestIdx;
     result[i] = refChainageM[refIdx];
   }
 

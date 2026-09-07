@@ -47,10 +47,12 @@ export async function generateSessionZip(sessionPath, outputPath) {
     // Pipe archive data to the file
     archive.pipe(output);
 
-    // Add all files except session.json
+    // Add all files except session.json and geometry topology JSON (an
+    // internal diagnostic artifact for infrastructure generation, not
+    // something a user downloading their session would need or understand)
     archive.glob('**/*', {
       cwd: sessionPath,
-      ignore: ['session.json']
+      ignore: ['session.json', '**/*_topology.json']
     });
 
     // Finalize the archive

@@ -229,7 +229,10 @@ router.get('/:id/download-geometry', asyncHandler(async (req, res) => {
   const archive = archiver('zip', { zlib: { level: 9 } });
   
   archive.pipe(output);
-  archive.directory(geometryDir, false);
+  // Topology JSON is an internal diagnostic artifact (full OSM way graph
+  // with tagged nodes) for infrastructure generation, not something a user
+  // downloading geometry needs or would understand — exclude it.
+  archive.directory(geometryDir, false, (data) => (data.name.endsWith('.json') ? false : data));
   await archive.finalize();
   
   // Wait for zip to finish writing

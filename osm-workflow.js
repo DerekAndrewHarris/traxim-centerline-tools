@@ -784,8 +784,14 @@ function drawSections(sections) {
         });
     }
 
-    // Draw each candidate section as its own colored, hoverable line group
-    sections.forEach((section, index) => {
+    // Draw each candidate section as its own colored, hoverable line group.
+    // Iterate in reverse so earlier entries in the list end up layered on
+    // top: Leaflet stacks later-added layers above earlier ones, so with
+    // many overlapping relations, drawing in list order buried each section
+    // under every later one — toggling an earlier entry off gave no visible
+    // change if a later, still-visible section covered the same path.
+    for (let index = sections.length - 1; index >= 0; index--) {
+        const section = sections[index];
         const color = SECTION_PREVIEW_COLORS[index % SECTION_PREVIEW_COLORS.length];
         const name = section.name || 'Unnamed section';
         const group = L.layerGroup();
@@ -801,7 +807,7 @@ function drawSections(sections) {
         if (state.selectedSections.includes(index)) {
             mapLayers.sections.addLayer(group);
         }
-    });
+    }
 }
 
 /**

@@ -364,6 +364,13 @@ export async function generateGeometryForSegment(segmentLabel, segmentBbox, outp
         if (progressCallback) progressCallback(60 + Math.round(pct * 0.1), msg);
       });
 
+      // fetchElevations() degrades internally rather than throwing on API
+      // failure, so this try/catch alone would never see it - check the flag
+      // explicitly rather than silently shipping a CSV that's quietly all 0s.
+      if (elevResults.degraded) {
+        warnings.push(`Elevation service unavailable (${elevResults.degradedReason}). Altitudes set to 0.`);
+      }
+
       // Ground-surface DEM data is wrong inside tunnels/on bridges — override
       // with a straight-line interpolation between portal elevations for any
       // point falling in a tunnel/bridge interval (see processor.js).
@@ -614,6 +621,9 @@ async function generateAlternativeGeometry(segmentLabel, alternative, altNumber,
   try {
     const elevPts = processedPoints.map(pt => ({ lat: pt.latitude, lon: pt.longitude }));
     const elevResults = await fetchElevations(elevPts);
+    if (elevResults.degraded) {
+      warnings.push(`${altLabel}: elevation service unavailable (${elevResults.degradedReason}). Altitudes set to 0.`);
+    }
     for (let i = 0; i < processedPoints.length; i++) {
       processedPoints[i].altitude = elevResults[i].elevation;
     }

@@ -100,17 +100,25 @@ export async function fetchElevations(points, progressCallback = null) {
 
   } catch (error) {
     console.error('Elevation fetch failed:', error.message);
-    
+
     // Graceful degradation: return all points with elevation = 0
     if (progressCallback) {
       progressCallback(100, 'Elevation service unavailable - using elevation = 0');
     }
-    
-    return points.map(p => ({
+
+    // This never throws, so a caller wrapping fetchElevations in try/catch to
+    // detect failure will never see one - degraded/degradedReason on the
+    // returned array (not a shape change; arrays are objects) is how a
+    // caller can tell "succeeded with real data" from "silently zeroed out"
+    // and warn the user instead of shipping a CSV that's quietly wrong.
+    const fallback = points.map(p => ({
       lat: p.lat,
       lon: p.lon,
       elevation: 0
     }));
+    fallback.degraded = true;
+    fallback.degradedReason = error.message;
+    return fallback;
   }
 }
 
