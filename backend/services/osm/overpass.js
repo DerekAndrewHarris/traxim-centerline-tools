@@ -7,12 +7,16 @@
 
 import { ipv4Fetch } from './ipv4fetch.js';
 
-// Overpass endpoints, raced via Promise.any in probeOverpassEndpoints() — fastest
-// healthy endpoint wins. OVERPASS_API_URL (self-hosted rail-only instance, when set)
-// goes first: on the same host it will always out-race the public mirrors, so it
-// acts as the de facto primary while they remain automatic fallbacks if it's down.
-const OVERPASS_ENDPOINTS = [
-  ...(process.env.OVERPASS_API_URL ? [process.env.OVERPASS_API_URL] : []),
+// OVERPASS_API_URL (self-hosted rail-only instance, when set) is checked
+// deterministically first in probeOverpassEndpoints() — NOT raced against the
+// public mirrors. Racing seems appealing (self-hosted, being local, should
+// always win) but a race can be lost to a one-off transient hiccup, and the
+// result below is cached for ENDPOINT_CACHE_MS — permanently stranding the
+// whole cache window on a public mirror even though self-hosted recovers a
+// moment later. Only fall through to racing the public mirrors if the
+// self-hosted check itself fails.
+const SELF_HOSTED_URL = process.env.OVERPASS_API_URL || null;
+const PUBLIC_ENDPOINTS = [
   'https://overpass-api.de/api/interpreter',        // Public fallback (Germany)
   'https://overpass.kumi.systems/api/interpreter'   // Public fallback (CDN)
 ];
@@ -20,8 +24,13 @@ const OVERPASS_ENDPOINTS = [
 const PROBE_QUERY = '[out:json][timeout:3];out 0;';
 const USER_AGENT = 'TraximFileGenerator/1.0 (traximrail.com)';
 
-// Cached winning endpoint
+// Cached winning endpoint, with a TTL so a transient failure doesn't strand
+// the rest of this (potentially long-running) process on a public mirror —
+// self-hosted gets re-tried periodically rather than abandoned forever after
+// one bad probe.
+const ENDPOINT_CACHE_MS = parseInt(process.env.OVERPASS_ENDPOINT_CACHE_MS || '300000', 10); // 5 min
 let _activeEndpoint = null;
+let _activeEndpointAt = 0;
 let _probeInFlight = null;
 
 // Dynamic inter-query gap based on the previous query's response time.
@@ -51,44 +60,56 @@ function recordQueryTiming(durationMs) {
  * Probe all Overpass endpoints and cache the fastest
  * @returns {Promise<string>} URL of fastest endpoint
  */
-async function probeOverpassEndpoints() {
-  if (_activeEndpoint) return _activeEndpoint;
-  if (_probeInFlight) return _probeInFlight;
-  
-  const probe = async (url) => {
-    try {
-      const res = await ipv4Fetch(url, {
-        method: 'POST',
-        socketTimeout: 3000,
-        headers: {
-          'Content-Type': 'application/x-www-form-urlencoded',
-          'User-Agent': USER_AGENT
-        },
-        body: new URLSearchParams({ data: PROBE_QUERY })
-      });
-      
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      
-      const text = await res.text();
-      if (text.trimStart().startsWith('<')) {
-        throw new Error('XML response (expected JSON)');
-      }
-      
-      return url;
-    } catch (error) {
-      throw new Error(`Probe failed: ${error.message}`);
+async function probeOne(url) {
+  try {
+    const res = await ipv4Fetch(url, {
+      method: 'POST',
+      socketTimeout: 3000,
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'User-Agent': USER_AGENT
+      },
+      body: new URLSearchParams({ data: PROBE_QUERY })
+    });
+
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+
+    const text = await res.text();
+    if (text.trimStart().startsWith('<')) {
+      throw new Error('XML response (expected JSON)');
     }
-  };
-  
-  _probeInFlight = Promise.any(OVERPASS_ENDPOINTS.map(probe))
-    .catch(() => OVERPASS_ENDPOINTS[0]) // All failed → use primary
+
+    return url;
+  } catch (error) {
+    throw new Error(`Probe failed: ${error.message}`);
+  }
+}
+
+async function probeOverpassEndpoints() {
+  if (_activeEndpoint && (Date.now() - _activeEndpointAt) < ENDPOINT_CACHE_MS) {
+    return _activeEndpoint;
+  }
+  if (_probeInFlight) return _probeInFlight;
+
+  _probeInFlight = (async () => {
+    if (SELF_HOSTED_URL) {
+      try {
+        return await probeOne(SELF_HOSTED_URL);
+      } catch (error) {
+        console.warn(`[Overpass] Self-hosted probe failed, falling back to public mirrors: ${error.message}`);
+      }
+    }
+    return Promise.any(PUBLIC_ENDPOINTS.map(probeOne))
+      .catch(() => PUBLIC_ENDPOINTS[0]); // All failed → use primary
+  })()
     .then((url) => {
       _activeEndpoint = url;
+      _activeEndpointAt = Date.now();
       _probeInFlight = null;
       console.log(`[Overpass] Selected endpoint: ${url}`);
       return url;
     });
-  
+
   return _probeInFlight;
 }
 
@@ -179,6 +200,7 @@ export async function overpassFetch(query, timeoutSec = 25, maxRetries = 2) {
  */
 export function resetEndpoint() {
   _activeEndpoint = null;
+  _activeEndpointAt = 0;
   _probeInFlight = null;
   console.log('[Overpass] Endpoint cache cleared');
 }
