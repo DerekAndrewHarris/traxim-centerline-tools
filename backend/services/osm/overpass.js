@@ -7,10 +7,14 @@
 
 import { ipv4Fetch } from './ipv4fetch.js';
 
-// Overpass endpoints in priority order
+// Overpass endpoints, raced via Promise.any in probeOverpassEndpoints() — fastest
+// healthy endpoint wins. OVERPASS_API_URL (self-hosted rail-only instance, when set)
+// goes first: on the same host it will always out-race the public mirrors, so it
+// acts as the de facto primary while they remain automatic fallbacks if it's down.
 const OVERPASS_ENDPOINTS = [
-  'https://overpass-api.de/api/interpreter',        // Primary (Germany)
-  'https://overpass.kumi.systems/api/interpreter'   // Secondary (CDN)
+  ...(process.env.OVERPASS_API_URL ? [process.env.OVERPASS_API_URL] : []),
+  'https://overpass-api.de/api/interpreter',        // Public fallback (Germany)
+  'https://overpass.kumi.systems/api/interpreter'   // Public fallback (CDN)
 ];
 
 const PROBE_QUERY = '[out:json][timeout:3];out 0;';
