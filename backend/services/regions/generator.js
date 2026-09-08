@@ -43,11 +43,14 @@ export const DEFAULTS_WARNING =
   `before using this file.`;
 
 /**
- * @param {Array<{name: string}>} confirmedSections - Session's confirmed sections, in route order
+ * @param {string[]} regionNames - Region names, one per geometry FILE actually produced
+ *   (a segment's main centerline plus each of its alternative routes are each their own
+ *   file and their own region - see backend/services/geometry/generator.js, whose first
+ *   CSV column for each file is exactly the name that must appear here), in route order
  * @param {string[]} colourPalette - Region colour palette (e.g. REGION_COLOURS from infrastructure/generator.js)
  * @returns {string} CSV file content
  */
-export function generateRegionsCsv(confirmedSections, colourPalette) {
+export function generateRegionsCsv(regionNames, colourPalette) {
   const lines = [
     '# First row of input data should always be blank for region name, "White" for colour and "1" for Train Graph Order. ',
     '# An unlimited number of train speed classes for nominal cant deficiency can be added from column H rightwards, but an empty column must be left between the last class and any column with non-input data.',
@@ -58,11 +61,11 @@ export function generateRegionsCsv(confirmedSections, colourPalette) {
     ',White,1,0,0,FALSE,,Normal,'
   ];
 
-  confirmedSections.forEach((section, i) => {
+  regionNames.forEach((name, i) => {
     const colour = colourPalette[i % colourPalette.length];
     const order = i + 2; // 1 is reserved for the mandatory first row
     lines.push(
-      `${section.name},${colour},${order},${DEFAULT_OPPOSING_DELAY},${DEFAULT_FOLLOWING_DELAY},` +
+      `${name},${colour},${order},${DEFAULT_OPPOSING_DELAY},${DEFAULT_FOLLOWING_DELAY},` +
       `FALSE,${DEFAULT_SUPERELEVATION},${DEFAULT_CANT_DEFICIENCY},`
     );
   });

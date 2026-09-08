@@ -99,24 +99,6 @@ router.post('/generate', asyncHandler(async (req, res) => {
       const results = [];
       const geometryDir = path.join(session.path, 'geometry');
 
-      // Regions.csv only needs the confirmed sections' names (known already,
-      // before any geometry is fetched) - generated here so it exists even if
-      // individual segments below fail, and written to the session ROOT (not
-      // geometryDir) so it's naturally excluded from the geometry-only ZIP
-      // and naturally included in the whole-session "download all" ZIP.
-      let regionsWarning = null;
-      console.log(`[Geometry API] Regions.csv: ${confirmedSections.length} confirmed section(s) - ` +
-        confirmedSections.map(s => `"${s.name}"`).join(', '));
-      try {
-        const regionsCsv = generateRegionsCsv(confirmedSections, REGION_COLOURS);
-        const regionsPath = path.join(session.path, 'Regions.csv');
-        await fs.writeFile(regionsPath, regionsCsv, 'utf-8');
-        regionsWarning = REGIONS_DEFAULTS_WARNING;
-        console.log(`[Geometry API] Wrote Regions.csv to ${regionsPath} (${confirmedSections.length} region(s), ${regionsCsv.length} bytes)`);
-      } catch (regionsErr) {
-        console.error(`[Geometry API] Failed to write Regions.csv:`, regionsErr);
-      }
-
       // Pre-fetch relation way IDs once for all unique relations used across segments.
       // This avoids repeating expensive Overpass family-expansion queries (one per
       // unique relation, not once per segment × per relation).
@@ -175,6 +157,35 @@ router.post('/generate', asyncHandler(async (req, res) => {
             error: error.message
           });
         }
+      }
+
+      // Regions.csv needs one row per geometry FILE actually produced, not per
+      // confirmed OSM relation - a segment's main centerline and each of its
+      // alternative routes are each their own file, each with its own region
+      // name in that file's own first column (see generator.js: segmentLabel /
+      // altLabel), and Traxim correlates Regions.csv rows to geometry files by
+      // that exact name. Only successful segments contribute rows. Written to
+      // the session ROOT (not geometryDir) so it's naturally excluded from the
+      // geometry-only ZIP and naturally included in the "download all" ZIP.
+      let regionsWarning = null;
+      const regionNames = [];
+      for (const r of results) {
+        if (r.error) continue;
+        regionNames.push(r.section);
+        for (let n = 1; n <= (r.alternativeCount || 0); n++) {
+          regionNames.push(`${r.section}_alt${n}`);
+        }
+      }
+      console.log(`[Geometry API] Regions.csv: ${regionNames.length} region(s) from ${results.length} segment result(s) - ` +
+        regionNames.map(n => `"${n}"`).join(', '));
+      try {
+        const regionsCsv = generateRegionsCsv(regionNames, REGION_COLOURS);
+        const regionsPath = path.join(session.path, 'Regions.csv');
+        await fs.writeFile(regionsPath, regionsCsv, 'utf-8');
+        regionsWarning = REGIONS_DEFAULTS_WARNING;
+        console.log(`[Geometry API] Wrote Regions.csv to ${regionsPath} (${regionNames.length} region(s), ${regionsCsv.length} bytes)`);
+      } catch (regionsErr) {
+        console.error(`[Geometry API] Failed to write Regions.csv:`, regionsErr);
       }
 
       // Merge infrastructure-format topology from all segments and write a
