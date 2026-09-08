@@ -40,6 +40,10 @@ jobs:
           git status
           echo "Index.html modified date:"
           ls -la index.html
+          echo "Stamping cache-busting build ID into index.html..."
+          BUILD_ID=$(git rev-parse --short HEAD)
+          sed -i "s/__BUILD_ID__/$BUILD_ID/g" index.html
+          echo "Stamped build ID: $BUILD_ID"
           sudo chown -R www-data:www-data /var/www/TraximCenterlineTools
           sudo chmod -R 755 /var/www/TraximCenterlineTools
           echo "=== Deployment Complete ==="

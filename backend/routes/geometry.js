@@ -105,13 +105,16 @@ router.post('/generate', asyncHandler(async (req, res) => {
       // geometryDir) so it's naturally excluded from the geometry-only ZIP
       // and naturally included in the whole-session "download all" ZIP.
       let regionsWarning = null;
+      console.log(`[Geometry API] Regions.csv: ${confirmedSections.length} confirmed section(s) - ` +
+        confirmedSections.map(s => `"${s.name}"`).join(', '));
       try {
         const regionsCsv = generateRegionsCsv(confirmedSections, REGION_COLOURS);
-        await fs.writeFile(path.join(session.path, 'Regions.csv'), regionsCsv, 'utf-8');
+        const regionsPath = path.join(session.path, 'Regions.csv');
+        await fs.writeFile(regionsPath, regionsCsv, 'utf-8');
         regionsWarning = REGIONS_DEFAULTS_WARNING;
-        console.log(`[Geometry API] Wrote Regions.csv (${confirmedSections.length} region(s))`);
+        console.log(`[Geometry API] Wrote Regions.csv to ${regionsPath} (${confirmedSections.length} region(s), ${regionsCsv.length} bytes)`);
       } catch (regionsErr) {
-        console.warn(`[Geometry API] Failed to write Regions.csv: ${regionsErr.message}`);
+        console.error(`[Geometry API] Failed to write Regions.csv:`, regionsErr);
       }
 
       // Pre-fetch relation way IDs once for all unique relations used across segments.
