@@ -130,11 +130,18 @@ export async function overpassFetch(query, timeoutSec = 25, maxRetries = 2) {
   
   let lastError;
   
+  // The inter-query gap exists to be a considerate, shared-quota citizen of
+  // the PUBLIC Overpass mirrors — it has no purpose against a private,
+  // self-hosted instance with no other users and no rate limit to respect,
+  // and was otherwise adding a ~1s floor to every single query regardless
+  // of how fast the endpoint actually responded.
+  const isSelfHosted = endpoint === SELF_HOSTED_URL;
+
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
     try {
       console.log(`[Overpass] Query attempt ${attempt + 1}/${maxRetries + 1}`);
 
-      await enforceQueryGap();
+      if (!isSelfHosted) await enforceQueryGap();
       const t0 = Date.now();
 
       const res = await ipv4Fetch(endpoint, {
@@ -147,7 +154,7 @@ export async function overpassFetch(query, timeoutSec = 25, maxRetries = 2) {
         body: new URLSearchParams({ data: normalizedQuery })
       });
 
-      recordQueryTiming(Date.now() - t0);
+      if (!isSelfHosted) recordQueryTiming(Date.now() - t0);
 
       if (res.status === 429) {
         // Rate limited — back off and let the slot recover

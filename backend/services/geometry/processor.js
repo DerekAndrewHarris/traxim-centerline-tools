@@ -552,9 +552,31 @@ export function mapPointsToChainage(points, refCoords, refChainageM) {
 /**
  * Override DEM-derived elevations with a straight-line interpolation between
  * portal elevations for any point falling inside a tunnel/bridge interval.
- * Portal elevations are themselves taken from the DEM data (interpolated to
- * the exact portal chainage) — trustworthy since a portal is ordinary ground
- * level by definition, unlike the tunnel/bridge interior.
+ *
+ * Portal elevations are the DEM reading at the output point IMMEDIATELY
+ * OUTSIDE the interval on each side — not a value searched for at the exact
+ * interval-boundary chainage. That search-based approach (computing an
+ * elevation "at chainage X" by interpolating between whichever two output
+ * points' mapped chainage straddle X) was fragile exactly where it mattered
+ * most: mapPointsToChainage can only be as precise as the raw OSM way's own
+ * vertex density, and a long, sparsely-mapped tunnel bore can leave dozens
+ * of output points sharing only two or three distinct mapped chainage
+ * values. Confirmed live: with output chainage collapsed that flat, the
+ * boundary search had to look arbitrarily far past the interval's own
+ * points to find a "crossing", occasionally landing on a genuinely
+ * unrelated, far-away point's elevation (a real case produced a "portal"
+ * value of 277m against two real endpoints of 61m and 33m).
+ *
+ * This avoids that entirely: once we know which contiguous run of output
+ * points falls inside the interval (a coarse in/out classification, which
+ * held up fine even where the fine-grained chainage search didn't), the
+ * portal elevations are just that run's immediate neighbours — ordinary
+ * ground level by definition, same trust assumption as before, just not
+ * arrived at via a fragile search. The per-point ramp between them uses
+ * OUTPUT ARRAY INDEX, not chainage value: output points are evenly
+ * resampled at a fixed interval, so index position within this contiguous
+ * run already exactly reflects distance-along-track, with no dependency on
+ * however sparse the underlying raw-chain chainage mapping is.
  *
  * Mutates `elevations` in place (array of {elevation, ...}, same length/order
  * as `pointChainageM`).
@@ -566,28 +588,27 @@ export function mapPointsToChainage(points, refCoords, refChainageM) {
 export function applyPortalElevationInterpolation(elevations, pointChainageM, intervals) {
   if (!intervals || intervals.length === 0) return;
 
-  const elevationAtChainage = (targetM) => {
-    if (targetM <= pointChainageM[0]) return elevations[0].elevation;
-    if (targetM >= pointChainageM[pointChainageM.length - 1]) return elevations[elevations.length - 1].elevation;
-    for (let i = 1; i < pointChainageM.length; i++) {
-      if (pointChainageM[i] >= targetM) {
-        const lowM = pointChainageM[i - 1], highM = pointChainageM[i];
-        const frac = highM > lowM ? (targetM - lowM) / (highM - lowM) : 0;
-        return elevations[i - 1].elevation + frac * (elevations[i].elevation - elevations[i - 1].elevation);
+  for (const { startM, endM } of intervals) {
+    let firstIdx = -1, lastIdx = -1;
+    for (let i = 0; i < pointChainageM.length; i++) {
+      if (pointChainageM[i] >= startM && pointChainageM[i] <= endM) {
+        if (firstIdx === -1) firstIdx = i;
+        lastIdx = i;
       }
     }
-    return elevations[elevations.length - 1].elevation;
-  };
+    if (firstIdx === -1) continue; // no output point fell in this interval
 
-  for (const { startM, endM } of intervals) {
-    const startElev = elevationAtChainage(startM);
-    const endElev = elevationAtChainage(endM);
-    for (let i = 0; i < pointChainageM.length; i++) {
-      const ch = pointChainageM[i];
-      if (ch >= startM && ch <= endM) {
-        const frac = endM > startM ? (ch - startM) / (endM - startM) : 0;
-        elevations[i].elevation = startElev + frac * (endElev - startElev);
-      }
+    // Falls back to the boundary point itself if the interval runs to the
+    // very start/end of the route (no outside neighbour exists there).
+    const beforeIdx = firstIdx > 0 ? firstIdx - 1 : firstIdx;
+    const afterIdx = lastIdx < elevations.length - 1 ? lastIdx + 1 : lastIdx;
+    const startElev = elevations[beforeIdx].elevation;
+    const endElev = elevations[afterIdx].elevation;
+
+    const span = afterIdx - beforeIdx;
+    for (let i = firstIdx; i <= lastIdx; i++) {
+      const frac = span > 0 ? (i - beforeIdx) / span : 0;
+      elevations[i].elevation = startElev + frac * (endElev - startElev);
     }
   }
 }
