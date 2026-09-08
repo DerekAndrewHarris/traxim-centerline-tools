@@ -2164,7 +2164,7 @@ function buildInfrastructureCsv(nodes, networkName) {
 // error indicator). Network-Editor falls back to a much larger stride-based
 // palette beyond ~12 regions; that fallback isn't ported here, so this simply
 // cycles back to the start for any additional regions.
-const REGION_COLOURS = [
+export const REGION_COLOURS = [
   'Lime', 'Cyan', 'Gold', 'DeepSkyBlue', 'Magenta', 'SpringGreen',
   'Orange', 'DodgerBlue', 'Yellow', 'Aqua', 'Chartreuse', 'Violet'
 ];

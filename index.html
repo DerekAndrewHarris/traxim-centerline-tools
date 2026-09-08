@@ -152,9 +152,12 @@
                             <div class="panel-content">
                                 <div id="geometryResults" class="results-box" style="display: none;"></div>
                                 <div style="display: flex; flex-direction: column; gap: 10px; margin-top: 15px;">
-                                    <button id="btnDownloadGeometryZip" class="btn-primary" disabled>Download Geometry ZIP</button>
-                                    <button id="btnDownloadGeometryKml" class="btn-primary" disabled>Generate & Download KMZ</button>
-                                    <button id="btnDownloadGeometryBoth" class="btn-primary" disabled>Download Both (ZIP + KMZ)</button>
+                                    <div style="display: flex; gap: 10px;">
+                                        <button id="btnDownloadGeometryZip" class="btn-primary" style="flex: 1;" disabled>Download Geometry ZIP</button>
+                                        <button id="btnDownloadGeometryRegions" class="btn-primary" style="flex: 1;" disabled>Download Regions.csv</button>
+                                        <button id="btnDownloadGeometryKml" class="btn-primary" style="flex: 1;" disabled>Generate & Download KMZ</button>
+                                    </div>
+                                    <button id="btnDownloadGeometryBoth" class="btn-primary" disabled>Download All (ZIP + Regions + KMZ)</button>
                                 </div>
                             </div>
                         </section>

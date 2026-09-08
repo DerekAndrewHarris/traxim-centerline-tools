@@ -156,6 +156,7 @@ function resetWorkflowUI() {
     document.getElementById('geometryResults').style.display = 'none';
     document.getElementById('geometryResults').innerHTML = '';
     document.getElementById('btnDownloadGeometryZip').disabled = true;
+    document.getElementById('btnDownloadGeometryRegions').disabled = true;
     document.getElementById('btnDownloadGeometryKml').disabled = true;
     document.getElementById('btnDownloadGeometryBoth').disabled = true;
 
@@ -1006,6 +1007,7 @@ async function pollGeometryJob() {
             // Enable Download Geometry panel
             enablePanel('panel-download-geometry');
             document.getElementById('btnDownloadGeometryZip').disabled = false;
+            document.getElementById('btnDownloadGeometryRegions').disabled = false;
             document.getElementById('btnDownloadGeometryKml').disabled = false;
             document.getElementById('btnDownloadGeometryBoth').disabled = false;
 
@@ -1115,6 +1117,12 @@ function displayGeometryResults(result) {
         html += '</ul>';
     }
 
+    // ── Regions.csv defaults notice ───────────────────────────────────────
+    if (result.regionsWarning) {
+        html += `<p class="warning" style="margin-top:10px"><strong>⚠ Regions.csv:</strong></p>` +
+                `<p style="color:#ffb74d;font-size:11px;">${result.regionsWarning}</p>`;
+    }
+
     if (!html) {
         html = '<p style="color:#aaa">No results returned.</p>';
     }
@@ -1131,6 +1139,38 @@ async function downloadGeometryZip() {
     } catch (error) {
         console.error('Download error:', error);
         alert('Download failed: ' + error.message);
+    }
+}
+
+/**
+ * Download Regions.csv
+ */
+async function downloadRegionsCsv() {
+    const btn = document.getElementById('btnDownloadGeometryRegions');
+    try {
+        btn.disabled = true;
+        btn.textContent = 'Downloading...';
+
+        const response = await fetch(`${API_BASE}/sessions/files/${state.sessionId}/Regions.csv`);
+        if (!response.ok) throw new Error(`Download failed: ${response.status}`);
+
+        const blob = await response.blob();
+        const url = window.URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = 'Regions.csv';
+        document.body.appendChild(a);
+        a.click();
+        window.URL.revokeObjectURL(url);
+        document.body.removeChild(a);
+
+        btn.disabled = false;
+        btn.textContent = 'Download Regions.csv';
+    } catch (error) {
+        console.error('Download error:', error);
+        alert('Download failed: ' + error.message);
+        btn.disabled = false;
+        btn.textContent = 'Download Regions.csv';
     }
 }
 
@@ -1217,20 +1257,28 @@ async function downloadGeometryKml() {
 }
 
 /**
- * Download Both Geometry Formats
+ * Download All (Geometry ZIP + Regions.csv + KMZ)
  */
 async function downloadGeometryBoth() {
     try {
         const btn = document.getElementById('btnDownloadGeometryBoth');
         btn.disabled = true;
         btn.textContent = 'Downloading ZIP...';
-        
+
         // Download geometry ZIP from backend
         const response = await fetch(`${API_BASE}/sessions/${state.sessionId}/download-geometry`);
         if (!response.ok) throw new Error(`Failed to download geometry: ${response.status}`);
-        
+
         const zipBlob = await response.blob();
-        
+
+        btn.textContent = 'Downloading Regions.csv...';
+
+        // Regions.csv is generated at Step 2 alongside geometry, not part of
+        // the geometry ZIP (it lives at the session root, not in geometryDir)
+        const regionsResponse = await fetch(`${API_BASE}/sessions/files/${state.sessionId}/Regions.csv`);
+        if (!regionsResponse.ok) throw new Error(`Failed to download Regions.csv: ${regionsResponse.status}`);
+        const regionsBlob = await regionsResponse.blob();
+
         btn.textContent = 'Reading CSV files...';
         
         // Extract and process CSV files using JSZip
@@ -1268,7 +1316,7 @@ async function downloadGeometryBoth() {
         });
         
         btn.textContent = 'Downloading files...';
-        
+
         // Download CSV ZIP
         const zipUrl = URL.createObjectURL(zipBlob);
         const zipLink = document.createElement('a');
@@ -1278,8 +1326,20 @@ async function downloadGeometryBoth() {
         zipLink.click();
         document.body.removeChild(zipLink);
         URL.revokeObjectURL(zipUrl);
-        
-        // Wait a moment then download KMZ
+
+        // Stagger each subsequent download — browsers can block multiple
+        // simultaneous downloads triggered in the same tick.
+        setTimeout(() => {
+            const regionsUrl = URL.createObjectURL(regionsBlob);
+            const regionsLink = document.createElement('a');
+            regionsLink.href = regionsUrl;
+            regionsLink.download = 'Regions.csv';
+            document.body.appendChild(regionsLink);
+            regionsLink.click();
+            document.body.removeChild(regionsLink);
+            URL.revokeObjectURL(regionsUrl);
+        }, 500);
+
         setTimeout(() => {
             const kmzUrl = URL.createObjectURL(kmzBlob);
             const kmzLink = document.createElement('a');
@@ -1289,19 +1349,19 @@ async function downloadGeometryBoth() {
             kmzLink.click();
             document.body.removeChild(kmzLink);
             URL.revokeObjectURL(kmzUrl);
-        }, 500);
-        
+        }, 1000);
+
         btn.disabled = false;
-        btn.textContent = 'Download Both (ZIP + KMZ)';
-        
-        console.log(`Generated both formats with ${Object.keys(geometryDict).length} sections`);
+        btn.textContent = 'Download All (ZIP + Regions + KMZ)';
+
+        console.log(`Generated all formats with ${Object.keys(geometryDict).length} sections`);
     } catch (error) {
         console.error('Download error:', error);
         alert('Download failed: ' + error.message);
-        
+
         const btn = document.getElementById('btnDownloadGeometryBoth');
         btn.disabled = false;
-        btn.textContent = 'Download Both (ZIP + KMZ)';
+        btn.textContent = 'Download All (ZIP + Regions + KMZ)';
     }
 }
 
@@ -1542,6 +1602,7 @@ document.addEventListener('DOMContentLoaded', function() {
     document.getElementById('btnQuerySections').addEventListener('click', querySections);
     document.getElementById('btnGenerateGeometry').addEventListener('click', generateGeometry);
     document.getElementById('btnDownloadGeometryZip').addEventListener('click', downloadGeometryZip);
+    document.getElementById('btnDownloadGeometryRegions').addEventListener('click', downloadRegionsCsv);
     document.getElementById('btnDownloadGeometryKml').addEventListener('click', downloadGeometryKml);
     document.getElementById('btnDownloadGeometryBoth').addEventListener('click', downloadGeometryBoth);
     document.getElementById('btnGenerateInfrastructure').addEventListener('click', generateInfrastructure);

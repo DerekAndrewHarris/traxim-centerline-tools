@@ -6,6 +6,8 @@
 import express from 'express';
 import { generateGeometryForSegment } from '../services/geometry/generator.js';
 import { prefetchRelationWayIds } from '../services/osm/osmGeometry.js';
+import { generateRegionsCsv, DEFAULTS_WARNING as REGIONS_DEFAULTS_WARNING } from '../services/regions/generator.js';
+import { REGION_COLOURS } from '../services/infrastructure/generator.js';
 import jobQueue from '../utils/jobQueue.js';
 import { asyncHandler } from '../utils/errorHandler.js';
 import { getSession, getSessionFilePath } from '../utils/tempFiles.js';
@@ -96,6 +98,21 @@ router.post('/generate', asyncHandler(async (req, res) => {
       const { sessionId, spacingMetres, segments } = data;
       const results = [];
       const geometryDir = path.join(session.path, 'geometry');
+
+      // Regions.csv only needs the confirmed sections' names (known already,
+      // before any geometry is fetched) - generated here so it exists even if
+      // individual segments below fail, and written to the session ROOT (not
+      // geometryDir) so it's naturally excluded from the geometry-only ZIP
+      // and naturally included in the whole-session "download all" ZIP.
+      let regionsWarning = null;
+      try {
+        const regionsCsv = generateRegionsCsv(confirmedSections, REGION_COLOURS);
+        await fs.writeFile(path.join(session.path, 'Regions.csv'), regionsCsv, 'utf-8');
+        regionsWarning = REGIONS_DEFAULTS_WARNING;
+        console.log(`[Geometry API] Wrote Regions.csv (${confirmedSections.length} region(s))`);
+      } catch (regionsErr) {
+        console.warn(`[Geometry API] Failed to write Regions.csv: ${regionsErr.message}`);
+      }
 
       // Pre-fetch relation way IDs once for all unique relations used across segments.
       // This avoids repeating expensive Overpass family-expansion queries (one per
@@ -243,7 +260,8 @@ router.post('/generate', asyncHandler(async (req, res) => {
         sessionId,
         totalSections: segments.length,
         successfulSections: results.filter(r => !r.error).length,
-        results
+        results,
+        regionsWarning
       };
     }
   );
