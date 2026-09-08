@@ -380,6 +380,26 @@ export async function generateGeometryForSegment(segmentLabel, segmentBbox, outp
         const finalChainageM = mapPointsToChainage(elevPts, rawCoords, rawChainageM);
         applyPortalElevationInterpolation(elevResults, finalChainageM, tunnelIntervals);
         applyPortalElevationInterpolation(elevResults, finalChainageM, bridgeIntervals);
+
+        // Diagnostic: confirm each detected interval actually reached real
+        // output points, and where — an interval that matches 0 points means
+        // mapPointsToChainage failed to associate any resampled point with
+        // it (the correction silently never applied), which raw DEM data
+        // alone can't explain but a chainage-mapping miss can.
+        for (const iv of [...tunnelIntervals.map(v => ({...v, kind: 'tunnel'})), ...bridgeIntervals.map(v => ({...v, kind: 'bridge'}))]) {
+          const affectedIdx = [];
+          for (let i = 0; i < finalChainageM.length; i++) {
+            if (finalChainageM[i] >= iv.startM && finalChainageM[i] <= iv.endM) affectedIdx.push(i);
+          }
+          const rangeLabel = `${(iv.startM / 1000).toFixed(3)}-${(iv.endM / 1000).toFixed(3)}km (raw chain frame)`;
+          if (affectedIdx.length > 0) {
+            const first = elevPts[affectedIdx[0]], last = elevPts[affectedIdx[affectedIdx.length - 1]];
+            console.log(`[Tunnel/Bridge Diag] ${iv.kind} ${rangeLabel} -> ${affectedIdx.length} pt(s), ` +
+              `(${first.lat.toFixed(5)},${first.lon.toFixed(5)}) to (${last.lat.toFixed(5)},${last.lon.toFixed(5)})`);
+          } else {
+            console.log(`[Tunnel/Bridge Diag] ${iv.kind} ${rangeLabel} -> 0 pts matched (mapping missed this interval)`);
+          }
+        }
       }
 
       for (let i = 0; i < finalPoints.length; i++) {
