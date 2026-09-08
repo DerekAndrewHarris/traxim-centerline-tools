@@ -35,7 +35,9 @@ import {
   buildCumulativeDistances,
   extractTaggedIntervals,
   mapPointsToChainage,
-  applyPortalElevationInterpolation
+  applyPortalElevationInterpolation,
+  applyGradientEnvelopeSmoothing,
+  DEFAULT_RULING_GRADIENT
 } from './processor.js';
 import { fetchElevations } from '../elevation.js';
 import path from 'path';
@@ -402,16 +404,48 @@ export async function generateGeometryForSegment(segmentLabel, segmentBbox, outp
       finalPoints[i].chainage = totalKm;
     }
 
+    // ── 8b. Gradient-feasibility smoothing ────────────────────────────────────
+    // DEM elevation can be locally implausible in ways gradient limits alone
+    // can catch (a grid cell landing on open water near a coastline, e.g.) -
+    // see project history for the concrete case this was built for. Keeps
+    // the pre-smoothing value alongside the smoothed one so it's inspectable
+    // rather than silently overwritten.
+    {
+      const rawAltitudes = finalPoints.map(pt => pt.altitude);
+      const chainageMetres = finalPoints.map(pt => pt.chainage * 1000);
+      const { smoothed, adjustedCount, maxAdjustmentM } =
+        applyGradientEnvelopeSmoothing(rawAltitudes, chainageMetres);
+      for (let i = 0; i < finalPoints.length; i++) {
+        finalPoints[i].rawAltitude = rawAltitudes[i];
+        finalPoints[i].altitude = smoothed[i];
+      }
+      if (adjustedCount > 0) {
+        warnings.push(
+          `Elevation smoothing adjusted ${adjustedCount} point(s) to stay within a ${(DEFAULT_RULING_GRADIENT * 100).toFixed(0)}% ` +
+          `ruling gradient (largest adjustment ${maxAdjustmentM.toFixed(1)}m). Raw values are kept in the CSV's ` +
+          `6th column for reference` +
+          (maxAdjustmentM > 5
+            ? ' - a change this large usually means the raw elevation data was genuinely unreliable there ' +
+              '(e.g. a coastal grid cell), worth spot-checking with GPS Visualizer or Google\'s Elevation API if precision matters for this section.'
+            : '.')
+        );
+      }
+    }
+
     console.log(`[Geometry Generator] Total length: ${totalKm.toFixed(2)} km`);
 
     if (progressCallback) progressCallback(75, 'Writing geometry file...');
 
+    // 6th column (raw_elevation) is a trailing addition after kilometerage —
+    // existing readers of this format take the first 5 columns and ignore
+    // the rest, so this is safe to append without breaking anything that
+    // consumes these files today.
     const filePath = path.join(outputDir, `${safeName}.csv`);
-    const lines = ['#region name,latitude,longitude,elevation,kilometerage'];
+    const lines = ['#region name,latitude,longitude,elevation,kilometerage,raw_elevation'];
     for (const pt of finalPoints) {
       lines.push(
         `${segmentLabel},${pt.latitude.toFixed(8)},${pt.longitude.toFixed(8)},` +
-        `${pt.altitude.toFixed(2)},${pt.chainage.toFixed(5)}`
+        `${pt.altitude.toFixed(2)},${pt.chainage.toFixed(5)},${(pt.rawAltitude ?? pt.altitude).toFixed(2)}`
       );
     }
     await fs.writeFile(filePath, lines.join('\n') + '\n', 'utf-8');
@@ -642,13 +676,31 @@ async function generateAlternativeGeometry(segmentLabel, alternative, altNumber,
     processedPoints[i].chainage = totalKm;
   }
 
-  // Write CSV
+  // Gradient-feasibility smoothing (see main geometry path for the reasoning)
+  {
+    const rawAltitudes = processedPoints.map(pt => pt.altitude);
+    const chainageMetres = processedPoints.map(pt => pt.chainage * 1000);
+    const { smoothed, adjustedCount, maxAdjustmentM } =
+      applyGradientEnvelopeSmoothing(rawAltitudes, chainageMetres);
+    for (let i = 0; i < processedPoints.length; i++) {
+      processedPoints[i].rawAltitude = rawAltitudes[i];
+      processedPoints[i].altitude = smoothed[i];
+    }
+    if (adjustedCount > 0) {
+      warnings.push(
+        `${altLabel}: elevation smoothing adjusted ${adjustedCount} point(s) ` +
+        `(largest adjustment ${maxAdjustmentM.toFixed(1)}m). Raw values kept in the CSV's 6th column.`
+      );
+    }
+  }
+
+  // Write CSV (6th column, raw_elevation, is a trailing addition — see main geometry path)
   const filePath = path.join(outputDir, `${altSafeName}.csv`);
-  const lines = ['#region name,latitude,longitude,elevation,kilometerage'];
+  const lines = ['#region name,latitude,longitude,elevation,kilometerage,raw_elevation'];
   for (const pt of processedPoints) {
     lines.push(
       `${altLabel},${pt.latitude.toFixed(8)},${pt.longitude.toFixed(8)},` +
-      `${pt.altitude.toFixed(2)},${pt.chainage.toFixed(5)}`
+      `${pt.altitude.toFixed(2)},${pt.chainage.toFixed(5)},${pt.rawAltitude.toFixed(2)}`
     );
   }
   await fs.writeFile(filePath, lines.join('\n') + '\n', 'utf-8');

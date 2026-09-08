@@ -47,12 +47,13 @@ export async function generateSessionZip(sessionPath, outputPath) {
     // Pipe archive data to the file
     archive.pipe(output);
 
-    // Add all files except session.json and geometry topology JSON (an
-    // internal diagnostic artifact for infrastructure generation, not
-    // something a user downloading their session would need or understand)
+    // Add all files except session.json, geometry topology JSON, and
+    // *_wayids.csv (all internal diagnostic artifacts — the latter is a
+    // list of OSM way IDs, not geometry, and risks a user mistaking it for
+    // a geometry file and feeding it back in as track data)
     archive.glob('**/*', {
       cwd: sessionPath,
-      ignore: ['session.json', '**/*_topology.json']
+      ignore: ['session.json', '**/*_topology.json', '**/*_wayids.csv']
     });
 
     // Finalize the archive

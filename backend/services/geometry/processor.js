@@ -1546,3 +1546,116 @@ function buildAlternativeCenterline(
 
   return { chain, visited, maxDeviation, reconverged };
 }
+
+/**
+ * Default ruling gradient used by applyGradientEnvelopeSmoothing when the
+ * caller doesn't supply one: 4% (1-in-25). Chosen as a conservative sanity
+ * backstop, not a claim about any real railway's actual ruling gradient —
+ * generous enough to almost never touch genuinely steep-but-real mountain
+ * track (real-world ruling gradients rarely exceed ~3.3%/1-in-30), while
+ * still catching the kind of physically-impossible artifacts elevation data
+ * can produce (a DEM cell landing on open water near a coastline, a
+ * tunnel/bridge chainage-mapping glitch) — see the gradient-smoothing
+ * discussion in project history for the concrete cases this was written for.
+ */
+export const DEFAULT_RULING_GRADIENT = 0.04;
+
+/**
+ * Look up the ruling gradient (as a fraction, e.g. 0.04 for 4%) that applies
+ * at a given chainage, preferring a zone override over the default.
+ *
+ * @param {number} km - Chainage in kilometres
+ * @param {number} defaultGradient
+ * @param {Array<{startKm: number, endKm: number, maxGradientPercent: number}>} zones
+ * @returns {number}
+ */
+function rulingGradientAt(km, defaultGradient, zones) {
+  if (zones) {
+    for (const z of zones) {
+      if (km >= z.startKm && km <= z.endKm) return z.maxGradientPercent / 100;
+    }
+  }
+  return defaultGradient;
+}
+
+/**
+ * Smooth an elevation profile so no two points imply a steeper gradient than
+ * the ruling gradient allows, without disturbing points that are already
+ * gradient-feasible.
+ *
+ * Method: compute the tightest gradient-feasible band consistent with EVERY
+ * point simultaneously — the upper envelope U[i] is how high point i could
+ * possibly be given every other point j and the max climb rate between them
+ * (U[i] = min over all j of raw[j] + K·distance(i,j)); the lower envelope
+ * L[i] is the symmetric lower bound. The smoothed value is the midpoint of
+ * that band. Computed via a forward sweep (accounts for j ≤ i) and a
+ * backward sweep (accounts for j ≥ i) combined with min/max, each O(n) — no
+ * different in cost to other per-point passes already in this pipeline.
+ *
+ * This is deliberately NOT an outlier-rejection scheme that tries to guess
+ * which points are "bad": every point is treated as equally uncertain, and
+ * the tightest globally-consistent band is found without assuming which
+ * point(s), if any, are the actual source of a violation. A useful property
+ * this gives us for free: if the raw data already satisfies the gradient
+ * constraint everywhere, U[i] = L[i] = raw[i] exactly and nothing is
+ * changed — only genuinely gradient-infeasible stretches get pulled toward
+ * feasibility, and only pulled as far as the nearest feasible value permits
+ * (not flattened, not replaced with a straight line).
+ *
+ * @param {number[]} rawElevations
+ * @param {number[]} chainageM - Cumulative distance per point, metres (e.g. from buildCumulativeDistances)
+ * @param {number} [defaultGradient] - Ruling gradient as a fraction (e.g. 0.04 for 4%); defaults to DEFAULT_RULING_GRADIENT
+ * @param {Array<{startKm: number, endKm: number, maxGradientPercent: number}>} [zones] - Optional chainage-range overrides
+ * @returns {{smoothed: number[], adjustedCount: number, maxAdjustmentM: number}}
+ */
+export function applyGradientEnvelopeSmoothing(rawElevations, chainageM, defaultGradient = DEFAULT_RULING_GRADIENT, zones = []) {
+  const n = rawElevations.length;
+  if (n === 0) return { smoothed: [], adjustedCount: 0, maxAdjustmentM: 0 };
+  if (n === 1) return { smoothed: [rawElevations[0]], adjustedCount: 0, maxAdjustmentM: 0 };
+
+  // Per-segment ruling gradient (piecewise-constant across zones), keyed by
+  // segment index i for the segment between point i-1 and point i.
+  const segGradient = new Array(n);
+  for (let i = 1; i < n; i++) {
+    const midKm = (chainageM[i - 1] + chainageM[i]) / 2 / 1000;
+    segGradient[i] = rulingGradientAt(midKm, defaultGradient, zones);
+  }
+
+  const upperFwd = new Array(n);
+  const lowerFwd = new Array(n);
+  upperFwd[0] = rawElevations[0];
+  lowerFwd[0] = rawElevations[0];
+  for (let i = 1; i < n; i++) {
+    const maxDelta = segGradient[i] * (chainageM[i] - chainageM[i - 1]);
+    upperFwd[i] = Math.min(rawElevations[i], upperFwd[i - 1] + maxDelta);
+    lowerFwd[i] = Math.max(rawElevations[i], lowerFwd[i - 1] - maxDelta);
+  }
+
+  const upperBwd = new Array(n);
+  const lowerBwd = new Array(n);
+  upperBwd[n - 1] = rawElevations[n - 1];
+  lowerBwd[n - 1] = rawElevations[n - 1];
+  for (let i = n - 2; i >= 0; i--) {
+    const maxDelta = segGradient[i + 1] * (chainageM[i + 1] - chainageM[i]);
+    upperBwd[i] = Math.min(rawElevations[i], upperBwd[i + 1] + maxDelta);
+    lowerBwd[i] = Math.max(rawElevations[i], lowerBwd[i + 1] - maxDelta);
+  }
+
+  const smoothed = new Array(n);
+  let adjustedCount = 0;
+  let maxAdjustmentM = 0;
+
+  for (let i = 0; i < n; i++) {
+    const upper = Math.min(upperFwd[i], upperBwd[i]);
+    const lower = Math.max(lowerFwd[i], lowerBwd[i]);
+    smoothed[i] = (upper + lower) / 2;
+
+    const delta = Math.abs(smoothed[i] - rawElevations[i]);
+    if (delta > 0.01) {
+      adjustedCount++;
+      if (delta > maxAdjustmentM) maxAdjustmentM = delta;
+    }
+  }
+
+  return { smoothed, adjustedCount, maxAdjustmentM };
+}
