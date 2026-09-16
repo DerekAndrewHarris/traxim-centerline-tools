@@ -46,4 +46,8 @@ jobs:
           echo "Stamped build ID: $BUILD_ID"
           sudo chown -R www-data:www-data /var/www/TraximCenterlineTools
           sudo chmod -R 755 /var/www/TraximCenterlineTools
+          echo "Restarting traxim-file-generator service..."
+          sudo systemctl restart traxim-file-generator
+          sleep 2
+          sudo systemctl is-active --quiet traxim-file-generator && echo "Service is active." || (echo "Service failed to start!" && sudo journalctl -u traxim-file-generator -n 30 --no-pager && exit 1)
           echo "=== Deployment Complete ==="
