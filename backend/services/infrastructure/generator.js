@@ -30,6 +30,9 @@ import {
   computeWayDirection,
   followChainToNode,
   determineBranch,
+  branchToNodeField,
+  branchToBranchField,
+  fieldToBranch,
   nearestKm,
   projectOntoGeometry,
   enforceReciprocalLinks
@@ -231,7 +234,7 @@ function ensureKmSeparation(nodes, geometryBySection) {
   const minKmSpacing = MIN_NODE_SPACING_M / 1000;
   const EPS = 1e-9;  // floating-point tolerance for km comparisons
   const nodeByName = new Map(nodes.map(n => [n.name, n]));
-  const arms = [['fNode','fOnBranch'], ['tNode','tOnBranch'], ['dNode','dOnBranch']];
+  const arms = [['fNode','fOnBranch'], ['tNode','tOnBranch'], ['dNode','dOnBranch'], ['xNode','xOnBranch']];
 
   // Helpers to read/write km for any geometry slot on a node
   function getKmOnGeo(node, geo) {
@@ -618,106 +621,24 @@ async function generateInfrastructureForSections(confirmedSections, networkName,
         processedCoordKeys.set(coordKey, node);
 
       } else if (degree === 4) {
-        // Degree-4: diamond crossing - create two back-to-back turnouts
-        // Pair ways by minimizing dot product sum (find most-opposite pairs)
-        const dirs = conns.map(c => ({
-          wayId: c.wayId,
-          ...computeWayDirection(coordKey, c.wayId, waysById)
-        }));
-
-        const pairings = [
-          [[0,1],[2,3]], [[0,2],[1,3]], [[0,3],[1,2]]
-        ];
-        let bestScore = Infinity, bestPairing = pairings[0];
-        for (const [[a,b],[c,d]] of pairings) {
-          const score =
-            dirs[a].dlat*dirs[b].dlat + dirs[a].dlon*dirs[b].dlon +
-            dirs[c].dlat*dirs[d].dlat + dirs[c].dlon*dirs[d].dlon;
-          if (score < bestScore) {
-            bestScore = score;
-            bestPairing = [[a,b],[c,d]];
-          }
-        }
-
-        // Through-route assignment for crossing topology
-        // connsA[0] and connsB[0] form tangent X → both map to T branch
-        // connsA[1] and connsB[1] form tangent Y → both map to D branch
-        // The spatial offset moves nodeA in the NEGATIVE direction of the T
-        // reference way.  Each node's T arm faces OUTWARD (away from its
-        // partner, along the track the sub-node represents).
-        // For sequential diamonds connected by a shared way, Step 8 redirects
-        // the target to the partner sub-node so the through-route connects
-        // same-side nodes across both crossings.
-        const refWayId = conns[bestPairing[0][0]].wayId;
-
-        // Compute ref way direction — needed for both D-way alignment
-        // and spatial offset.  Node A is offset in the NEGATIVE direction
-        // and Node B in the POSITIVE direction of this vector.
-        const { dlat: dirLat, dlon: dirLon } = computeWayDirection(coordKey, refWayId, waysById);
-        const dirMag = Math.sqrt(dirLat * dirLat + dirLon * dirLon) || 1;
-        const normDLat = dirLat / dirMag;
-        const normDLon = dirLon / dirMag;
-
-        // Assign D-ways to sub-nodes by spatial alignment.
-        // The D-way whose direction dot-products more negatively with the
-        // ref direction goes to Node A (negative-offset side); the other
-        // goes to Node B (positive-offset side).
-        const dIdx0 = bestPairing[1][0], dIdx1 = bestPairing[1][1];
-        const dDot0 = dirs[dIdx0].dlat * normDLat + dirs[dIdx0].dlon * normDLon;
-        const dDot1 = dirs[dIdx1].dlat * normDLat + dirs[dIdx1].dlon * normDLon;
-        const dConnA = dDot0 <= dDot1 ? conns[dIdx0] : conns[dIdx1];
-        const dConnB = dDot0 <= dDot1 ? conns[dIdx1] : conns[dIdx0];
-
-        const connsA = [
-          { ...conns[bestPairing[0][1]], _deg4Branch: 'T' },
-          { ...dConnA, _deg4Branch: 'D' }
-        ];
-        const connsB = [
-          { ...conns[bestPairing[0][0]], _deg4Branch: 'T' },
-          { ...dConnB, _deg4Branch: 'D' }
-        ];
-
-        // Spatially separate by ±15m
-        const offsetM = 15;
-        const offsetDegLat = offsetM / 111000;
-        const offsetDegLon = (offsetM / 111000) / Math.cos(lat * Math.PI / 180);
-
-        const latA = lat - normDLat * offsetDegLat;
-        const lonA = lon - normDLon * offsetDegLon;
-        const latB = lat + normDLat * offsetDegLat;
-        const lonB = lon + normDLon * offsetDegLon;
-
-        const nodeA = {
-          name: `${nodeName} A`,
-          lat: latA, lon: lonA, km,
+        // Degree-4: diamond crossing.  Two independent tracks cross at grade
+        // with no physical connection between them — a single node with all
+        // four branches (F, T, D, X) connected.  Which physical track lands
+        // on F/T vs D/X, and which end of each pair is which letter, is
+        // resolved later by determineBranch() (processor.js) from the way
+        // geometry — this step just records the raw topology.
+        const node = {
+          name: nodeName,
+          lat, lon, km,
           region: sectionName,
-          railwayType: 'junction',
+          railwayType: 'diamond',
           _topoKey: coordKey,
-          _topoConns: connsA
+          _topoConns: conns
         };
-        nodes.push(nodeA);
-
-        const nodeB = {
-          name: `${nodeName} B`,
-          lat: latB, lon: lonB, km,
-          region: sectionName,
-          railwayType: 'junction',
-          _topoKey: `${coordKey}_deg4B`,
-          _topoConns: connsB,
-          _degree4Partner: nodeA
-        };
-        nodeA._degree4Partner = nodeB;
-        nodes.push(nodeB);
-
-        // Cross-link F branches
-        nodeA.fNode = nodeB.name;
-        nodeA.fOnBranch = 'F';
-        nodeB.fNode = nodeA.name;
-        nodeB.fOnBranch = 'F';
-
-        topoNodes.set(coordKey, [nodeA, nodeB]);
-        processedCoordKeys.set(coordKey, [nodeA, nodeB]);
-        warnings.push(`Topology: degree-4 key at ${sectionName} km ${km.toFixed(3)} — created two turnout nodes "${nodeA.name}" and "${nodeB.name}".`);
+        nodes.push(node);
+        topoNodes.set(coordKey, node);
+        processedCoordKeys.set(coordKey, node);
+        warnings.push(`Topology: degree-4 key at ${sectionName} km ${km.toFixed(3)} — created diamond crossing "${node.name}".`);
 
       } else if (degree === 3) {
         // Turnout junction
@@ -758,10 +679,9 @@ async function generateInfrastructureForSections(confirmedSections, networkName,
   const realKeyToNodes = new Map();
   for (const [, topoNodes] of topoNodesBySection) {
     for (const [key, entry] of topoNodes) {
-      const realKey = key.endsWith('_deg4B') ? key.slice(0, -6) : key;
-      if (!realKeyToNodes.has(realKey)) realKeyToNodes.set(realKey, []);
+      if (!realKeyToNodes.has(key)) realKeyToNodes.set(key, []);
       const arr = Array.isArray(entry) ? entry : [entry];
-      realKeyToNodes.get(realKey).push(...arr);
+      realKeyToNodes.get(key).push(...arr);
     }
   }
 
@@ -803,10 +723,9 @@ async function generateInfrastructureForSections(confirmedSections, networkName,
           for (let i = nodes.length - 1; i >= 0; i--) {
             if (namesToRemove.has(nodes[i].name)) nodes.splice(i, 1);
           }
-          // Remove from topoNodesBySection (both real key and _deg4B variant)
+          // Remove from topoNodesBySection
           for (const [, sectionTopoNodes] of topoNodesBySection) {
             sectionTopoNodes.delete(key);
-            sectionTopoNodes.delete(key + '_deg4B');
           }
           filteredCount += nodeList.length;
         }
@@ -820,9 +739,7 @@ async function generateInfrastructureForSections(confirmedSections, networkName,
   // Build section node key sets
   const sectionNodeKeyMap = new Map();
   for (const [sectionName, topoNodes] of topoNodesBySection) {
-    const keys = new Set(
-      [...topoNodes.keys()].map(k => k.endsWith('_deg4B') ? k.slice(0, -6) : k)
-    );
+    const keys = new Set(topoNodes.keys());
     for (const [k, cands] of realKeyToNodes) {
       if (cands.some(c => c.region === sectionName)) keys.add(k);
     }
@@ -850,21 +767,9 @@ async function generateInfrastructureForSections(confirmedSections, networkName,
       const nodeList = Array.isArray(entry) ? entry : [entry];
 
       for (const node of nodeList) {
-        const realKey = key.endsWith('_deg4B') ? key.slice(0, -6) : key;
+        const realKey = key;
         const conns = node._topoConns ?? adj.get(realKey) ?? [];
         if (conns.length === 0) continue;
-
-        // Build full connection list for determineBranch (includes synthetic
-        // partner link for degree-4 sub-nodes so angle analysis sees all arms)
-        let sourceConns = conns;
-        if (node._degree4Partner) {
-          const partner = node._degree4Partner;
-          sourceConns = [...conns, {
-            wayId: `_synthetic_partner_${node.name}`,
-            otherKey: `${partner.lat},${partner.lon}`,
-            _isSynthetic: true
-          }];
-        }
 
         for (const conn of conns) {
           // Follow the chain to find the far node.
@@ -910,62 +815,22 @@ async function generateInfrastructureForSections(confirmedSections, networkName,
             continue;
           }
 
-          // For degree-4 targets, pick the specific sub-node that owns the
-          // arriving way.  Without this, candidates.find() picks the first
-          // match by insertion order, which may be the wrong sub-node.
-          if (farNode._degree4Partner) {
-            const partner = farNode._degree4Partner;
-            const farOwnsWay = farNode._topoConns?.some(c => c.wayId === arrivedViaWayId);
-            const partnerOwnsWay = partner._topoConns?.some(c => c.wayId === arrivedViaWayId);
-            if (!farOwnsWay && partnerOwnsWay && partner !== node) {
-              farNode = partner;
-            }
-          }
-
           // Determine which branch of the FAR node the arriving way connects to
           const farNodeKey = farNode._topoKey || reachedKey;
           let farNodeConns = farNode._topoConns || adj.get(farNodeKey) || [];
-          let farBranch;
-          if (farNode._degree4Partner) {
-            // Use the _deg4Branch tag from the far node's tagged connections
-            const taggedFarConn = farNodeConns.find(c => c.wayId === arrivedViaWayId);
-            farBranch = taggedFarConn?._deg4Branch ?? null;
-            if (!farBranch) {
-              // Fallback: determineBranch with synthetic partner
-              const partner = farNode._degree4Partner;
-              const augmented = [...farNodeConns, {
-                wayId: `_synthetic_partner_${farNode.name}`,
-                otherKey: `${partner.lat},${partner.lon}`,
-                _isSynthetic: true
-              }];
-              farBranch = determineBranch(
-                farNodeKey, augmented, arrivedViaWayId, waysById, farNode.km, null
-              );
-            }
-          } else {
-            farBranch = determineBranch(
-              farNodeKey, farNodeConns, arrivedViaWayId, waysById, farNode.km, null
-            );
-          }
+          const farBranch = determineBranch(
+            farNodeKey, farNodeConns, arrivedViaWayId, waysById, farNode.km, null
+          );
 
           // Determine which branch of THIS (source) node this way belongs to.
-          // For degree-4 sub-nodes, F is already set to the partner — use
-          // the _deg4Branch tag assigned during node creation to ensure
-          // both nodes in the pair assign the same tangent to the same branch.
-          let sourceBranch;
-          if (node._degree4Partner) {
-            const taggedConn = conns.find(c => c.wayId === conn.wayId);
-            sourceBranch = taggedConn?._deg4Branch ?? (!node.tNode ? 'T' : !node.dNode ? 'D' : null);
-          } else {
-            sourceBranch = determineBranch(
-              realKey, sourceConns, conn.wayId, waysById, node.km, null
-            );
-          }
+          const sourceBranch = determineBranch(
+            realKey, conns, conn.wayId, waysById, node.km, null
+          );
           if (!sourceBranch) continue;
 
           // Assign the connection to the source branch
-          const nodeField = sourceBranch === 'F' ? 'fNode' : sourceBranch === 'T' ? 'tNode' : 'dNode';
-          const branchField = sourceBranch === 'F' ? 'fOnBranch' : sourceBranch === 'T' ? 'tOnBranch' : 'dOnBranch';
+          const nodeField = branchToNodeField(sourceBranch);
+          const branchField = branchToBranchField(sourceBranch);
 
           if (!node[nodeField]) {
             node[nodeField] = farNode.name;
@@ -975,38 +840,6 @@ async function generateInfrastructureForSections(confirmedSections, networkName,
 
       }
     }
-  }
-
-  // ── Step 8a: Sequential diamond crossing fixup ──
-  // When two degree-4 diamond crossings are connected by a shared way, the
-  // outward T assignment connects sub-nodes on OPPOSITE sides of their
-  // respective diamonds (e.g. I↔K).  The correct topology connects sub-nodes
-  // on the SAME side (e.g. K↔H).  Detect this pattern and redirect:
-  //   - If source.T reached a degree-4 sub-node whose PARTNER has an empty T,
-  //     redirect source.T to the partner, set the partner's T reciprocally,
-  //     and clear the old reached node's reciprocal T.
-  for (const node of nodes) {
-    if (!node._degree4Partner || !node.tNode) continue;
-
-    // Find the reached T-target
-    const target = nodes.find(n => n.name === node.tNode);
-    if (!target || !target._degree4Partner) continue;
-    if (node.tOnBranch !== 'T') continue;
-
-    const partner = target._degree4Partner;
-    if (partner === node) continue; // don't redirect to self
-    if (partner.tNode) continue;    // partner's T already assigned
-
-    // Confirm the target's T points back to this node (reciprocal link)
-    if (target.tNode !== node.name) continue;
-
-    // Redirect: source.T → partner, partner.T → source, clear target.T
-    node.tNode = partner.name;
-    node.tOnBranch = 'T';
-    partner.tNode = node.name;
-    partner.tOnBranch = 'T';
-    target.tNode = null;
-    target.tOnBranch = null;
   }
 
   // ── Step 8b: Cross-section connections ──
@@ -1035,20 +868,24 @@ async function generateInfrastructureForSections(confirmedSections, networkName,
           if (nodeA.region === nodeB.region) continue;
 
           // Already connected?
-          if (nodeA.fNode === nodeB.name || nodeA.tNode === nodeB.name || nodeA.dNode === nodeB.name) continue;
+          if (nodeA.fNode === nodeB.name || nodeA.tNode === nodeB.name ||
+              nodeA.dNode === nodeB.name || nodeA.xNode === nodeB.name) continue;
 
-          // Find free arm on each — prefer D (diverging branch to another section)
-          const freeArmA = !nodeA.dNode ? 'D' : !nodeA.tNode ? 'T' : !nodeA.fNode ? 'F' : null;
-          const freeArmB = !nodeB.dNode ? 'D' : !nodeB.tNode ? 'T' : !nodeB.fNode ? 'F' : null;
+          // Find free arm on each — prefer D (diverging branch to another
+          // section). X is only ever a candidate for a diamond crossing.
+          const freeArmA = !nodeA.dNode ? 'D' : !nodeA.tNode ? 'T' : !nodeA.fNode ? 'F'
+            : (nodeA.railwayType === 'diamond' && !nodeA.xNode) ? 'X' : null;
+          const freeArmB = !nodeB.dNode ? 'D' : !nodeB.tNode ? 'T' : !nodeB.fNode ? 'F'
+            : (nodeB.railwayType === 'diamond' && !nodeB.xNode) ? 'X' : null;
           if (!freeArmA || !freeArmB) continue;
 
-          const fieldA = freeArmA === 'F' ? 'fNode' : freeArmA === 'T' ? 'tNode' : 'dNode';
-          const branchA = freeArmA === 'F' ? 'fOnBranch' : freeArmA === 'T' ? 'tOnBranch' : 'dOnBranch';
+          const fieldA = branchToNodeField(freeArmA);
+          const branchA = branchToBranchField(freeArmA);
           nodeA[fieldA] = nodeB.name;
           nodeA[branchA] = freeArmB;
 
-          const fieldB = freeArmB === 'F' ? 'fNode' : freeArmB === 'T' ? 'tNode' : 'dNode';
-          const branchB = freeArmB === 'F' ? 'fOnBranch' : freeArmB === 'T' ? 'tOnBranch' : 'dOnBranch';
+          const fieldB = branchToNodeField(freeArmB);
+          const branchB = branchToBranchField(freeArmB);
           nodeB[fieldB] = nodeA.name;
           nodeB[branchB] = freeArmA;
 
@@ -1061,13 +898,14 @@ async function generateInfrastructureForSections(confirmedSections, networkName,
 
     // Also follow cross-section chains for junctions that don't share a key
     for (const node of nodes) {
-      if (node.fNode && node.tNode && node.dNode) continue;
+      const armsFull = (n) => n.fNode && n.tNode && n.dNode && (n.railwayType !== 'diamond' || n.xNode);
+      if (armsFull(node)) continue;
       const realKey = node._topoKey;
       if (!realKey) continue;
       const conns = node._topoConns ?? adj.get(realKey) ?? [];
 
       for (const conn of conns) {
-        if (node.fNode && node.tNode && node.dNode) break;
+        if (armsFull(node)) break;
 
         const result = followChainToNode(realKey, conn.wayId, waysById, adj, allSectionNodeKeys);
         if (!result) continue;
@@ -1080,48 +918,25 @@ async function generateInfrastructureForSections(confirmedSections, networkName,
         if (!farNode) continue;
 
         // Already connected?
-        if (node.fNode === farNode.name || node.tNode === farNode.name || node.dNode === farNode.name) continue;
+        if (node.fNode === farNode.name || node.tNode === farNode.name ||
+            node.dNode === farNode.name || node.xNode === farNode.name) continue;
 
         // Determine source branch
-        let sourceConns = conns;
-        let sourceBranch;
-        if (node._degree4Partner) {
-          const taggedConn = conns.find(c => c.wayId === conn.wayId);
-          sourceBranch = taggedConn?._deg4Branch ?? (!node.tNode ? 'T' : !node.dNode ? 'D' : null);
-        } else {
-          sourceBranch = determineBranch(realKey, sourceConns, conn.wayId, waysById, node.km, null);
-        }
+        const sourceBranch = determineBranch(realKey, conns, conn.wayId, waysById, node.km, null);
         if (!sourceBranch) continue;
 
-        const nodeField = sourceBranch === 'F' ? 'fNode' : sourceBranch === 'T' ? 'tNode' : 'dNode';
+        const nodeField = branchToNodeField(sourceBranch);
         if (node[nodeField]) continue;
 
         // Determine far branch
         const farNodeKey = farNode._topoKey || reachedKey;
         let farNodeConns = farNode._topoConns || adj.get(farNodeKey) || [];
-        let farBranch;
-        if (farNode._degree4Partner) {
-          const taggedFarConn = farNodeConns.find(c => c.wayId === arrivedViaWayId);
-          farBranch = taggedFarConn?._deg4Branch ?? null;
-          if (!farBranch) {
-            const partner = farNode._degree4Partner;
-            const augmented = [...farNodeConns, {
-              wayId: `_synthetic_partner_${farNode.name}`,
-              otherKey: `${partner.lat},${partner.lon}`,
-              _isSynthetic: true
-            }];
-            farBranch = determineBranch(
-              farNodeKey, augmented, arrivedViaWayId, waysById, farNode.km, null
-            );
-          }
-        } else {
-          farBranch = determineBranch(
-            farNodeKey, farNodeConns, arrivedViaWayId, waysById, farNode.km, null
-          );
-        }
+        const farBranch = determineBranch(
+          farNodeKey, farNodeConns, arrivedViaWayId, waysById, farNode.km, null
+        );
         if (!farBranch) continue;
 
-        const branchField = sourceBranch === 'F' ? 'fOnBranch' : sourceBranch === 'T' ? 'tOnBranch' : 'dOnBranch';
+        const branchField = branchToBranchField(sourceBranch);
         node[nodeField] = farNode.name;
         node[branchField] = farBranch;
 
@@ -1139,10 +954,11 @@ async function generateInfrastructureForSections(confirmedSections, networkName,
       if (n.fNode) isReferenced.add(n.fNode);
       if (n.tNode) isReferenced.add(n.tNode);
       if (n.dNode) isReferenced.add(n.dNode);
+      if (n.xNode) isReferenced.add(n.xNode);
     }
     for (let i = nodes.length - 1; i >= 0; i--) {
       const n = nodes[i];
-      if (n.fNode || n.tNode || n.dNode) continue;
+      if (n.fNode || n.tNode || n.dNode || n.xNode) continue;
       if (isReferenced.has(n.name)) continue;
       nodes.splice(i, 1);
     }
@@ -1168,7 +984,7 @@ async function generateInfrastructureForSections(confirmedSections, networkName,
       if (!node.tNode && !node.dNode) continue; // completely unconnected — orphan pass handles it
 
       // Skip real turnouts — their branch labels are geometry-derived and correct
-      const topoDegreeC = (node._topoConns?.length ?? 0) + (node._degree4Partner ? 1 : 0);
+      const topoDegreeC = node._topoConns?.length ?? 0;
       if (topoDegreeC > 2) continue;
 
       // Determine what to swap into F
@@ -1218,7 +1034,7 @@ async function generateInfrastructureForSections(confirmedSections, networkName,
     for (const node of nodes) {
       // Skip partial turnouts: if the topology gives this node 3+ arms,
       // it is a real junction even if only 2 currently chain to a node.
-      const topoDegree = (node._topoConns?.length ?? 0) + (node._degree4Partner ? 1 : 0);
+      const topoDegree = node._topoConns?.length ?? 0;
       if (topoDegree > 2) continue;
 
       const hasFNode = !!node.fNode;
@@ -1290,16 +1106,16 @@ async function generateInfrastructureForSections(confirmedSections, networkName,
     const nodesByName = new Map(nodes.map(n => [n.name, n]));
 
     for (const node of nodes) {
-      const rawKey = node._topoKey;
-      if (!rawKey) continue;
-      const realKey = rawKey.endsWith('_deg4B') ? rawKey.slice(0, -6) : rawKey;
+      const realKey = node._topoKey;
+      if (!realKey) continue;
       const conns = node._topoConns ?? adj.get(realKey) ?? [];
-      const topoDegree = conns.length + (node._degree4Partner ? 1 : 0);
+      const topoDegree = conns.length;
       if (topoDegree < 3) continue;
-      if (node.fNode && node.tNode && node.dNode) continue;
+      const armsFull = node.fNode && node.tNode && node.dNode && (node.railwayType !== 'diamond' || node.xNode);
+      if (armsFull) continue;
 
       for (const conn of conns) {
-        if (node.fNode && node.tNode && node.dNode) break;
+        if (node.fNode && node.tNode && node.dNode && (node.railwayType !== 'diamond' || node.xNode)) break;
 
         const result = followChainToNode(realKey, conn.wayId, waysById, adj, allTopoNodeKeys);
         if (!result) {
@@ -1315,29 +1131,13 @@ async function generateInfrastructureForSections(confirmedSections, networkName,
 
         // This chain exits the network boundary.  Determine which arm of
         // the source node this way belongs to.
-        let sourceConns = conns;
-        if (node._degree4Partner) {
-          const partner = node._degree4Partner;
-          sourceConns = [...conns, {
-            wayId: `_synthetic_partner_${node.name}`,
-            otherKey: `${partner.lat},${partner.lon}`,
-            _isSynthetic: true
-          }];
-        }
-
-        let sourceBranch;
-        if (node._degree4Partner) {
-          const taggedConn = conns.find(c => c.wayId === conn.wayId);
-          sourceBranch = taggedConn?._deg4Branch ?? null;
-        } else {
-          sourceBranch = determineBranch(
-            realKey, sourceConns, conn.wayId, waysById, node.km, null
-          );
-        }
+        const sourceBranch = determineBranch(
+          realKey, conns, conn.wayId, waysById, node.km, null
+        );
         if (!sourceBranch) continue;
 
         // Only create boundary node if this arm is still empty
-        const nodeField = sourceBranch === 'F' ? 'fNode' : sourceBranch === 'T' ? 'tNode' : 'dNode';
+        const nodeField = branchToNodeField(sourceBranch);
         if (node[nodeField]) {
           continue;
         }
@@ -1367,7 +1167,7 @@ async function generateInfrastructureForSections(confirmedSections, networkName,
         nodesByName.set(bName, boundaryNode);
 
         // Wire the source node's empty arm to the boundary node's F
-        const branchField = sourceBranch === 'F' ? 'fOnBranch' : sourceBranch === 'T' ? 'tOnBranch' : 'dOnBranch';
+        const branchField = branchToBranchField(sourceBranch);
         node[nodeField] = bName;
         node[branchField] = 'F';
 
@@ -1386,13 +1186,39 @@ async function generateInfrastructureForSections(confirmedSections, networkName,
   // requirement applies to kilometrage, not physical coordinates.
   // ensureKmSeparation (called after Step 11) handles the km rule.
 
-  // ── Step 10: Platform nodes — DISABLED ──
-  // Platform fetching and insertion is disabled pending a future enhancement.
-  // Proper implementation requires geo-matching platforms to track links and
-  // link-splitting.  The Overpass query and insertion loop are preserved in
-  // source but skipped at runtime to save time.
-  // To re-enable: remove the `if (false)` guard below.
-  if (false) {
+  updateProgress(80, 'Enforcing reciprocal links');
+  // ── Step 10: Enforce reciprocal links ──
+  enforceReciprocalLinks(nodes, warnings);
+
+  // ── Step 11: Platform nodes ──
+  // Platforms are standalone OSM ways with no relation tying them to "their"
+  // track (Overpass fetch below is a pure tag+bbox query) — proximity to
+  // actual track geometry is the only signal available, so they have to be
+  // geo-matched to an existing LINK and spliced into it, splitting that link
+  // in two.
+  //
+  // Matching against the deduplicated per-region centerline (geometryBySection)
+  // is NOT enough: the geometry pipeline collapses parallel tracks onto one
+  // centerline before this stage ever runs, so a station's 2nd/3rd platform
+  // track was never kept as its own line, and Step 6 doesn't create a node
+  // for a plain (non-junction) point along it either — a loop track between
+  // two turnouts is invisible to a centerline-only search. So instead we
+  // search every real graph LINK (any two nodes already connected via an
+  // arm), reconstructing each link's own true OSM geometry by walking its
+  // topology chain — mainline and every loop/siding alike are candidates,
+  // and each platform attaches to whichever one it's physically closest to.
+  // Falls back to a straight line between endpoints only when a link's
+  // topology can't be walked (e.g. one end is a synthetic boundary node).
+  //
+  // Scoped to platforms landing on an ordinary degree-2 stretch of track (the
+  // overwhelming majority — normal wayside/through stations); a platform
+  // that geo-matches close to a turnout or diamond is skipped with a warning
+  // rather than risking an incorrect splice into a junction's own arm.
+  // Inserted with Signalled F/T = false (the engine's new per-end signalling
+  // flag) so it reads as an unsignalled waypoint rather than implying a
+  // signal that isn't there.
+  const PLATFORM_MATCH_THRESHOLD_M = 100;
+  const PLATFORM_JUNCTION_BUFFER_M = 50;
   updateProgress(75, 'Fetching platform nodes');
   let platforms = [];
   if (bbox) {
@@ -1412,11 +1238,165 @@ async function generateInfrastructureForSections(confirmedSections, networkName,
       }
     }
   }
-  } // end disabled Step 10
 
-  updateProgress(80, 'Enforcing reciprocal links');
-  // ── Step 11: Enforce reciprocal links ──
-  enforceReciprocalLinks(nodes, warnings);
+  if (platforms.length > 0) {
+    const ARM_FIELDS = ['fNode', 'tNode', 'dNode', 'xNode'];
+    const findArmTo = (node, targetName) => ARM_FIELDS.find(f => node[f] === targetName) ?? null;
+
+    // Walk a link's real topology chain from `startKey` along `wayId`,
+    // collecting every intermediate OSM vertex with a cumulative distance
+    // (in km, arbitrary zero-point — NOT regional kilometrage) so the
+    // resulting polyline can be handed straight to projectOntoGeometry().
+    // Mirrors followChainToNode()'s own traversal/termination logic but
+    // additionally records geometry instead of only the reached key.
+    function reconstructLinkPolyline(startKey, wayId, targetTopoKey) {
+      const { lat: sLat, lon: sLon } = parseCoordKey(startKey);
+      const points = [{ lat: sLat, lon: sLon, km: 0 }];
+      let cumKm = 0;
+      let cursorKey = startKey;
+      let currentWayId = wayId;
+      const MAX_CHAIN_LENGTH = 1000;
+
+      for (let step = 0; step < MAX_CHAIN_LENGTH; step++) {
+        const way = waysById.get(currentWayId);
+        if (!way || !way.coords || way.coords.length < 2) return null;
+
+        const coords = way.coords;
+        const firstKey = makeCoordKey(coords[0].lat, coords[0].lon);
+        const lastKey = makeCoordKey(coords[coords.length - 1].lat, coords[coords.length - 1].lon);
+
+        let seq, nextKey;
+        if (firstKey === cursorKey) { seq = coords; nextKey = lastKey; }
+        else if (lastKey === cursorKey) { seq = [...coords].reverse(); nextKey = firstKey; }
+        else return null; // cursor isn't an endpoint of this way — shouldn't happen
+
+        for (let i = 1; i < seq.length; i++) {
+          cumKm += haversineM(seq[i - 1], seq[i]) / 1000;
+          points.push({ lat: seq[i].lat, lon: seq[i].lon, km: cumKm });
+        }
+
+        cursorKey = nextKey;
+        if (cursorKey === targetTopoKey) return { points };
+
+        const nextConns = (adj.get(cursorKey) || []).filter(c => c.wayId !== currentWayId);
+        if (nextConns.length !== 1) return null; // dead end or a different junction — not our target
+        currentWayId = nextConns[0].wayId;
+      }
+      return null;
+    }
+
+    // Reconstruct the real geometry of the link between two adjacent nodes,
+    // falling back to a straight line when either end lacks topology data
+    // (e.g. a Step 8e boundary node) or the chain can't be walked.
+    function linkPolyline(a, b) {
+      if (a._topoConns && a._topoKey && b._topoKey) {
+        for (const conn of a._topoConns) {
+          const result = reconstructLinkPolyline(a._topoKey, conn.wayId, b._topoKey);
+          if (result) return result.points;
+        }
+      }
+      return [
+        { lat: a.lat, lon: a.lon, km: 0 },
+        { lat: b.lat, lon: b.lon, km: haversineM(a, b) / 1000 },
+      ];
+    }
+
+    const nodesByName = new Map(nodes.map(n => [n.name, n]));
+    // Deterministic order so repeated runs against the same data produce the
+    // same result regardless of Overpass's own element ordering.
+    const sortedPlatforms = [...platforms].sort((a, b) => a.name.localeCompare(b.name));
+    let insertedCount = 0;
+
+    for (const platform of sortedPlatforms) {
+      const point = { lat: platform.centLat, lon: platform.centLon };
+
+      // Rebuilt fresh each time: earlier insertions in this loop become new
+      // candidate links, so a second platform landing on an already-spliced
+      // link correctly narrows against the new, shorter remainder.
+      let best = null;
+      for (const node of nodes) {
+        for (const armField of ARM_FIELDS) {
+          const neighborName = node[armField];
+          if (!neighborName) continue;
+          const neighbor = nodesByName.get(neighborName);
+          if (!neighbor) continue;
+
+          const poly = linkPolyline(node, neighbor);
+          const { km: polyKm, projLat, projLon } = projectOntoGeometry(point, poly);
+          const distM = haversineM(point, { lat: projLat, lon: projLon });
+          if (!best || distM < best.distM) {
+            best = { a: node, b: neighbor, armOnA: armField, poly, polyKm, projLat, projLon, distM };
+          }
+        }
+      }
+
+      if (!best || best.distM > PLATFORM_MATCH_THRESHOLD_M) {
+        warnings.push(`Platform "${platform.name}": no track within ${PLATFORM_MATCH_THRESHOLD_M}m — skipped.`);
+        continue;
+      }
+      const { a, b, armOnA, poly, polyKm, projLat, projLon } = best;
+
+      const nearJunction =
+        (['junction', 'diamond'].includes(a.railwayType) && haversineM({ lat: projLat, lon: projLon }, a) < PLATFORM_JUNCTION_BUFFER_M) ||
+        (['junction', 'diamond'].includes(b.railwayType) && haversineM({ lat: projLat, lon: projLon }, b) < PLATFORM_JUNCTION_BUFFER_M);
+      if (nearJunction) {
+        warnings.push(`Platform "${platform.name}": within ${PLATFORM_JUNCTION_BUFFER_M}m of a turnout/diamond — ` +
+          `skipped (splice into a junction arm needs manual review).`);
+        continue;
+      }
+
+      const armOnB = findArmTo(b, a.name);
+      if (!armOnB) {
+        warnings.push(`Platform "${platform.name}": matched link "${a.name}" / "${b.name}" isn't ` +
+          `reciprocally linked — skipped (manual insertion needed).`);
+        continue;
+      }
+
+      // Regional kilometrage: interpolate between the two endpoints' own km
+      // along the fraction of the way this platform sits along the link's
+      // (arbitrary zero-point) reconstructed length. Falls back to a's own
+      // km/region when the two ends don't share a region to interpolate on.
+      const totalPolyKm = poly[poly.length - 1].km;
+      const t = totalPolyKm > 0 ? polyKm / totalPolyKm : 0;
+      const region = a.region;
+      const km = (b.region === a.region && a.km != null && b.km != null)
+        ? a.km + t * (b.km - a.km)
+        : a.km ?? 0;
+
+      // Unique name
+      let platName = platform.name;
+      let pIdx = 0;
+      while (nodesByName.has(platName)) {
+        platName = `${platform.name} ${String.fromCharCode(65 + pIdx++)}`;
+      }
+
+      const platformNode = {
+        name: platName,
+        lat: projLat, lon: projLon, km,
+        region,
+        railwayType: 'platform',
+        signalledF: false,
+        signalledT: false,
+        fNode: a.name,
+        fOnBranch: fieldToBranch(armOnA),
+        tNode: b.name,
+        tOnBranch: fieldToBranch(armOnB),
+      };
+      nodes.push(platformNode);
+      nodesByName.set(platName, platformNode);
+
+      a[armOnA] = platName;
+      a[branchToBranchField(fieldToBranch(armOnA))] = 'F';
+      b[armOnB] = platName;
+      b[branchToBranchField(fieldToBranch(armOnB))] = 'T';
+
+      insertedCount++;
+    }
+
+    if (insertedCount > 0) {
+      warnings.push(`Platforms: inserted ${insertedCount} platform node(s), unsignalled (Signalled F/T = False).`);
+    }
+  }
 
   // Second orphan removal pass — connections may have been cleared by
   // enforceReciprocalLinks, leaving topo nodes with no links.
@@ -1427,11 +1407,12 @@ async function generateInfrastructureForSections(confirmedSections, networkName,
       if (n.fNode) isReferenced.add(n.fNode);
       if (n.tNode) isReferenced.add(n.tNode);
       if (n.dNode) isReferenced.add(n.dNode);
+      if (n.xNode) isReferenced.add(n.xNode);
     }
     for (let i = nodes.length - 1; i >= 0; i--) {
       const n = nodes[i];
       if (n.railwayType === 'platform') continue;
-      if (n.fNode || n.tNode || n.dNode) continue;
+      if (n.fNode || n.tNode || n.dNode || n.xNode) continue;
       if (isReferenced.has(n.name)) continue;
       nodes.splice(i, 1);
     }
@@ -1598,8 +1579,8 @@ async function generateInfrastructureForSections(confirmedSections, networkName,
 
   updateProgress(85, 'Computing display positions');
   // ── Step 12: Clean up internal annotations ──
-  // Note: _topoKey, _topoConns, _degree4Partner are cleaned up AFTER Step 14
-  // (flip calculation) which needs them.  Only general annotations removed here.
+  // Note: _topoKey, _topoConns are cleaned up AFTER Step 14 (flip calculation)
+  // which needs them.  Only general annotations removed here.
 
   updateProgress(87, 'Applying station-based naming');
 
@@ -1704,12 +1685,13 @@ async function generateInfrastructureForSections(confirmedSections, networkName,
         }
       }
 
-      // Apply renames: node names and all F/T/D cross-references
+      // Apply renames: node names and all F/T/D/X cross-references
       for (const n of nodes) {
         if (renameMap.has(n.name))  n.name  = renameMap.get(n.name);
         if (n.fNode && renameMap.has(n.fNode)) n.fNode = renameMap.get(n.fNode);
         if (n.tNode && renameMap.has(n.tNode)) n.tNode = renameMap.get(n.tNode);
         if (n.dNode && renameMap.has(n.dNode)) n.dNode = renameMap.get(n.dNode);
+        if (n.xNode && renameMap.has(n.xNode)) n.xNode = renameMap.get(n.xNode);
       }
 
       warnings.push(`Naming pass: renamed ${renameMap.size} of ${nodes.length} nodes to nearest-station convention`);
@@ -1805,23 +1787,10 @@ async function generateInfrastructureForSections(confirmedSections, networkName,
         //   negative → D diverges right → flip = true
         const cross = dirs[tIdx].dlon * dirs[dIdx].dlat - dirs[tIdx].dlat * dirs[dIdx].dlon;
         node.flip = cross < 0;
-      } else if (node.dNode && node._topoKey && node._topoConns && node._topoConns.length === 2
-                 && node._topoConns.every(c => c._deg4Branch)) {
-        // Degree-4 diamond crossing sub-node: _topoConns has exactly T and D,
-        // tagged with _deg4Branch.  Use the real (un-suffixed) topology key
-        // for way direction lookup.
-        const realKey = node._topoKey.endsWith('_deg4B')
-          ? node._topoKey.slice(0, -6)
-          : node._topoKey;
-        const tConn = node._topoConns.find(c => c._deg4Branch === 'T');
-        const dConn = node._topoConns.find(c => c._deg4Branch === 'D');
-        if (tConn && dConn) {
-          const tDir = computeWayDirection(realKey, tConn.wayId, waysById);
-          const dDir = computeWayDirection(realKey, dConn.wayId, waysById);
-          const cross = tDir.dlon * dDir.dlat - tDir.dlat * dDir.dlon;
-          node.flip = cross < 0;
-        }
       }
+      // Flip has no meaning for a diamond crossing (no diverge side to
+      // mirror — see manual: "hidden from the panel when Diamond crossing
+      // is ticked") so it's left at its default for railwayType 'diamond'.
     }
 
     // ── Auto-rotate nodes based on F/T connections ──
@@ -1892,7 +1861,6 @@ async function generateInfrastructureForSections(confirmedSections, networkName,
   for (const node of nodes) {
     delete node._topoKey;
     delete node._topoConns;
-    delete node._degree4Partner;
   }
 
   // ── Step 15: Branch-conflict and link-mismatch validation ──
@@ -2073,8 +2041,8 @@ async function generateInfrastructureForSections(confirmedSections, networkName,
   updateProgress(93, 'Building CSV output');
 
   // ── Step 17: Build Infrastructure CSV ──
-  const csv = buildInfrastructureCsv(nodes, networkName);
-  const connectionCount = nodes.filter(n => n.tNode || n.fNode).length;
+  const connectionCount = nodes.filter(n => n.tNode || n.fNode || n.dNode || n.xNode).length;
+  const csv = buildInfrastructureCsv(nodes, networkName, nodes.length, connectionCount);
 
   // Add final warnings
   warnings.push(
@@ -2087,7 +2055,7 @@ async function generateInfrastructureForSections(confirmedSections, networkName,
   );
 
   // Check for isolated nodes
-  const isolated = nodes.filter(n => !n.fNode && !n.tNode && !n.dNode);
+  const isolated = nodes.filter(n => !n.fNode && !n.tNode && !n.dNode && !n.xNode);
   if (isolated.length > 0) {
     warnings.push(
       `ISOLATED NODES (${isolated.length}): no connections — may be a separate sub-network or ` +
@@ -2105,23 +2073,34 @@ async function generateInfrastructureForSections(confirmedSections, networkName,
   };
 }
 
+/** Format a Date as "YYYY-MM-DD HH:mm:ss" (local time), matching the Network Editor's own stamp. */
+function formatTimestamp(date) {
+  const p = (n) => String(n).padStart(2, '0');
+  return `${date.getFullYear()}-${p(date.getMonth() + 1)}-${p(date.getDate())} ` +
+         `${p(date.getHours())}:${p(date.getMinutes())}:${p(date.getSeconds())}`;
+}
+
 /**
- * Build Infrastructure CSV content from nodes array
+ * Build Infrastructure CSV content from nodes array (v7 format).
  * @param {Array<Object>} nodes - Infrastructure nodes
  * @param {string} networkName - Network name
+ * @param {number} nodeCount - Total node count, for the version line
+ * @param {number} connectionCount - Total connection count, for the version line
  * @returns {string} CSV content
  */
-function buildInfrastructureCsv(nodes, networkName) {
+function buildInfrastructureCsv(nodes, networkName, nodeCount, connectionCount) {
   const lines = [
-    `#6,Traxim v6 - Generated by traxim-input-creator-mcp`,
+    `#7,Traxim v7 ${formatTimestamp(new Date())} nodes ${nodeCount} connections ${connectionCount}`,
     networkName,
-    `#Name,F Enabled,T Enabled,D Enabled,F Node,F on branch,T Node,T on branch,D Node,D on branch,Region1,Km1,Region2,Km2,Region3,Km3,Default branch,PosX,PosY,Length,Width,Rotation,Flip,Mirror,Draw,OffsetX,OffsetY,Latitude,Longitude`,
+    `#Name,F Enabled,T Enabled,D Enabled,X Enabled,F Node,F on branch,T Node,T on branch,D Node,D on branch,X Node,X on branch,Region1,Km1,Region2,Km2,Region3,Km3,Region4,Km4,Default branch,Length,Width,Rotation,Flip,Draw,Timing Point,Capacity Point,Signalled F,Signalled T,SimEntry Permitted,SimArrival Timeout,PosX,PosY,OffsetX,OffsetY,Latitude,Longitude`,
   ];
 
   for (const node of nodes) {
+    const isDiamond = node.railwayType === 'diamond';
     lines.push(
       [
         sanitiseName(node.name),
+        'True',
         'True',
         'True',
         'True',
@@ -2131,21 +2110,30 @@ function buildInfrastructureCsv(nodes, networkName) {
         node.tNode ? (node.tOnBranch ?? 'F') : '',
         node.dNode ? sanitiseName(node.dNode) : '',
         node.dNode ? (node.dOnBranch ?? 'F') : '',
+        node.xNode ? sanitiseName(node.xNode) : '',
+        node.xNode ? (node.xOnBranch ?? 'F') : '',
         node.region || '',
         (node.km ?? 0).toFixed(3),
         node.region2 || '',
         node.km2 != null ? node.km2.toFixed(3) : '',
         node.region3 || '',
         node.km3 != null ? node.km3.toFixed(3) : '',
-        'T',
-        node.posX ?? '0',
-        node.posY ?? '0',
+        '', // Region4 — not currently tracked (nodes span at most 3 regions)
+        '', // Km4
+        isDiamond ? '' : 'T', // Default branch — no default for a diamond crossing
         '40',
         '20',
         node.rotation ?? 0,
         node.flip ? 'True' : 'False',
-        'False',
-        'True',
+        'True', // Draw
+        'True', // Timing Point — mirrors Draw, preserving pre-v7 behaviour where the two were coupled
+        'False', // Capacity Point
+        node.signalledF === false ? 'False' : 'True',
+        node.signalledT === false ? 'False' : 'True',
+        'False', // SimEntry Permitted
+        '60', // SimArrival Timeout
+        node.posX ?? '0',
+        node.posY ?? '0',
         node.offsetX ?? '0',
         node.offsetY ?? '0',
         node.lat.toFixed(8),

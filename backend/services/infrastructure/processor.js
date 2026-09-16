@@ -16,6 +16,24 @@ const SNAP_THRESHOLD_M = 0.5;   // 0.5m threshold for coordinate matching
 const COORD_PRECISION = 7;      // ~1cm precision for coordinate keys
 
 /**
+ * Map a branch letter (F/T/D/X) to its node-name field. X is only meaningful
+ * for a diamond crossing's fourth arm (see determineBranch).
+ */
+function branchToNodeField(branch) {
+  return branch === 'F' ? 'fNode' : branch === 'T' ? 'tNode' : branch === 'D' ? 'dNode' : 'xNode';
+}
+
+/** Map a branch letter (F/T/D/X) to its on-branch field. */
+function branchToBranchField(branch) {
+  return branch === 'F' ? 'fOnBranch' : branch === 'T' ? 'tOnBranch' : branch === 'D' ? 'dOnBranch' : 'xOnBranch';
+}
+
+/** Map a node-name field (fNode/tNode/dNode/xNode) back to its branch letter. */
+function fieldToBranch(field) {
+  return field === 'fNode' ? 'F' : field === 'tNode' ? 'T' : field === 'dNode' ? 'D' : 'X';
+}
+
+/**
  * Calculate haversine distance between two points in metres.
  * @param {{lat: number, lon: number}} a - First point
  * @param {{lat: number, lon: number}} b - Second point
@@ -318,7 +336,43 @@ function determineBranch(nodeKey, nodeConns, arrivedViaWayId, waysById, nodeKm, 
     return nodeConns[0].wayId === arrivedViaWayId ? 'F' : 'T';
   }
 
-  if (degree >= 3) {
+  if (degree === 4) {
+    // Diamond crossing - two independent tracks cross at this point with no
+    // physical connection between them (F-T pair and D-X pair).  Find the
+    // pairing into two 2-groups that minimises the summed dot product (most
+    // mutually-opposite pairs = the two straight-through crossing tracks) —
+    // same geometric test the old two-turnout workaround used to detect a
+    // diamond in the first place, just resolving all 4 arms on one node
+    // instead of splitting it across two synthetic nodes.
+    const dirs = nodeConns.map(c => ({
+      wayId: c.wayId,
+      ...computeWayDirection(nodeKey, c.wayId, waysById)
+    }));
+
+    const pairings = [[[0, 1], [2, 3]], [[0, 2], [1, 3]], [[0, 3], [1, 2]]];
+    let bestScore = Infinity, bestPairing = pairings[0];
+    for (const [[a, b], [c, d]] of pairings) {
+      const score =
+        dirs[a].dlat * dirs[b].dlat + dirs[a].dlon * dirs[b].dlon +
+        dirs[c].dlat * dirs[d].dlat + dirs[c].dlon * dirs[d].dlon;
+      if (score < bestScore) {
+        bestScore = score;
+        bestPairing = [[a, b], [c, d]];
+      }
+    }
+
+    // Arbitrary but consistent: first pair → F/T, second pair → D/X. A
+    // diamond has no diverge semantics, so which physical track gets which
+    // label doesn't matter — only that both ends of a link agree, which
+    // reciprocal-link enforcement guarantees downstream.
+    const [[fIdx, tIdx], [dIdx, xIdx]] = bestPairing;
+    if (arrivedViaWayId === dirs[fIdx].wayId) return 'F';
+    if (arrivedViaWayId === dirs[tIdx].wayId) return 'T';
+    if (arrivedViaWayId === dirs[dIdx].wayId) return 'D';
+    if (arrivedViaWayId === dirs[xIdx].wayId) return 'X';
+  }
+
+  if (degree === 3) {
     // Turnout - branch identification.
     // Primary signal: OSM way continuity.  After splitting at intermediate
     // junctions, two segments of the same original way share a base ID
@@ -347,14 +401,12 @@ function determineBranch(nodeKey, nodeConns, arrivedViaWayId, waysById, nodeKm, 
     const baseId = (id) => id.replace(/_\d+$/, '');
     let ftIdx1 = -1, ftIdx2 = -1;
 
-    if (degree === 3) {
-      const bases = dirs.map(d => baseId(d.wayId));
-      for (let i = 0; i < 3; i++) {
-        for (let j = i + 1; j < 3; j++) {
-          if (bases[i] === bases[j]) {
-            ftIdx1 = i;
-            ftIdx2 = j;
-          }
+    const bases = dirs.map(d => baseId(d.wayId));
+    for (let i = 0; i < 3; i++) {
+      for (let j = i + 1; j < 3; j++) {
+        if (bases[i] === bases[j]) {
+          ftIdx1 = i;
+          ftIdx2 = j;
         }
       }
     }
@@ -511,16 +563,13 @@ function applySpatialSeparation(nodes, warnings) {
     let adjustmentsMade = false;
 
     for (const node of nodes) {
-      for (const branch of ['F', 'T', 'D']) {
-        const branchFieldNode = branch === 'F' ? 'fNode' : branch === 'T' ? 'tNode' : 'dNode';
+      for (const branch of ['F', 'T', 'D', 'X']) {
+        const branchFieldNode = branchToNodeField(branch);
         const connectedName = node[branchFieldNode];
         if (!connectedName) continue;
 
         const connected = nodes.find(n => n.name === connectedName);
         if (!connected) continue;
-
-        // Skip degree-4 partners (already spatially separated at creation)
-        if (node._degree4Partner === connected || connected._degree4Partner === node) continue;
 
         // Compute distance in metres (not degree space) to avoid
         // longitude-scaling error at mid-latitudes
@@ -583,7 +632,8 @@ function enforceReciprocalLinks(nodes, warnings) {
     for (const [armField, branchField] of [
       ['fNode', 'fOnBranch'],
       ['tNode', 'tOnBranch'],
-      ['dNode', 'dOnBranch']
+      ['dNode', 'dOnBranch'],
+      ['xNode', 'xOnBranch']
     ]) {
       const targetName = node[armField];
       const targetBranch = node[branchField];
@@ -596,13 +646,10 @@ function enforceReciprocalLinks(nodes, warnings) {
         continue;
       }
 
-      const targetArmField = targetBranch === 'F' ? 'fNode' :
-                             targetBranch === 'T' ? 'tNode' : 'dNode';
-      const targetArmBranchField = targetBranch === 'F' ? 'fOnBranch' :
-                                    targetBranch === 'T' ? 'tOnBranch' : 'dOnBranch';
+      const targetArmField = branchToNodeField(targetBranch);
+      const targetArmBranchField = branchToBranchField(targetBranch);
 
-      const sourceBranch = armField === 'fNode' ? 'F' :
-                           armField === 'tNode' ? 'T' : 'D';
+      const sourceBranch = fieldToBranch(armField);
 
       const reciprocalName = targetNode[targetArmField];
       const reciprocalBranch = targetNode[targetArmBranchField];
@@ -615,8 +662,7 @@ function enforceReciprocalLinks(nodes, warnings) {
           // If so, do NOT overwrite — the current node's claim is the stale one.
           const otherNode = nodeByName.get(reciprocalName);
           if (otherNode) {
-            const otherArmField = reciprocalBranch === 'F' ? 'fNode' :
-                                  reciprocalBranch === 'T' ? 'tNode' : 'dNode';
+            const otherArmField = branchToNodeField(reciprocalBranch);
             if (otherNode[otherArmField] === targetName) {
               // Existing reciprocal pair is valid — skip overwrite, clear stale claim
               warnings.push(
@@ -663,6 +709,9 @@ export {
   computeWayDirection,
   followChainToNode,
   determineBranch,
+  branchToNodeField,
+  branchToBranchField,
+  fieldToBranch,
   nearestKm,
   projectOntoGeometry,
   applySpatialSeparation,
