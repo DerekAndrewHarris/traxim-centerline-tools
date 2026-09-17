@@ -312,6 +312,76 @@ function followChainToNode(startKey, wayId, waysById, adj, sectionNodeKeys) {
 }
 
 /**
+ * Resolve which of a degree-4 diamond crossing's four raw connections is
+ * F/T/D/X. Shared by determineBranch() (assigning each arriving way to a
+ * branch) and the diamond flip computation in generator.js (which needs the
+ * same F/T/D/X assignment and direction vectors to decide handedness) - both
+ * must agree on the same pairing, so this lives in one place.
+ * @returns {{dirs: Array<{wayId:string,dlat:number,dlon:number}>, fIdx:number, tIdx:number, dIdx:number, xIdx:number}}
+ */
+function computeDiamondBranchIndices(nodeKey, nodeConns, waysById) {
+  const dirs = nodeConns.map(c => ({
+    wayId: c.wayId,
+    ...computeWayDirection(nodeKey, c.wayId, waysById)
+  }));
+
+  // Primary signal: OSM way continuity, same principle as the degree-3
+  // case below — two segments of the same original way (sharing a base ID
+  // once the splitWaysAtIntermediateJunctions suffix is stripped) are
+  // definitively one continuous physical track through this point, not a
+  // geometric guess. This matters more here than at a turnout: a busy yard
+  // throat often has several tracks meeting at shallow, similar angles
+  // rather than one clean near-90° crossing, which angle-based pairing
+  // alone can misjudge.
+  const baseId4 = (id) => id.replace(/_\d+$/, '');
+  const bases4 = dirs.map(d => baseId4(d.wayId));
+  let bestPairing = null;
+  outer: for (let i = 0; i < 4; i++) {
+    for (let j = i + 1; j < 4; j++) {
+      if (bases4[i] !== bases4[j]) continue;
+      const rest = [0, 1, 2, 3].filter(k => k !== i && k !== j);
+      bestPairing = [[i, j], rest];
+      break outer;
+    }
+  }
+
+  // Fallback: angle-based analysis (most-opposite dot product pairing —
+  // the two straight-through crossing tracks are the pair whose combined
+  // direction is closest to directly opposite) when no shared base way ID
+  // exists for either pair.
+  if (!bestPairing) {
+    const pairings = [[[0, 1], [2, 3]], [[0, 2], [1, 3]], [[0, 3], [1, 2]]];
+    let bestScore = Infinity;
+    bestPairing = pairings[0];
+    for (const [[a, b], [c, d]] of pairings) {
+      const score =
+        dirs[a].dlat * dirs[b].dlat + dirs[a].dlon * dirs[b].dlon +
+        dirs[c].dlat * dirs[d].dlat + dirs[c].dlon * dirs[d].dlon;
+      if (score < bestScore) {
+        bestScore = score;
+        bestPairing = [[a, b], [c, d]];
+      }
+    }
+  }
+
+  // First pair → F/T (arbitrary but consistent — a diamond has no diverge
+  // semantics, so which physical track gets F vs T doesn't matter, only
+  // that both ends of a link agree, which reciprocal-link enforcement
+  // guarantees downstream). Second pair → D/X, but NOT arbitrarily: D is
+  // whichever of the two is angularly closer to F (i.e. sits on F's side
+  // of the crossing) and X whichever is closer to T, so the crossing
+  // reads consistently rather than depending on incidental array order —
+  // confirmed against a real case where the naive index-order assignment
+  // put D and X on the wrong sides relative to F/T.
+  const [[fIdx, tIdx], [dIdx0, xIdx0]] = bestPairing;
+  const dotD0F = dirs[dIdx0].dlat * dirs[fIdx].dlat + dirs[dIdx0].dlon * dirs[fIdx].dlon;
+  const dotD0T = dirs[dIdx0].dlat * dirs[tIdx].dlat + dirs[dIdx0].dlon * dirs[tIdx].dlon;
+  const [dIdx, xIdx] = dotD0T > dotD0F ? [xIdx0, dIdx0] : [dIdx0, xIdx0];
+
+  return { dirs, fIdx, tIdx, dIdx, xIdx };
+}
+
+/**
  * Determine which branch (F/T/D) a way arrives at on a node.
  * For degree-3 nodes: angle analysis to find through route vs diverging.
  * For degree-2 nodes: F if toward lower km, T if toward higher km.
@@ -338,64 +408,10 @@ function determineBranch(nodeKey, nodeConns, arrivedViaWayId, waysById, nodeKm, 
 
   if (degree === 4) {
     // Diamond crossing - two independent tracks cross at this point with no
-    // physical connection between them (F-T pair and D-X pair).
-    const dirs = nodeConns.map(c => ({
-      wayId: c.wayId,
-      ...computeWayDirection(nodeKey, c.wayId, waysById)
-    }));
-
-    // Primary signal: OSM way continuity, same principle as the degree-3
-    // case below — two segments of the same original way (sharing a base ID
-    // once the splitWaysAtIntermediateJunctions suffix is stripped) are
-    // definitively one continuous physical track through this point, not a
-    // geometric guess. This matters more here than at a turnout: a busy yard
-    // throat often has several tracks meeting at shallow, similar angles
-    // rather than one clean near-90° crossing, which angle-based pairing
-    // alone can misjudge.
-    const baseId4 = (id) => id.replace(/_\d+$/, '');
-    const bases4 = dirs.map(d => baseId4(d.wayId));
-    let bestPairing = null;
-    outer: for (let i = 0; i < 4; i++) {
-      for (let j = i + 1; j < 4; j++) {
-        if (bases4[i] !== bases4[j]) continue;
-        const rest = [0, 1, 2, 3].filter(k => k !== i && k !== j);
-        bestPairing = [[i, j], rest];
-        break outer;
-      }
-    }
-
-    // Fallback: angle-based analysis (most-opposite dot product pairing —
-    // the two straight-through crossing tracks are the pair whose combined
-    // direction is closest to directly opposite) when no shared base way ID
-    // exists for either pair.
-    if (!bestPairing) {
-      const pairings = [[[0, 1], [2, 3]], [[0, 2], [1, 3]], [[0, 3], [1, 2]]];
-      let bestScore = Infinity;
-      bestPairing = pairings[0];
-      for (const [[a, b], [c, d]] of pairings) {
-        const score =
-          dirs[a].dlat * dirs[b].dlat + dirs[a].dlon * dirs[b].dlon +
-          dirs[c].dlat * dirs[d].dlat + dirs[c].dlon * dirs[d].dlon;
-        if (score < bestScore) {
-          bestScore = score;
-          bestPairing = [[a, b], [c, d]];
-        }
-      }
-    }
-
-    // First pair → F/T (arbitrary but consistent — a diamond has no diverge
-    // semantics, so which physical track gets F vs T doesn't matter, only
-    // that both ends of a link agree, which reciprocal-link enforcement
-    // guarantees downstream). Second pair → D/X, but NOT arbitrarily: D is
-    // whichever of the two is angularly closer to F (i.e. sits on F's side
-    // of the crossing) and X whichever is closer to T, so the crossing
-    // reads consistently rather than depending on incidental array order —
-    // confirmed against a real case where the naive index-order assignment
-    // put D and X on the wrong sides relative to F/T.
-    const [[fIdx, tIdx], [dIdx0, xIdx0]] = bestPairing;
-    const dotD0F = dirs[dIdx0].dlat * dirs[fIdx].dlat + dirs[dIdx0].dlon * dirs[fIdx].dlon;
-    const dotD0T = dirs[dIdx0].dlat * dirs[tIdx].dlat + dirs[dIdx0].dlon * dirs[tIdx].dlon;
-    const [dIdx, xIdx] = dotD0T > dotD0F ? [xIdx0, dIdx0] : [dIdx0, xIdx0];
+    // physical connection between them (F-T pair and D-X pair). Pairing
+    // decision (and dirs) shared with the flip computation in generator.js
+    // so both use exactly the same F/T/D/X assignment.
+    const { dirs, fIdx, tIdx, dIdx, xIdx } = computeDiamondBranchIndices(nodeKey, nodeConns, waysById);
     if (arrivedViaWayId === dirs[fIdx].wayId) return 'F';
     if (arrivedViaWayId === dirs[tIdx].wayId) return 'T';
     if (arrivedViaWayId === dirs[dIdx].wayId) return 'D';
@@ -739,6 +755,7 @@ export {
   computeWayDirection,
   followChainToNode,
   determineBranch,
+  computeDiamondBranchIndices,
   branchToNodeField,
   branchToBranchField,
   fieldToBranch,

@@ -30,6 +30,7 @@ import {
   computeWayDirection,
   followChainToNode,
   determineBranch,
+  computeDiamondBranchIndices,
   branchToNodeField,
   branchToBranchField,
   fieldToBranch,
@@ -1792,10 +1793,20 @@ async function generateInfrastructureForSections(confirmedSections, networkName,
         //   negative → D diverges right → flip = true
         const cross = dirs[tIdx].dlon * dirs[dIdx].dlat - dirs[tIdx].dlat * dirs[dIdx].dlon;
         node.flip = cross < 0;
+      } else if (node.railwayType === 'diamond' && node._topoKey && node._topoConns && node._topoConns.length === 4) {
+        // The Network Editor's own unflipped diamond layout (see
+        // NodeEditor.js getBasePosition) places F/T on one diagonal and D/X
+        // on the other, with X sharing the corner slot a turnout's T would
+        // occupy and T sharing the slot a turnout's D would occupy. Reusing
+        // the turnout formula above with X standing in for T and T standing
+        // in for D reproduces the same handedness test for that shared pair
+        // of corners, using the SAME F/T/D/X assignment determineBranch()
+        // already committed to for this node's own links (via the shared
+        // computeDiamondBranchIndices helper) so the two never disagree.
+        const { dirs, tIdx, xIdx } = computeDiamondBranchIndices(node._topoKey, node._topoConns, waysById);
+        const cross = dirs[xIdx].dlon * dirs[tIdx].dlat - dirs[xIdx].dlat * dirs[tIdx].dlon;
+        node.flip = cross < 0;
       }
-      // Flip has no meaning for a diamond crossing (no diverge side to
-      // mirror — see manual: "hidden from the panel when Diamond crossing
-      // is ticked") so it's left at its default for railwayType 'diamond'.
     }
 
     // ── Auto-rotate nodes based on F/T connections ──
