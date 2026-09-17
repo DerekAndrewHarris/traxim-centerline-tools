@@ -338,26 +338,48 @@ function determineBranch(nodeKey, nodeConns, arrivedViaWayId, waysById, nodeKm, 
 
   if (degree === 4) {
     // Diamond crossing - two independent tracks cross at this point with no
-    // physical connection between them (F-T pair and D-X pair).  Find the
-    // pairing into two 2-groups that minimises the summed dot product (most
-    // mutually-opposite pairs = the two straight-through crossing tracks) —
-    // same geometric test the old two-turnout workaround used to detect a
-    // diamond in the first place, just resolving all 4 arms on one node
-    // instead of splitting it across two synthetic nodes.
+    // physical connection between them (F-T pair and D-X pair).
     const dirs = nodeConns.map(c => ({
       wayId: c.wayId,
       ...computeWayDirection(nodeKey, c.wayId, waysById)
     }));
 
-    const pairings = [[[0, 1], [2, 3]], [[0, 2], [1, 3]], [[0, 3], [1, 2]]];
-    let bestScore = Infinity, bestPairing = pairings[0];
-    for (const [[a, b], [c, d]] of pairings) {
-      const score =
-        dirs[a].dlat * dirs[b].dlat + dirs[a].dlon * dirs[b].dlon +
-        dirs[c].dlat * dirs[d].dlat + dirs[c].dlon * dirs[d].dlon;
-      if (score < bestScore) {
-        bestScore = score;
-        bestPairing = [[a, b], [c, d]];
+    // Primary signal: OSM way continuity, same principle as the degree-3
+    // case below — two segments of the same original way (sharing a base ID
+    // once the splitWaysAtIntermediateJunctions suffix is stripped) are
+    // definitively one continuous physical track through this point, not a
+    // geometric guess. This matters more here than at a turnout: a busy yard
+    // throat often has several tracks meeting at shallow, similar angles
+    // rather than one clean near-90° crossing, which angle-based pairing
+    // alone can misjudge.
+    const baseId4 = (id) => id.replace(/_\d+$/, '');
+    const bases4 = dirs.map(d => baseId4(d.wayId));
+    let bestPairing = null;
+    outer: for (let i = 0; i < 4; i++) {
+      for (let j = i + 1; j < 4; j++) {
+        if (bases4[i] !== bases4[j]) continue;
+        const rest = [0, 1, 2, 3].filter(k => k !== i && k !== j);
+        bestPairing = [[i, j], rest];
+        break outer;
+      }
+    }
+
+    // Fallback: angle-based analysis (most-opposite dot product pairing —
+    // the two straight-through crossing tracks are the pair whose combined
+    // direction is closest to directly opposite) when no shared base way ID
+    // exists for either pair.
+    if (!bestPairing) {
+      const pairings = [[[0, 1], [2, 3]], [[0, 2], [1, 3]], [[0, 3], [1, 2]]];
+      let bestScore = Infinity;
+      bestPairing = pairings[0];
+      for (const [[a, b], [c, d]] of pairings) {
+        const score =
+          dirs[a].dlat * dirs[b].dlat + dirs[a].dlon * dirs[b].dlon +
+          dirs[c].dlat * dirs[d].dlat + dirs[c].dlon * dirs[d].dlon;
+        if (score < bestScore) {
+          bestScore = score;
+          bestPairing = [[a, b], [c, d]];
+        }
       }
     }
 

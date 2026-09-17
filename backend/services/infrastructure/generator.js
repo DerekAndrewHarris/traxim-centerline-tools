@@ -1219,9 +1219,14 @@ async function generateInfrastructureForSections(confirmedSections, networkName,
   // signal that isn't there.
   const PLATFORM_MATCH_THRESHOLD_M = 100;
   const PLATFORM_JUNCTION_BUFFER_M = 50;
+  // Temporarily disabled to isolate diamond-crossing topology from platform
+  // insertion while debugging a reported diamond-chain issue (two arms of one
+  // diamond both connecting to the next diamond in a dense yard throat).
+  // Set back to true once diamonds are confirmed clean.
+  const PLATFORM_INSERTION_ENABLED = false;
   updateProgress(75, 'Fetching platform nodes');
   let platforms = [];
-  if (bbox) {
+  if (PLATFORM_INSERTION_ENABLED && bbox) {
     const cacheFile = sessionPath ? path.join(sessionPath, 'osm_platforms.json') : null;
     if (cacheFile && fs.existsSync(cacheFile)) {
       platforms = JSON.parse(fs.readFileSync(cacheFile, 'utf-8'));
@@ -2040,6 +2045,34 @@ async function generateInfrastructureForSections(confirmedSections, networkName,
 
   updateProgress(93, 'Building CSV output');
 
+  // Diamond sanity check: a genuine diamond crossing's four arms should lead
+  // to four DIFFERENT neighbours. Two arms landing on the same neighbour
+  // means either two parallel tracks really do run directly between two
+  // consecutive diamonds with nothing else between them (possible in a dense
+  // multi-track yard throat), or the pairing/chain-following got it wrong —
+  // flagged here rather than requiring a manual CSV read to spot.
+  {
+    const dupDiamonds = [];
+    for (const n of nodes) {
+      if (n.railwayType !== 'diamond') continue;
+      const counts = new Map();
+      for (const nb of [n.fNode, n.tNode, n.dNode, n.xNode]) {
+        if (!nb) continue;
+        counts.set(nb, (counts.get(nb) || 0) + 1);
+      }
+      for (const [nb, count] of counts) {
+        if (count > 1) dupDiamonds.push(`"${n.name}" → "${nb}" (${count} arms)`);
+      }
+    }
+    if (dupDiamonds.length > 0) {
+      warnings.push(
+        `DIAMOND DOUBLE-LINK (${dupDiamonds.length}): a diamond crossing has more than one arm ` +
+        `connecting to the same neighbour — verify this is genuinely two parallel tracks and not a ` +
+        `misclassified junction: ${dupDiamonds.join(', ')}`
+      );
+    }
+  }
+
   // ── Step 17: Build Infrastructure CSV ──
   const connectionCount = nodes.filter(n => n.tNode || n.fNode || n.dNode || n.xNode).length;
   const csv = buildInfrastructureCsv(nodes, networkName, nodes.length, connectionCount);
@@ -2122,7 +2155,7 @@ function buildInfrastructureCsv(nodes, networkName, nodeCount, connectionCount) 
         '', // Km4
         isDiamond ? '' : 'T', // Default branch — no default for a diamond crossing
         '40',
-        '20',
+        isDiamond ? '10' : '20', // Width — 10 gives diamonds a better crossing angle in the Network Editor
         node.rotation ?? 0,
         node.flip ? 'True' : 'False',
         'True', // Draw
