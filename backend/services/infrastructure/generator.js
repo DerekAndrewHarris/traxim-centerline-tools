@@ -268,48 +268,80 @@ function ensureKmSeparation(nodes, geometryBySection) {
     return bounds;
   }
 
-  // Recursive: after pushing `pushedNode` on `geo`, check whether it now
-  // violates the spacing constraint with any of its OTHER connected nodes
-  // and propagate the push outward.  `visited` prevents infinite loops.
-  // `pushDir` (+1 or -1) is the inherited direction — neighbours are always
-  // pushed further in this direction so that chains stay monotonic.
-  function propagate(pushedNode, geo, visited, pushDir) {
-    const pushedKm = getKmOnGeo(pushedNode, geo);
-    if (pushedKm == null) return;
+  // Decide which of two same-geo nodes should sit at the lower km, using
+  // each one's OTHER same-geo neighbours (excluding each other) as context:
+  // whichever node's wider neighbourhood sits at a higher average km should
+  // itself become the higher one. This is the ONLY place that decides
+  // direction — both the initial pairwise pass and the cascading propagate
+  // step below call it fresh for every pair, rather than propagate
+  // inheriting a fixed direction from whatever pair originally triggered
+  // it. A node in a densely-interconnected cluster (e.g. three diamonds
+  // directly linked to each other) can have neighbours on both sides, so a
+  // direction that's correct for the pair that triggered a push is not
+  // necessarily correct for every OTHER neighbour that push then finds
+  // itself too close to — blindly extending one direction to all of them
+  // was pushing some nodes to the wrong side of a node they're directly
+  // linked to.
+  function decideLoHi(a, b, geo) {
+    const avgOtherKm = (node, excludeName) => {
+      let sum = 0, count = 0;
+      for (const [af] of arms) {
+        const nm = node[af];
+        if (!nm || nm === excludeName) continue;
+        const nb = nodeByName.get(nm);
+        if (!nb) continue;
+        const k = getKmOnGeo(nb, geo);
+        if (k != null) { sum += k; count++; }
+      }
+      return count > 0 ? sum / count : null;
+    };
+    const avgA = avgOtherKm(a, b.name);
+    const avgB = avgOtherKm(b, a.name);
+    if (avgA != null && avgB != null && Math.abs(avgA - avgB) > EPS) {
+      return avgA > avgB ? [b, a] : [a, b];
+    }
+    const kmA = getKmOnGeo(a, geo), kmB = getKmOnGeo(b, geo);
+    return kmA <= kmB ? [a, b] : [b, a];
+  }
 
-    for (const [armField] of arms) {
-      const otherName = pushedNode[armField];
-      if (!otherName) continue;
-      const other = nodeByName.get(otherName);
-      if (!other || visited.has(other.name)) continue;
+  // Push two too-close nodes apart around their midpoint (clamped to
+  // geometry bounds), then recursively check whichever of THEIR other
+  // neighbours are now too close, re-deciding direction for each one.
+  function pushApart(nodeA, nodeB, geo, visited) {
+    const kmA = getKmOnGeo(nodeA, geo), kmB = getKmOnGeo(nodeB, geo);
+    const midKm = (kmA + kmB) / 2;
+    const { min: gMin, max: gMax } = getBounds(geo);
 
-      const otherKm = getKmOnGeo(other, geo);
-      if (otherKm == null) continue;
+    let kmLow = midKm - minKmSpacing / 2;
+    let kmHigh = midKm + minKmSpacing / 2;
+    if (kmLow < gMin) { kmLow = gMin; kmHigh = kmLow + minKmSpacing; }
+    if (kmHigh > gMax) { kmHigh = gMax; kmLow = kmHigh - minKmSpacing; }
+    kmLow = Math.floor(kmLow * 1000) / 1000;
+    kmHigh = Math.ceil(kmHigh * 1000) / 1000;
 
-      const diff = Math.abs(pushedKm - otherKm);
-      if (diff >= minKmSpacing - EPS) continue;
+    const [loNode, hiNode] = decideLoHi(nodeA, nodeB, geo);
+    setKmOnGeo(loNode, geo, kmLow);
+    setKmOnGeo(hiNode, geo, kmHigh);
 
-      // Push `other` in the inherited direction so that chains remain
-      // monotonic — the current km ordering may be unreliable for nodes
-      // that started at nearly identical positions.
-      const { min: gMin, max: gMax } = getBounds(geo);
-      const dir = pushDir;
-      let newOtherKm = pushedKm + dir * minKmSpacing;
-      // Round in the push direction so quantisation doesn't shrink the gap
-      newOtherKm = dir > 0
-        ? Math.ceil(newOtherKm * 1000) / 1000
-        : Math.floor(newOtherKm * 1000) / 1000;
-      // Clamp to geometry bounds
-      newOtherKm = Math.max(gMin, Math.min(gMax, newOtherKm));
+    for (const pushedNode of [loNode, hiNode]) {
+      const pushedKm = getKmOnGeo(pushedNode, geo);
+      for (const [armField] of arms) {
+        const otherName = pushedNode[armField];
+        if (!otherName) continue;
+        const other = nodeByName.get(otherName);
+        if (!other || other === loNode || other === hiNode || visited.has(other.name)) continue;
+        const otherKm = getKmOnGeo(other, geo);
+        if (otherKm == null) continue;
+        if (Math.abs(pushedKm - otherKm) >= minKmSpacing - EPS) continue;
 
-      setKmOnGeo(other, geo, newOtherKm);
-      visited.add(pushedNode.name);
-      propagate(other, geo, visited, pushDir);
+        visited.add(pushedNode.name);
+        pushApart(pushedNode, other, geo, visited);
+      }
     }
   }
 
   // Outer loop: scan all connected pairs; when a violation is found, push
-  // the pair apart symmetrically and recursively propagate both sides.
+  // the pair apart.
   for (let iter = 0; iter < 10; iter++) {
     let changed = false;
     for (const node of nodes) {
@@ -326,56 +358,8 @@ function ensureKmSeparation(nodes, geometryBySection) {
           if (nKm == null || tKm == null) continue;
           if (Math.abs(nKm - tKm) >= minKmSpacing - EPS) continue;
 
-          const midKm = (nKm + tKm) / 2;
-          const { min: gMin, max: gMax } = getBounds(geo);
-
-          let kmLow  = midKm - minKmSpacing / 2;
-          let kmHigh = midKm + minKmSpacing / 2;
-          if (kmLow < gMin)  { kmLow = gMin;  kmHigh = kmLow + minKmSpacing; }
-          if (kmHigh > gMax) { kmHigh = gMax;  kmLow = kmHigh - minKmSpacing; }
-
-          // Round outward so quantisation preserves the gap
-          kmLow  = Math.floor(kmLow * 1000) / 1000;
-          kmHigh = Math.ceil(kmHigh * 1000) / 1000;
-
-          // Determine which node should be lo (lower km) and which hi.
-          // When both nodes are very close, current km ordering may not
-          // reflect the physical track direction.  Use each node's OTHER
-          // neighbours as context: the node whose wider neighbourhood has
-          // higher average km should become the hi node.
-          let loNode, hiNode;
-          {
-            let ctxN = 0, ctxNc = 0, ctxT = 0, ctxTc = 0;
-            for (const [af] of arms) {
-              const nn = node[af];
-              if (nn && nn !== targetName) {
-                const nb = nodeByName.get(nn);
-                if (nb) { const k = getKmOnGeo(nb, geo); if (k != null) { ctxN += k; ctxNc++; } }
-              }
-              const tn = target[af];
-              if (tn && tn !== node.name) {
-                const nb = nodeByName.get(tn);
-                if (nb) { const k = getKmOnGeo(nb, geo); if (k != null) { ctxT += k; ctxTc++; } }
-              }
-            }
-            const avgN = ctxNc > 0 ? ctxN / ctxNc : null;
-            const avgT = ctxTc > 0 ? ctxT / ctxTc : null;
-            if (avgN != null && avgT != null && Math.abs(avgN - avgT) > EPS) {
-              // Node with higher-km neighbourhood becomes hi
-              [loNode, hiNode] = avgN > avgT ? [target, node] : [node, target];
-            } else {
-              [loNode, hiNode] = nKm <= tKm ? [node, target] : [target, node];
-            }
-          }
-          setKmOnGeo(loNode, geo, kmLow);
-          setKmOnGeo(hiNode, geo, kmHigh);
+          pushApart(node, target, geo, new Set([node.name, target.name]));
           changed = true;
-
-          // Recursively fix any neighbours that loNode / hiNode now violate
-          const visitedLo = new Set([hiNode.name]);
-          propagate(loNode, geo, visitedLo, -1);
-          const visitedHi = new Set([loNode.name]);
-          propagate(hiNode, geo, visitedHi, 1);
         }
       }
     }
