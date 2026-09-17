@@ -383,11 +383,19 @@ function determineBranch(nodeKey, nodeConns, arrivedViaWayId, waysById, nodeKm, 
       }
     }
 
-    // Arbitrary but consistent: first pair → F/T, second pair → D/X. A
-    // diamond has no diverge semantics, so which physical track gets which
-    // label doesn't matter — only that both ends of a link agree, which
-    // reciprocal-link enforcement guarantees downstream.
-    const [[fIdx, tIdx], [dIdx, xIdx]] = bestPairing;
+    // First pair → F/T (arbitrary but consistent — a diamond has no diverge
+    // semantics, so which physical track gets F vs T doesn't matter, only
+    // that both ends of a link agree, which reciprocal-link enforcement
+    // guarantees downstream). Second pair → D/X, but NOT arbitrarily: D is
+    // whichever of the two is angularly closer to F (i.e. sits on F's side
+    // of the crossing) and X whichever is closer to T, so the crossing
+    // reads consistently rather than depending on incidental array order —
+    // confirmed against a real case where the naive index-order assignment
+    // put D and X on the wrong sides relative to F/T.
+    const [[fIdx, tIdx], [dIdx0, xIdx0]] = bestPairing;
+    const dotD0F = dirs[dIdx0].dlat * dirs[fIdx].dlat + dirs[dIdx0].dlon * dirs[fIdx].dlon;
+    const dotD0T = dirs[dIdx0].dlat * dirs[tIdx].dlat + dirs[dIdx0].dlon * dirs[tIdx].dlon;
+    const [dIdx, xIdx] = dotD0T > dotD0F ? [xIdx0, dIdx0] : [dIdx0, xIdx0];
     if (arrivedViaWayId === dirs[fIdx].wayId) return 'F';
     if (arrivedViaWayId === dirs[tIdx].wayId) return 'T';
     if (arrivedViaWayId === dirs[dIdx].wayId) return 'D';

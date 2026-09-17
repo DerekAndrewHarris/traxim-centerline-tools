@@ -1823,7 +1823,13 @@ async function generateInfrastructureForSections(confirmedSections, networkName,
         const distF = Math.sqrt(dxF * dxF + dyF * dyF);
         const distT = Math.sqrt(dxT * dxT + dyT * dyT);
 
-        if (distF < 1 && distT < 1) continue;
+        // Only bail when the weighted-average division below would be
+        // unstable (both neighbours essentially coincident with this node,
+        // total distance ~0) - NOT merely "close", which is a normal
+        // condition in a dense yard and was previously skipping rotation
+        // for any node whose neighbours were within ~33m (1 canvas unit),
+        // silently leaving it at the 0 default instead of a real angle.
+        if (distF + distT < 1e-6) continue;
 
         let angleToF = ((Math.atan2(dyF, dxF) * 180 / Math.PI) % 360 + 360) % 360;
         let angleToT = ((Math.atan2(dyT, dxT) * 180 / Math.PI) % 360 + 360) % 360;
