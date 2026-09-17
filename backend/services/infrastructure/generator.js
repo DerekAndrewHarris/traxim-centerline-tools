@@ -39,6 +39,16 @@ import {
   enforceReciprocalLinks
 } from './processor.js';
 
+// Relation-based topology fetching (osmGeometry.js's fetchSegmentGeometryViaRelations)
+// pre-filters relation ways against each segment's bbox expanded by this margin, so
+// track that curves outside the nominal segment box is still picked up. Station-anchor
+// fetching must use the same margin on the same bbox - otherwise a station just outside
+// the raw segment box (but within the expanded corridor) has its trackage/nodes created
+// by the topology fetch while never itself becoming a naming anchor, silently pushing
+// nearby nodes onto the nearest anchor that WAS fetched instead (confirmed root cause
+// of nodes near a station being named after a neighbouring station instead).
+const CORRIDOR_MARGIN_DEG = 0.05; // ~5 km
+
 /**
  * Parse geometry CSV file to extract points with km values
  * @param {string} csvContent - CSV file content
@@ -73,11 +83,20 @@ function parseGeometryCsv(csvContent) {
  * @returns {Promise<Array<{id: string, lat: number, lon: number, name: string}>>}
  */
 async function fetchStationsFromOverpass(bbox) {
+  // Expand by the same margin the topology fetch's relation pre-filter uses (see
+  // CORRIDOR_MARGIN_DEG) so a station just outside the raw segment bbox - but inside
+  // the corridor the topology fetch actually considers - isn't missed as a naming anchor.
+  const parts = bbox.split(',').map(Number);
+  const expandedBbox = [
+    parts[0] - CORRIDOR_MARGIN_DEG, parts[1] - CORRIDOR_MARGIN_DEG,
+    parts[2] + CORRIDOR_MARGIN_DEG, parts[3] + CORRIDOR_MARGIN_DEG
+  ].join(',');
+
   const query = `
     [out:json][timeout:60];
     (
-      node["railway"="station"](${bbox});
-      node["railway"="halt"](${bbox});
+      node["railway"="station"](${expandedBbox});
+      node["railway"="halt"](${expandedBbox});
     );
     out body;
   `;
@@ -149,13 +168,13 @@ async function fetchPlatformsFromOverpass(bbox) {
  */
 async function fetchRailwayTopologyFromOverpass(bbox) {
   // Fallback: used only when osm_topology.json was not written by the geometry
-  // pipeline.  Expand bbox by ~5 km so that ways just outside the search area
-  // (e.g. bridges, tunnels) are not missed.
-  const MARGIN = 0.05; // ~5 km
+  // pipeline. Expand bbox by the same corridor margin used everywhere else (see
+  // CORRIDOR_MARGIN_DEG) so ways just outside the search area (e.g. bridges,
+  // tunnels) are not missed.
   const parts = bbox.split(',').map(Number);
   const expandedBbox = [
-    parts[0] - MARGIN, parts[1] - MARGIN,
-    parts[2] + MARGIN, parts[3] + MARGIN
+    parts[0] - CORRIDOR_MARGIN_DEG, parts[1] - CORRIDOR_MARGIN_DEG,
+    parts[2] + CORRIDOR_MARGIN_DEG, parts[3] + CORRIDOR_MARGIN_DEG
   ].join(',');
 
   const query = `
@@ -476,6 +495,140 @@ function ensureKmSeparation(nodes, geometryBySection) {
       }
     }
     if (!changed) break;
+  }
+}
+
+/**
+ * Correct nodes whose km falls on the wrong side of neighbours it's directly
+ * linked to. reprojectKmAlongTopology() assigns each node's km by walking a
+ * BFS spanning tree - a node's value comes from whichever ONE edge first
+ * reached it in the queue, and its OTHER edges (real connections that just
+ * weren't the BFS parent) are never cross-checked. In a simple chain that's
+ * fine, but in a densely-meshed junction cluster (several interlinked
+ * diamonds/turnouts) a node can end up locally consistent along the path it
+ * was discovered through while still disagreeing with a sibling connection -
+ * exactly what the Network Editor's own validator flags (it checks a node's
+ * km against ALL of its F/T/D/X neighbours, not just one).
+ *
+ * F is always the backward (lower- or higher-km, whichever this chain's
+ * direction is - see below) side and T is always the opposite, forward
+ * side. For a diamond, D is aligned with F's side and X is aligned with T's
+ * side (see determineBranch()'s D/X assignment, which pairs D with F and X
+ * with T by angular alignment) - so D joins the backward group and X joins
+ * the forward group. For a turnout, D is itself the diverging branch
+ * alongside T, both forward.
+ *
+ * Direction (whether "backward" means lower or higher km) isn't fixed
+ * globally - it depends on which end of the region's geometry this part of
+ * the topology walk started from - so it's inferred per node from the
+ * neighbours' own relative values rather than assumed.
+ */
+function enforceKmOrdering(nodes) {
+  const EPS = 1e-9;
+  const nodeByName = new Map(nodes.map(n => [n.name, n]));
+
+  function getKmOnGeo(node, geo) {
+    if (node.region === geo) return node.km;
+    if (node.region2 === geo) return node.km2;
+    if (node.region3 === geo) return node.km3;
+    return null;
+  }
+  function setKmOnGeo(node, geo, val) {
+    if (node.region === geo) node.km = val;
+    else if (node.region2 === geo) node.km2 = val;
+    else if (node.region3 === geo) node.km3 = val;
+  }
+  function getGeos(node) {
+    const geos = [node.region];
+    if (node.region2) geos.push(node.region2);
+    if (node.region3) geos.push(node.region3);
+    return geos;
+  }
+
+  const MAX_PASSES = 8;
+  for (let pass = 0; pass < MAX_PASSES; pass++) {
+    let anyFixed = false;
+
+    for (const node of nodes) {
+      const isDiamond = node.railwayType === 'diamond';
+      const backwardArms = isDiamond ? ['fNode', 'dNode'] : ['fNode'];
+      const forwardArms = isDiamond ? ['tNode', 'xNode'] : ['tNode', 'dNode'];
+
+      for (const geo of getGeos(node)) {
+        if (!geo) continue;
+        const currentKm = getKmOnGeo(node, geo);
+        if (currentKm == null) continue;
+
+        const backwardKms = [];
+        for (const arm of backwardArms) {
+          const nb = nodeByName.get(node[arm]);
+          if (!nb) continue;
+          const k = getKmOnGeo(nb, geo);
+          if (k != null) backwardKms.push(k);
+        }
+        const forwardKms = [];
+        for (const arm of forwardArms) {
+          const nb = nodeByName.get(node[arm]);
+          if (!nb) continue;
+          const k = getKmOnGeo(nb, geo);
+          if (k != null) forwardKms.push(k);
+        }
+
+        if (backwardKms.length > 0 && forwardKms.length > 0) {
+          // Through node: current must sit on the far side of EVERY backward
+          // neighbour from EVERY forward neighbour. Mirrors the Network
+          // Editor's own check exactly: current is valid if it's above the
+          // backward group and at or below the forward group's max (an
+          // "increasing" chain), OR below the backward group and at or
+          // above the forward group's min (a "decreasing" chain) - a node's
+          // own forward group can legitimately spread across a wide range
+          // (e.g. a diamond's T and X ends), so only the LOOSEST forward
+          // bound may be used, not the tightest, or an already-valid node
+          // gets wrongly flagged.
+          const backwardMax = Math.max(...backwardKms);
+          const backwardMin = Math.min(...backwardKms);
+          const forwardMax = Math.max(...forwardKms);
+          const forwardMin = Math.min(...forwardKms);
+
+          const validIncreasing = currentKm > backwardMax + EPS && currentKm <= forwardMax + EPS;
+          const validDecreasing = currentKm < backwardMin - EPS && currentKm >= forwardMin - EPS;
+          if (validIncreasing || validDecreasing) continue;
+
+          const increasing = (backwardMax + backwardMin) < (forwardMax + forwardMin);
+          if (increasing) {
+            if (backwardMax >= forwardMax - EPS) continue; // neighbours themselves conflict - leave for another pass
+            setKmOnGeo(node, geo, (backwardMax + forwardMax) / 2);
+          } else {
+            if (backwardMin <= forwardMin + EPS) continue;
+            setKmOnGeo(node, geo, (backwardMin + forwardMin) / 2);
+          }
+          anyFixed = true;
+        } else if (backwardKms.length >= 2 || forwardKms.length >= 2) {
+          // Endpoint node: every same-region neighbour is on one side (e.g.
+          // an alt-route spur's dead end, whose T and D both lead back into
+          // the mesh but nothing continues past it). Current must sit
+          // outside the span of that single group, not wedged inside it.
+          const group = backwardKms.length >= 2 ? backwardKms : forwardKms;
+          const groupMin = Math.min(...group);
+          const groupMax = Math.max(...group);
+          if (currentKm <= groupMin + EPS || currentKm >= groupMax - EPS) continue; // already outside - valid
+
+          // Move to whichever side is the smaller adjustment, clearing it by a
+          // full minimum-spacing margin rather than landing exactly on the
+          // boundary (which ensureKmSeparation would then have to push apart
+          // again from a zero-distance tie).
+          const margin = MIN_NODE_SPACING_M / 1000;
+          if (currentKm - groupMin < groupMax - currentKm) {
+            setKmOnGeo(node, geo, groupMin - margin);
+          } else {
+            setKmOnGeo(node, geo, groupMax + margin);
+          }
+          anyFixed = true;
+        }
+      }
+    }
+
+    if (!anyFixed) break;
   }
 }
 
@@ -1557,6 +1710,18 @@ async function generateInfrastructureForSections(confirmedSections, networkName,
 
   // Enforce minimum km spacing on all shared geometries (primary + alt)
   ensureKmSeparation(nodes, geometryBySection);
+
+  // BFS reprojection above only cross-checks the ONE edge each node was
+  // discovered through, not every edge it actually has - correct any that
+  // still disagree with a direct neighbour (see enforceKmOrdering doc
+  // comment). Ordering and spacing are interdependent (fixing one can
+  // reintroduce a violation of the other in a densely-meshed cluster), so
+  // alternate the two until neither has anything left to fix, capped so a
+  // genuinely conflicting cluster can't loop forever.
+  for (let i = 0; i < 10; i++) {
+    enforceKmOrdering(nodes);
+    ensureKmSeparation(nodes, geometryBySection);
+  }
 
   // ── Step 11b: Geometry reference pruning ──
   // Principle: each link must be unambiguously attributable to exactly one

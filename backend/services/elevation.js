@@ -20,6 +20,16 @@ const ELEV_STRIDE = 8;           // Query every 8th point
 const REQUEST_TIMEOUT_MS = 30000; // 30 second timeout per request
 const MAX_RETRIES = 2;           // Retry failed requests twice
 
+// Circuit breaker: an outage otherwise costs its full retry+backoff ceiling
+// (~93s per batch) on EVERY batch of EVERY segment in a job, since each call
+// rediscovers the outage independently - a 17-segment run can take 5-10
+// minutes to fail all the way through. Once a batch exhausts its retries, we
+// assume the service is down for the rest of this process and skip straight
+// to degraded for subsequent batches, re-probing once after a cooldown in
+// case it recovers mid-session (e.g. a later job run).
+const CIRCUIT_COOLDOWN_MS = 5 * 60 * 1000;
+let circuitOpenedAt = null;
+
 /**
  * Fetch elevations for an array of points from Open-Elevation API.
  * Uses sub-sampling strategy: queries every ELEV_STRIDE-th point,
@@ -144,6 +154,21 @@ async function fetchElevationsBatched(points, progressCallback = null) {
       progressCallback(percent, `Querying elevation batch ${batchIdx + 1}/${totalBatches} (${batch.length} points)`);
     }
 
+    // Circuit breaker: if a previous batch (this segment or an earlier one)
+    // already exhausted its retries recently, don't repeat the full
+    // timeout+retry dance - skip straight to degraded for this batch too.
+    if (circuitOpenedAt !== null) {
+      const elapsed = Date.now() - circuitOpenedAt;
+      if (elapsed < CIRCUIT_COOLDOWN_MS) {
+        throw new Error(
+          `Elevation service circuit open (failed ${Math.round(elapsed / 1000)}s ago, ` +
+          `re-probing after ${Math.round(CIRCUIT_COOLDOWN_MS / 1000)}s) - skipping retries`
+        );
+      }
+      // Cooldown elapsed - let this batch through as a probe. It closes the
+      // circuit on success or reopens it (with a fresh timestamp) below.
+    }
+
     // Query batch with retries
     let batchResults = null;
     let lastError = null;
@@ -163,10 +188,13 @@ async function fetchElevationsBatched(points, progressCallback = null) {
     }
 
     if (!batchResults) {
-      // All retries failed - throw error to trigger graceful degradation
+      // All retries failed - open the circuit so later batches/segments in
+      // this process skip straight to degraded instead of repeating this.
+      circuitOpenedAt = Date.now();
       throw new Error(`Elevation batch ${batchIdx + 1} failed after ${MAX_RETRIES} retries: ${lastError.message}`);
     }
 
+    circuitOpenedAt = null; // Success - service is up, close the circuit
     results.push(...batchResults);
   }
 
@@ -200,7 +228,7 @@ async function queryElevationBatch(points) {
       'Accept': 'application/json'
     },
     body: requestBody,
-    timeout: REQUEST_TIMEOUT_MS
+    socketTimeout: REQUEST_TIMEOUT_MS
   });
 
   if (!response.ok) {
@@ -302,7 +330,7 @@ export async function checkElevationServiceAvailable() {
         'Accept': 'application/json'
       },
       body: JSON.stringify({ locations: testPoint }),
-      timeout: 5000 // 5 second timeout for health check
+      socketTimeout: 5000 // 5 second timeout for health check
     });
 
     return response.ok;
