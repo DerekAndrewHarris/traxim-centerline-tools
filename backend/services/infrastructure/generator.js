@@ -1478,11 +1478,7 @@ async function generateInfrastructureForSections(confirmedSections, networkName,
   // signal that isn't there.
   const PLATFORM_MATCH_THRESHOLD_M = 100;
   const PLATFORM_JUNCTION_BUFFER_M = 50;
-  // Temporarily disabled to isolate diamond-crossing topology from platform
-  // insertion while debugging a reported diamond-chain issue (two arms of one
-  // diamond both connecting to the next diamond in a dense yard throat).
-  // Set back to true once diamonds are confirmed clean.
-  const PLATFORM_INSERTION_ENABLED = false;
+  const PLATFORM_INSERTION_ENABLED = true;
   updateProgress(75, 'Fetching platform nodes');
   let platforms = [];
   if (PLATFORM_INSERTION_ENABLED && bbox) {
@@ -1618,14 +1614,26 @@ async function generateInfrastructureForSections(confirmedSections, networkName,
 
       // Regional kilometrage: interpolate between the two endpoints' own km
       // along the fraction of the way this platform sits along the link's
-      // (arbitrary zero-point) reconstructed length. Falls back to a's own
-      // km/region when the two ends don't share a region to interpolate on.
+      // (arbitrary zero-point) reconstructed length. A node near a diamond or
+      // an alt-route junction can carry up to 3 region slots (region/region2/
+      // region3), and the region THIS link actually belongs to isn't always
+      // either node's primary `region` field - search every slot combination
+      // for one they actually share, rather than assuming primary vs primary.
       const totalPolyKm = poly[poly.length - 1].km;
       const t = totalPolyKm > 0 ? polyKm / totalPolyKm : 0;
-      const region = a.region;
-      const km = (b.region === a.region && a.km != null && b.km != null)
-        ? a.km + t * (b.km - a.km)
-        : a.km ?? 0;
+      const regionSlots = (n) => [['region', 'km'], ['region2', 'km2'], ['region3', 'km3']].filter(([rf]) => n[rf]);
+
+      let region = a.region, km = a.km ?? 0;
+      outer:
+      for (const [aRegionField, aKmField] of regionSlots(a)) {
+        for (const [bRegionField, bKmField] of regionSlots(b)) {
+          if (a[aRegionField] === b[bRegionField] && a[aKmField] != null && b[bKmField] != null) {
+            region = a[aRegionField];
+            km = a[aKmField] + t * (b[bKmField] - a[aKmField]);
+            break outer;
+          }
+        }
+      }
 
       // Unique name
       let platName = platform.name;
