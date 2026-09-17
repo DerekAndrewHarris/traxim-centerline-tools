@@ -336,18 +336,40 @@ function reprojectKmAlongTopology(nodes, geometryBySection) {
         if (nb.region !== region && nb.region2 !== region && nb.region3 !== region) continue;
 
         const isThrough = armField === 'fNode' || armField === 'tNode';
-        const searchPoints = isThrough ? points.slice(curIdx) : points;
-        if (searchPoints.length === 0) continue;
+        let projKm, nbIdx;
 
-        const proj = projectOntoGeometry({ lat: nb.lat, lon: nb.lon }, searchPoints);
-        // projectOntoGeometry() extrapolates past either end of whatever
-        // array it's given (by design, for points genuinely beyond the full
-        // line) - which can return a km BELOW the sliced sub-array's own
-        // minimum, silently defeating the forward constraint. Clamp it back.
-        const projKm = isThrough ? Math.max(proj.km, points[curIdx].km) : proj.km;
-        const nbIdx = isThrough
-          ? indexAtOrBefore(points, curIdx, projKm)
-          : indexAtOrBefore(points, 0, projKm);
+        if (isThrough) {
+          // A "through" (F/T) arm continues the chain, but which physical
+          // direction that means isn't fixed - it depends on how
+          // determineBranch labelled this node's arms, not on which way the
+          // walk has been going so far. Forcing every through-arm to search
+          // only forward from curIdx (the fix for the original non-monotonic
+          // "dip" bug) silently breaks when THIS arm actually continues
+          // backward: the neighbour's true position falls outside the
+          // forward slice entirely, so it gets clamped to whatever's nearest
+          // at the wrong end instead (confirmed case: a node ~2.5km behind
+          // curIdx got projected right on top of it). Try both directions
+          // and keep whichever actually lands closer to the neighbour's real
+          // coordinates - forward wins ties, preserving the original
+          // anti-dip guarantee for the ordinary case.
+          const fwdPoints = points.slice(curIdx);
+          const bwdPoints = points.slice(0, curIdx + 1);
+          const fwdProj = fwdPoints.length > 0 ? projectOntoGeometry({ lat: nb.lat, lon: nb.lon }, fwdPoints) : null;
+          const bwdProj = bwdPoints.length > 0 ? projectOntoGeometry({ lat: nb.lat, lon: nb.lon }, bwdPoints) : null;
+          const fwdDist = fwdProj ? haversineM(nb, { lat: fwdProj.projLat, lon: fwdProj.projLon }) : Infinity;
+          const bwdDist = bwdProj ? haversineM(nb, { lat: bwdProj.projLat, lon: bwdProj.projLon }) : Infinity;
+
+          const useForward = fwdDist <= bwdDist;
+          const chosen = useForward ? fwdProj : bwdProj;
+          projKm = useForward ? Math.max(chosen.km, points[curIdx].km) : Math.min(chosen.km, points[curIdx].km);
+          nbIdx = useForward
+            ? indexAtOrBefore(points, curIdx, projKm)
+            : indexAtOrBefore(points, 0, projKm);
+        } else {
+          const proj = projectOntoGeometry({ lat: nb.lat, lon: nb.lon }, points);
+          projKm = proj.km;
+          nbIdx = indexAtOrBefore(points, 0, projKm);
+        }
 
         setKmOnGeo(nb, region, projKm);
         visited.add(nb.name);
