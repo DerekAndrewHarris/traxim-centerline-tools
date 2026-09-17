@@ -227,6 +227,118 @@ async function fetchRailwayTopologyFromOverpass(bbox) {
 }
 
 /**
+ * Re-derive km for every node by walking the topology graph in order,
+ * instead of trusting each node's own independently-projected km.
+ *
+ * projectOntoGeometry() picks whichever segment of the region's resampled
+ * polyline is geometrically NEAREST, searched across the WHOLE line. In a
+ * dense yard or tight curve - especially once parallel tracks have been
+ * deduplicated onto one shared centerline (see the geometry pipeline) - a
+ * node's true sequential neighbour can end up geometrically farther from it
+ * than some OTHER, unrelated point on the line. Two directly-linked nodes
+ * can each independently land on a locally "nearest" but sequentially wrong
+ * segment, producing a non-monotonic ("dip") km sequence even though
+ * neither node's own projection was unreasonable in isolation.
+ *
+ * Fix: walk the F/T "through" chain in topological order from a seed, and
+ * project each subsequent node only onto the PART of the polyline at or
+ * after its predecessor's own matched position. A match's index can then
+ * only be >= the one before it, so a dip is structurally impossible for the
+ * walked chain - no comparison of old km values is needed (and wouldn't
+ * help: the old km is exactly what's unreliable here).
+ *
+ * D/X (diverging) branches are NOT walked with this forward constraint -
+ * they may legitimately run back on themselves - so they keep the
+ * unconstrained whole-line search, same as before. Their own further F/T
+ * continuations still get the constraint, relative to wherever the branch
+ * itself was found.
+ *
+ * The seed for each region is whichever node's EXISTING projected km is
+ * closest to the region's own minimum (its topological start) - endpoints
+ * are far less likely to sit in an ambiguous dense-yard/parallel-track spot
+ * than nodes deep inside a busy throat, so trusting the original projection
+ * there is safe. Nodes never reached by the walk (disconnected fragments)
+ * keep their original independently-projected km unchanged.
+ */
+function reprojectKmAlongTopology(nodes, geometryBySection) {
+  const nodeByName = new Map(nodes.map(n => [n.name, n]));
+  const ARMS = ['fNode', 'tNode', 'dNode', 'xNode'];
+
+  function getKmOnGeo(node, geo) {
+    if (node.region === geo) return node.km;
+    if (node.region2 === geo) return node.km2;
+    if (node.region3 === geo) return node.km3;
+    return null;
+  }
+  function setKmOnGeo(node, geo, val) {
+    if (node.region === geo) node.km = val;
+    else if (node.region2 === geo) node.km2 = val;
+    else if (node.region3 === geo) node.km3 = val;
+  }
+  // Index of the last point whose km is <= targetKm, i.e. where a forward
+  // search starting from targetKm should resume from.
+  function indexAtOrBefore(points, fromIdx, targetKm) {
+    let idx = fromIdx;
+    for (let i = fromIdx; i < points.length; i++) {
+      if (points[i].km <= targetKm) idx = i; else break;
+    }
+    return idx;
+  }
+
+  for (const [region, points] of geometryBySection) {
+    if (!points || points.length < 2) continue;
+    const regionNodes = nodes.filter(n => n.region === region || n.region2 === region || n.region3 === region);
+    if (regionNodes.length === 0) continue;
+
+    const geomMinKm = Math.min(...points.map(p => p.km));
+    let seed = null, seedDist = Infinity;
+    for (const n of regionNodes) {
+      const k = getKmOnGeo(n, region);
+      if (k == null) continue;
+      const d = Math.abs(k - geomMinKm);
+      if (d < seedDist) { seedDist = d; seed = n; }
+    }
+    if (!seed) continue;
+
+    const seedProj = projectOntoGeometry({ lat: seed.lat, lon: seed.lon }, points);
+    setKmOnGeo(seed, region, seedProj.km);
+    const seedIdx = indexAtOrBefore(points, 0, seedProj.km);
+
+    const visited = new Set([seed.name]);
+    const queue = [{ node: seed, idx: seedIdx }];
+
+    while (queue.length > 0) {
+      const { node: cur, idx: curIdx } = queue.shift();
+      for (const armField of ARMS) {
+        const nbName = cur[armField];
+        if (!nbName) continue;
+        const nb = nodeByName.get(nbName);
+        if (!nb || visited.has(nb.name)) continue;
+        if (nb.region !== region && nb.region2 !== region && nb.region3 !== region) continue;
+
+        const isThrough = armField === 'fNode' || armField === 'tNode';
+        const searchPoints = isThrough ? points.slice(curIdx) : points;
+        if (searchPoints.length === 0) continue;
+
+        const proj = projectOntoGeometry({ lat: nb.lat, lon: nb.lon }, searchPoints);
+        // projectOntoGeometry() extrapolates past either end of whatever
+        // array it's given (by design, for points genuinely beyond the full
+        // line) - which can return a km BELOW the sliced sub-array's own
+        // minimum, silently defeating the forward constraint. Clamp it back.
+        const projKm = isThrough ? Math.max(proj.km, points[curIdx].km) : proj.km;
+        const nbIdx = isThrough
+          ? indexAtOrBefore(points, curIdx, projKm)
+          : indexAtOrBefore(points, 0, projKm);
+
+        setKmOnGeo(nb, region, projKm);
+        visited.add(nb.name);
+        queue.push({ node: nb, idx: nbIdx });
+      }
+    }
+  }
+}
+
+/**
  * Ensure connected node pairs sharing a region have km values at least
  * MIN_NODE_SPACING_M / 1000 km apart.  Iteratively pushes km values apart
  * from their midpoint when they are too close.
@@ -437,6 +549,15 @@ async function generateInfrastructureForSections(confirmedSections, networkName,
         warnings.push(`Station fetch from Overpass failed: ${error.message}. Station-based naming will be unavailable.`);
       }
     }
+  }
+  // Diagnostic: list every station anchor actually available for the naming
+  // pass, so a "wrong station won" naming complaint can be checked directly
+  // against what was fetched rather than guessed at.
+  if (stationAnchors.length > 0) {
+    warnings.push(
+      `Naming anchors available (${stationAnchors.length}): ` +
+      stationAnchors.map(a => `"${a.name}" (${a.lat.toFixed(4)},${a.lon.toFixed(4)})`).join(', ')
+    );
   }
 
   updateProgress(30, 'Fetching railway topology from Overpass');
@@ -1427,6 +1548,12 @@ async function generateInfrastructureForSections(confirmedSections, networkName,
       if (node[kmField] > maxGeoKm) node[kmField] = +maxGeoKm.toFixed(3);
     }
   }
+
+  // Re-derive km by walking the topology graph in order, rather than trusting
+  // each node's independently-projected km. See reprojectKmAlongTopology()
+  // doc comment for why independent projection can produce a non-monotonic
+  // ("dip") sequence between directly-linked nodes.
+  reprojectKmAlongTopology(nodes, geometryBySection);
 
   // Enforce minimum km spacing on all shared geometries (primary + alt)
   ensureKmSeparation(nodes, geometryBySection);
