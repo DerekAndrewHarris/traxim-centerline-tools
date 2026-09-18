@@ -595,7 +595,20 @@ function ensureKmSeparation(nodes, geometryBySection) {
  */
 function enforceKmOrdering(nodes) {
   const EPS = 1e-9;
+  const ARMS_ALL = ['fNode', 'tNode', 'dNode', 'xNode'];
   const nodeByName = new Map(nodes.map(n => [n.name, n]));
+  // Nudging a neighbour (rather than the node currently being checked) can
+  // fight with that neighbour's OWN check of ITS OWN neighbours - moving it
+  // to satisfy this relationship can violate a different one, which then
+  // moves it back next pass, forever (confirmed on real data: several
+  // clusters never converged, unlike the plain same-node nudge above, which
+  // provably terminates via the interval-intersection guard). Since we
+  // can't cheaply prove convergence for a cross-node move the way we can
+  // for a same-node one, cap each ordered pair to a single attempt for the
+  // whole run - one real correction is applied, but a pair that turns out
+  // to still disagree afterwards is left alone rather than fought over
+  // indefinitely.
+  const neighbourNudgeAttempted = new Set();
 
   function getKmOnGeo(node, geo) {
     if (node.region === geo) return node.km;
@@ -625,6 +638,7 @@ function enforceKmOrdering(nodes) {
   const MAX_PASSES = 25;
   for (let pass = 0; pass < MAX_PASSES; pass++) {
     let anyFixed = false;
+    let neighbourNudgeCount = 0;
 
     for (const node of nodes) {
       // Platforms used to be skipped here entirely: when platform-to-link
@@ -651,107 +665,184 @@ function enforceKmOrdering(nodes) {
         ? [[['fNode'], ['tNode']], [['dNode'], ['xNode']]]
         : [[['fNode'], ['tNode', 'dNode']]];
 
-      for (const geo of getGeos(node)) {
-        if (!geo) continue;
-
-        for (const [backwardArms, forwardArms] of trackPairs) {
-        // Re-read every track pair: a diamond's F<->T fix above can change
-        // this same node's km before its D<->X pair is checked.
-        const currentKm = getKmOnGeo(node, geo);
-        if (currentKm == null) continue;
-
-        const backwardKms = [];
+      // For a diamond, both tracks constrain the SAME single km value, but
+      // are checked independently - if their two requirements don't
+      // overlap at all (confirmed real case: F<->T wanted (32.081, 32.116],
+      // D<->X wanted [32.148, 32.888), no overlap), fixing one to satisfy it
+      // immediately re-breaks the other, and the two chase each other every
+      // single pass forever - the CSV just captures whichever value the run
+      // happened to stop on, not a converged answer. Compute both tracks'
+      // required interval FIRST, intersect them, and only ever move into a
+      // value both agree on; if they don't agree at all, leave the node
+      // alone rather than oscillate (matches the existing "neighbours
+      // conflict" bailout below, just extended across a diamond's tracks).
+      function requiredInterval(geo, backwardArms, forwardArms) {
+        const backwardKms = [], backwardNodes = [];
         for (const arm of backwardArms) {
           const nb = nodeByName.get(node[arm]);
           if (!nb) continue;
           const k = getKmOnGeo(nb, geo);
-          if (k != null) backwardKms.push(k);
+          if (k != null) { backwardKms.push(k); backwardNodes.push(nb); }
         }
-        const forwardKms = [];
+        const forwardKms = [], forwardNodes = [];
         for (const arm of forwardArms) {
           const nb = nodeByName.get(node[arm]);
           if (!nb) continue;
           const k = getKmOnGeo(nb, geo);
-          if (k != null) forwardKms.push(k);
+          if (k != null) { forwardKms.push(k); forwardNodes.push(nb); }
+        }
+        if (backwardKms.length === 0 && forwardKms.length === 0) return null;
+        if (backwardKms.length > 0 && forwardKms.length > 0) {
+          const backwardMax = Math.max(...backwardKms), backwardMin = Math.min(...backwardKms);
+          const forwardMax = Math.max(...forwardKms), forwardMin = Math.min(...forwardKms);
+          const increasing = (backwardMax + backwardMin) < (forwardMax + forwardMin);
+          // Track which actual neighbour node is responsible for the lo/hi
+          // bound (not just the number) - needed so a genuine conflict
+          // between two tracks (below) can identify exactly which node on
+          // each side to reconsider, rather than the interval alone.
+          const loNode = increasing ? backwardNodes[backwardKms.indexOf(backwardMax)] : forwardNodes[forwardKms.indexOf(forwardMin)];
+          const hiNode = increasing ? forwardNodes[forwardKms.indexOf(forwardMax)] : backwardNodes[backwardKms.indexOf(backwardMin)];
+          return increasing
+            ? { kind: 'through', lo: backwardMax + EPS, hi: forwardMax + EPS, backwardKms, forwardKms, backwardNodes, forwardNodes, loNode, hiNode }
+            : { kind: 'through', lo: forwardMin - EPS, hi: backwardMin - EPS, backwardKms, forwardKms, backwardNodes, forwardNodes, loNode, hiNode };
+        }
+        // Endpoint: every same-region neighbour on this track is on one
+        // side - valid outside that group's span, not wedged inside it.
+        // Only meaningful with 2+ on that side (a single lone neighbour has
+        // nothing to be "wedged between" - no constraint at all). Not a
+        // bounded interval (unbounded below or above), handled separately
+        // below rather than folded into the intersection.
+        const group = backwardKms.length > 0 ? backwardKms : forwardKms;
+        return group.length >= 2 ? { kind: 'endpoint', group } : null;
+      }
+
+      for (const geo of getGeos(node)) {
+        if (!geo) continue;
+        const currentKm = getKmOnGeo(node, geo);
+        if (currentKm == null) continue;
+
+        const reqs = trackPairs.map(([b, f]) => requiredInterval(geo, b, f)).filter(Boolean);
+        if (reqs.length === 0) continue;
+
+        // Endpoint-style requirements (2+ same-side neighbours) can't be
+        // combined with a "through" interval the same way - handle each on
+        // its own, same as before splitting this into a helper.
+        const throughReqs = reqs.filter(r => r.kind === 'through');
+        const endpointReqs = reqs.filter(r => r.kind === 'endpoint');
+
+        if (throughReqs.length > 0) {
+          const lo = Math.max(...throughReqs.map(r => r.lo));
+          const hi = Math.min(...throughReqs.map(r => r.hi));
+          if (currentKm > lo - EPS && currentKm <= hi + EPS) {
+            // Already valid for every through track at once.
+          } else if (lo <= hi) {
+            // Nudge minimally past whichever bound is violated, rather than
+            // jumping straight to a midpoint - a barely-out-of-order tie
+            // with a close neighbour shouldn't collapse onto a point
+            // roughly halfway to a much more distant one.
+            const margin = MIN_NODE_SPACING_M / 1000;
+            let target = currentKm;
+            if (target <= lo) target = Math.min(hi, lo + margin);
+            if (target > hi) target = Math.max(lo, hi - margin);
+            setKmOnGeo(node, geo, target);
+            if (process.env.DEBUG_ORDERING) {
+              const dt = process.env.DEBUG_ORDERING.split(',').map(Number);
+              if (haversineM(node, { lat: dt[0], lon: dt[1] }) < 500) {
+                console.error(`[order] ${node.name}: was=${currentKm.toFixed(4)} -> ${target.toFixed(4)} | interval=[${lo.toFixed(4)},${hi.toFixed(4)}]`);
+              }
+            }
+            anyFixed = true;
+          } else {
+            // lo > hi: no value satisfies every through track at once - not
+            // fixable by moving the current node alone. This happens either
+            // with a single track (this node's own backward and forward
+            // neighbours are themselves in the wrong relative order) or,
+            // for a diamond, when its two independent tracks (F<->T and
+            // D<->X) each pin it to disjoint ranges. Either way, the actual
+            // outlier is one of the specific neighbour nodes that produced
+            // the binding lo/hi bound - find those two nodes and, using
+            // each neighbour's own OTHER same-region neighbours as context
+            // (the same technique ensureKmSeparation already uses to decide
+            // push direction), nudge whichever one disagrees with its own
+            // broader neighbourhood, rather than leaving the cluster
+            // unresolved.
+            const loReq = throughReqs.reduce((a, b) => (b.lo > a.lo ? b : a));
+            const hiReq = throughReqs.reduce((a, b) => (b.hi < a.hi ? b : a));
+            const loNode = loReq.loNode;
+            const hiNode = hiReq.hiNode;
+
+            function avgOtherKm(refNode, excludeNames) {
+              let sum = 0, count = 0;
+              for (const arm of ARMS_ALL) {
+                const nm = refNode[arm];
+                if (!nm || excludeNames.includes(nm)) continue;
+                const other = nodeByName.get(nm);
+                if (!other) continue;
+                const k = getKmOnGeo(other, geo);
+                if (k != null) { sum += k; count++; }
+              }
+              return count > 0 ? sum / count : null;
+            }
+
+            // Keyed by the unordered node pair (not lo/hi specifically) -
+            // which one comes out "lo" vs "hi" can flip pass to pass as
+            // nearby kms shift, and a direction-sensitive key would let the
+            // same two nodes fight forever under alternating keys.
+            const nudgeKey = loNode && hiNode ? `${geo}|${[loNode.name, hiNode.name].sort().join('~')}` : null;
+            if (loNode && hiNode && loNode !== hiNode && !neighbourNudgeAttempted.has(nudgeKey)) {
+              const ctxLo = avgOtherKm(loNode, [node.name, hiNode.name]);
+              const ctxHi = avgOtherKm(hiNode, [node.name, loNode.name]);
+              const loKm = getKmOnGeo(loNode, geo), hiKm = getKmOnGeo(hiNode, geo);
+              // Both nodes' OWN current km are numerically reversed (that's
+              // the conflict). Rather than just picking a direction, judge
+              // each one against ITS OWN broader neighbourhood: the node
+              // whose actual km deviates furthest from what its other
+              // neighbours suggest is the more likely error, so nudge that
+              // one - the other one's value is left as the anchor. Needs
+              // both contexts to make a confident call; without one, leave
+              // alone rather than guess.
+              if (ctxLo != null && ctxHi != null) {
+                neighbourNudgeAttempted.add(nudgeKey);
+                const devLo = Math.abs(loKm - ctxLo);
+                const devHi = Math.abs(hiKm - ctxHi);
+                const margin = MIN_NODE_SPACING_M / 1000;
+                let moved, movedTo;
+                if (devLo >= devHi) {
+                  // loNode's actual km is further from its own neighbours'
+                  // average than hiNode's is - loNode is the outlier;
+                  // pull it down below hiNode.
+                  movedTo = hiKm - margin;
+                  setKmOnGeo(loNode, geo, movedTo);
+                  moved = loNode;
+                } else {
+                  movedTo = loKm + margin;
+                  setKmOnGeo(hiNode, geo, movedTo);
+                  moved = hiNode;
+                }
+                if (process.env.DEBUG_ORDERING_ALL) {
+                  console.error(`[order-neighbour] ${node.name}: ${loNode.name}(${loKm.toFixed(4)},ctx=${ctxLo.toFixed(4)},dev=${devLo.toFixed(4)}) vs ${hiNode.name}(${hiKm.toFixed(4)},ctx=${ctxHi.toFixed(4)},dev=${devHi.toFixed(4)}) reversed - moved ${moved.name} -> ${movedTo.toFixed(4)}`);
+                }
+                if (process.env.DEBUG_ORDERING) {
+                  const dt = process.env.DEBUG_ORDERING.split(',').map(Number);
+                  if (haversineM(node, { lat: dt[0], lon: dt[1] }) < 500) {
+                    console.error(`[order-neighbour] ${node.name}: ${loNode.name}(${loKm.toFixed(4)},ctx=${ctxLo.toFixed(4)},dev=${devLo.toFixed(4)}) vs ${hiNode.name}(${hiKm.toFixed(4)},ctx=${ctxHi.toFixed(4)},dev=${devHi.toFixed(4)}) reversed - moved ${moved.name} -> ${movedTo.toFixed(4)}`);
+                  }
+                }
+                anyFixed = true;
+                neighbourNudgeCount++;
+              }
+            }
+            // else: no clear outlier identifiable (missing context, or the
+            // two bounding neighbours coincide) - leave this node's km
+            // untouched rather than oscillate chasing an impossible target.
+          }
         }
 
-        if (backwardKms.length > 0 && forwardKms.length > 0) {
-          // Through node: current must sit on the far side of EVERY backward
-          // neighbour from EVERY forward neighbour. Mirrors the Network
-          // Editor's own check exactly: current is valid if it's above the
-          // backward group and at or below the forward group's max (an
-          // "increasing" chain), OR below the backward group and at or
-          // above the forward group's min (a "decreasing" chain) - a node's
-          // own forward group can legitimately spread across a wide range
-          // (e.g. a diamond's T and X ends), so only the LOOSEST forward
-          // bound may be used, not the tightest, or an already-valid node
-          // gets wrongly flagged.
-          const backwardMax = Math.max(...backwardKms);
-          const backwardMin = Math.min(...backwardKms);
-          const forwardMax = Math.max(...forwardKms);
-          const forwardMin = Math.min(...forwardKms);
-
-          const validIncreasing = currentKm > backwardMax + EPS && currentKm <= forwardMax + EPS;
-          const validDecreasing = currentKm < backwardMin - EPS && currentKm >= forwardMin - EPS;
-          if (validIncreasing || validDecreasing) continue;
-
-          // Nudge minimally past whichever bound is actually being violated,
-          // rather than jumping straight to the backward/forward midpoint.
-          // Confirmed failure mode: two nodes 17m apart (adjacent inserted
-          // platforms) landed in a near-tie, off by ~17m - a trivial,
-          // ordinary projection difference - while the FAR neighbour on the
-          // other side was 800m+ away. The midpoint of those two collapsed
-          // the node's genuinely-correct position onto a bogus point roughly
-          // halfway to the far neighbour, because the fix didn't distinguish
-          // "barely out of order with a close neighbour" from "actually
-          // needs to move a long way". A minimal nudge keeps a real, correct
-          // position intact whenever the violation is only a rounding-scale
-          // tie-break, and still falls back to the midpoint on the rare
-          // case where a small margin can't fit between both bounds at all.
-          const margin = MIN_NODE_SPACING_M / 1000;
-          const increasing = (backwardMax + backwardMin) < (forwardMax + forwardMin);
-          let dbgTarget;
-          if (increasing) {
-            if (backwardMax >= forwardMax - EPS) continue; // neighbours themselves conflict - leave for another pass
-            let target = currentKm;
-            if (target <= backwardMax) target = backwardMax + margin;
-            if (target > forwardMax) target = forwardMax - margin;
-            if (target <= backwardMax || target > forwardMax) target = (backwardMax + forwardMax) / 2;
-            setKmOnGeo(node, geo, target);
-            dbgTarget = target;
-          } else {
-            if (backwardMin <= forwardMin + EPS) continue;
-            let target = currentKm;
-            if (target >= backwardMin) target = backwardMin - margin;
-            if (target < forwardMin) target = forwardMin + margin;
-            if (target >= backwardMin || target < forwardMin) target = (backwardMin + forwardMin) / 2;
-            setKmOnGeo(node, geo, target);
-            dbgTarget = target;
-          }
-          if (process.env.DEBUG_ORDERING) {
-            const dt = process.env.DEBUG_ORDERING.split(',').map(Number);
-            if (haversineM(node, { lat: dt[0], lon: dt[1] }) < 500) {
-              console.error(
-                `[order] ${node.name}: was=${currentKm.toFixed(4)} -> ${dbgTarget.toFixed(4)} | ` +
-                `backward=[${backwardKms.map(k=>k.toFixed(4))}] forward=[${forwardKms.map(k=>k.toFixed(4))}] increasing=${increasing}`
-              );
-            }
-          }
-          anyFixed = true;
-        } else if (backwardKms.length >= 2 || forwardKms.length >= 2) {
-          // Endpoint node: every same-region neighbour is on one side (e.g.
-          // an alt-route spur's dead end, whose T and D both lead back into
-          // the mesh but nothing continues past it). Current must sit
-          // outside the span of that single group, not wedged inside it.
-          const group = backwardKms.length >= 2 ? backwardKms : forwardKms;
-          const groupMin = Math.min(...group);
-          const groupMax = Math.max(...group);
+        for (const req of endpointReqs) {
+          const groupMin = Math.min(...req.group);
+          const groupMax = Math.max(...req.group);
           if (currentKm <= groupMin + EPS || currentKm >= groupMax - EPS) continue; // already outside - valid
 
-          // Move to whichever side is the smaller adjustment, clearing it by a
-          // full minimum-spacing margin rather than landing exactly on the
-          // boundary (which ensureKmSeparation would then have to push apart
-          // again from a zero-distance tie).
           const margin = MIN_NODE_SPACING_M / 1000;
           if (currentKm - groupMin < groupMax - currentKm) {
             setKmOnGeo(node, geo, groupMin - margin);
@@ -760,10 +851,12 @@ function enforceKmOrdering(nodes) {
           }
           anyFixed = true;
         }
-        }
       }
     }
 
+    if (process.env.DEBUG_ORDERING_ALL) {
+      console.error(`[pass ${pass}] anyFixed=${anyFixed} neighbourNudges=${neighbourNudgeCount}`);
+    }
     if (!anyFixed) break;
   }
 }
