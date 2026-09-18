@@ -152,6 +152,10 @@ async function fetchPlatformsFromOverpass(bbox) {
         id: element.id.toString(),
         centLat,
         centLon,
+        // Full boundary/centreline geometry, not just the centroid - an
+        // island platform's own edge can sit right next to two different
+        // tracks while its centroid sits between both, closer to neither.
+        geometry: element.geometry.map(c => ({ lat: c.lat, lon: c.lon })),
         name: element.tags?.name || 'Platform',
         ref: element.tags?.ref || null
       });
@@ -611,30 +615,48 @@ function enforceKmOrdering(nodes) {
     return geos;
   }
 
-  const MAX_PASSES = 8;
+  // Diamonds now check two independent tracks per node (see below), so a
+  // cluster of interlinked diamonds needs more passes to fully settle than
+  // before. Tested empirically against a real network: 8 passes left
+  // several genuine violations unconverged; 25 clears everything that's
+  // going to converge; 50 found nothing further - the remainder are
+  // genuinely conflicting neighbours (see the bailouts below), not a
+  // convergence issue.
+  const MAX_PASSES = 25;
   for (let pass = 0; pass < MAX_PASSES; pass++) {
     let anyFixed = false;
 
     for (const node of nodes) {
-      // Platform nodes already get their km from a direct projection onto
-      // the region's real geometry (see the platform-insertion step) - the
-      // most trustworthy source available, not derived from a topology
-      // walk that could itself be wrong. F/T "through" neighbours are
-      // assumed to progress monotonically, but a platform can legitimately
-      // sit on a passing loop/siding that diverges from and rejoins a
-      // mainline, genuinely dipping below both its mainline-side neighbours'
-      // km - that's correct, not an error. Confirmed failure mode: two
-      // adjacent platforms on such a loop kept "correcting" each other
-      // upward by the same margin every single pass, an unbounded feedback
-      // loop that dragged both several km away from their real position.
-      if (node.railwayType === 'platform') continue;
-
+      // Platforms used to be skipped here entirely: when platform-to-link
+      // matching worked by comparing distances to reconstructed link
+      // geometry across the whole network (since replaced - see platform
+      // insertion's own history), a mismatched link could put a platform's
+      // real, correctly-projected km genuinely far from a "neighbour" that
+      // was never really adjacent to begin with, and two such platforms
+      // would "correct" each other upward every pass in an unbounded
+      // feedback loop. Now that platforms are matched to their own adjacent
+      // track way directly (resolveWayBounds), their F/T neighbours are
+      // reliably real, so ordinary ordering enforcement is safe again and
+      // cleans up the small (tens-of-metres) ties that independent
+      // projection naturally leaves between closely-spaced platforms.
+      // A diamond is two independent straight tracks crossing with no
+      // switching between them (F<->T and D<->X) - unlike a turnout, where
+      // T and D are alternative forward routes from one F approach. Check
+      // each track separately, matching the Network Editor's own validator
+      // (fixed this session): D and X must never be cross-checked against
+      // F/T's own range, or a track that's genuinely fine gets judged
+      // against a completely unrelated track's km.
       const isDiamond = node.railwayType === 'diamond';
-      const backwardArms = isDiamond ? ['fNode', 'dNode'] : ['fNode'];
-      const forwardArms = isDiamond ? ['tNode', 'xNode'] : ['tNode', 'dNode'];
+      const trackPairs = isDiamond
+        ? [[['fNode'], ['tNode']], [['dNode'], ['xNode']]]
+        : [[['fNode'], ['tNode', 'dNode']]];
 
       for (const geo of getGeos(node)) {
         if (!geo) continue;
+
+        for (const [backwardArms, forwardArms] of trackPairs) {
+        // Re-read every track pair: a diamond's F<->T fix above can change
+        // this same node's km before its D<->X pair is checked.
         const currentKm = getKmOnGeo(node, geo);
         if (currentKm == null) continue;
 
@@ -738,11 +760,108 @@ function enforceKmOrdering(nodes) {
           }
           anyFixed = true;
         }
+        }
       }
     }
 
     if (!anyFixed) break;
   }
+}
+
+/**
+ * Nearest point on a way's own polyline to `point`, and the real distance to
+ * it in metres. Reuses projectOntoGeometry() with a synthetic sequential
+ * "km" per vertex (0,1,2,...) - we only want the nearest point and distance
+ * here, not a real chainage, and this avoids duplicating its segment-
+ * projection math.
+ */
+function nearestPointOnWay(point, wayCoords) {
+  // Deliberately NOT projectOntoGeometry(): its endpoint extrapolation is
+  // correct for centerline chainage (a point genuinely beyond the mapped
+  // extent should still get a sensible km), but wrong here - confirmed
+  // case: a short 2-point way ~3km from a platform, whose own direction
+  // happened to point roughly toward it, extrapolated its line for ~9km
+  // and reported the platform as 0.6m away. This needs a real, BOUNDED
+  // point-to-segment distance that never extends past a way's own ends.
+  const cosLat = Math.cos(point.lat * Math.PI / 180);
+  const px = point.lon * cosLat, py = point.lat;
+  let bestDistSq = Infinity, bestLat = wayCoords[0].lat, bestLon = wayCoords[0].lon, bestSegIdx = 0;
+
+  for (let i = 0; i < wayCoords.length - 1; i++) {
+    const a = wayCoords[i], b = wayCoords[i + 1];
+    const ax = a.lon * cosLat, ay = a.lat;
+    const bx = b.lon * cosLat, by = b.lat;
+    const dx = bx - ax, dy = by - ay;
+    const lenSq = dx * dx + dy * dy;
+
+    let t = lenSq < 1e-20 ? 0 : ((px - ax) * dx + (py - ay) * dy) / lenSq;
+    t = Math.max(0, Math.min(1, t)); // clamp to the segment itself - no extrapolation
+
+    const projX = ax + t * dx, projY = ay + t * dy;
+    const distSq = (px - projX) ** 2 + (py - projY) ** 2;
+    if (distSq < bestDistSq) {
+      bestDistSq = distSq;
+      bestLat = a.lat + t * (b.lat - a.lat);
+      bestLon = a.lon + t * (b.lon - a.lon);
+      bestSegIdx = i;
+    }
+  }
+
+  return {
+    projLat: bestLat,
+    projLon: bestLon,
+    distM: haversineM(point, { lat: bestLat, lon: bestLon }),
+    segIdx: bestSegIdx
+  };
+}
+
+/**
+ * Find railway ways passing within `thresholdM` of ANY vertex of a
+ * platform's own boundary/centreline geometry - not its centroid, which for
+ * an island platform sitting between two tracks is close to neither one.
+ * Returns candidates sorted nearest-first.
+ */
+function findNearbyTrackWays(platformGeometry, ways, thresholdM) {
+  const results = [];
+  for (const way of ways) {
+    if (!way.coords || way.coords.length < 2) continue;
+    let minDist = Infinity;
+    for (const pt of platformGeometry) {
+      const { distM } = nearestPointOnWay(pt, way.coords);
+      if (distM < minDist) minDist = distM;
+    }
+    if (minDist <= thresholdM) results.push({ wayId: way.id, dist: minDist });
+  }
+  results.sort((a, b) => a.dist - b.dist);
+  return results;
+}
+
+/**
+ * Resolve the two already-established nodes (by their _topoKey) bounding
+ * the given way - i.e. the real graph link this way is physically part of.
+ * Walks outward from each of the way's own endpoints via followChainToNode,
+ * exactly like the topology-building step originally did, so a platform can
+ * be matched onto ITS OWN physical track rather than by comparing distances
+ * to other links' reconstructed geometry (which breaks down wherever two
+ * tracks run close together - see reprojectKmAlongTopology's history this
+ * session). Returns null if either direction can't be resolved.
+ */
+function resolveWayBounds(wayId, waysById, adj, sectionNodeKeys) {
+  const way = waysById.get(wayId);
+  if (!way || !way.coords || way.coords.length < 2) return null;
+
+  const firstKey = makeCoordKey(way.coords[0].lat, way.coords[0].lon);
+  const lastKey = makeCoordKey(way.coords[way.coords.length - 1].lat, way.coords[way.coords.length - 1].lon);
+
+  const boundA = sectionNodeKeys.has(firstKey)
+    ? { reachedKey: firstKey }
+    : followChainToNode(lastKey, wayId, waysById, adj, sectionNodeKeys);
+  const boundB = sectionNodeKeys.has(lastKey)
+    ? { reachedKey: lastKey }
+    : followChainToNode(firstKey, wayId, waysById, adj, sectionNodeKeys);
+
+  if (!boundA || !boundB || boundA.reachedKey === boundB.reachedKey) return null;
+  return { aKey: boundA.reachedKey, bKey: boundB.reachedKey };
 }
 
 /**
@@ -1564,23 +1683,25 @@ async function generateInfrastructureForSections(confirmedSections, networkName,
 
   // ── Step 11: Platform nodes ──
   // Platforms are standalone OSM ways with no relation tying them to "their"
-  // track (Overpass fetch below is a pure tag+bbox query) — proximity to
-  // actual track geometry is the only signal available, so they have to be
-  // geo-matched to an existing LINK and spliced into it, splitting that link
-  // in two.
+  // track. The previous approach matched each platform to whichever graph
+  // LINK's reconstructed geometry it landed closest to across the WHOLE
+  // network - fragile wherever two tracks run near each other (an ordinary
+  // double-track section), because a platform sitting beside track A can
+  // easily be geometrically "closer" to track B's reconstruction than to
+  // A's, especially once a branch-assignment quirk elsewhere mislabels one
+  // parallel track as a "diverging" arm (confirmed root cause of most
+  // platforms landing on the wrong link this session).
   //
-  // Matching against the deduplicated per-region centerline (geometryBySection)
-  // is NOT enough: the geometry pipeline collapses parallel tracks onto one
-  // centerline before this stage ever runs, so a station's 2nd/3rd platform
-  // track was never kept as its own line, and Step 6 doesn't create a node
-  // for a plain (non-junction) point along it either — a loop track between
-  // two turnouts is invisible to a centerline-only search. So instead we
-  // search every real graph LINK (any two nodes already connected via an
-  // arm), reconstructing each link's own true OSM geometry by walking its
-  // topology chain — mainline and every loop/siding alike are candidates,
-  // and each platform attaches to whichever one it's physically closest to.
-  // Falls back to a straight line between endpoints only when a link's
-  // topology can't be walked (e.g. one end is a synthetic boundary node).
+  // Now matches the platform to ITS OWN adjacent track WAY first (any
+  // vertex of the platform's real boundary geometry within
+  // PLATFORM_WAY_MATCH_THRESHOLD_M of the way), then resolves which
+  // established graph link that specific way belongs to by walking outward
+  // from its own endpoints (resolveWayBounds) - the same topology-walk the
+  // original node-creation step used, so there's no ambiguity between
+  // physically nearby but topologically distinct tracks. An island platform
+  // (one OSM object serving two faces, tagged e.g. ref="1;2") resolves to
+  // up to that many distinct adjacent ways/tracks and gets one platform
+  // node spliced into each.
   //
   // Scoped to platforms landing on an ordinary degree-2 stretch of track (the
   // overwhelming majority — normal wayside/through stations); a platform
@@ -1589,7 +1710,8 @@ async function generateInfrastructureForSections(confirmedSections, networkName,
   // Inserted with Signalled F/T = false (the engine's new per-end signalling
   // flag) so it reads as an unsignalled waypoint rather than implying a
   // signal that isn't there.
-  const PLATFORM_MATCH_THRESHOLD_M = 100;
+  const PLATFORM_WAY_MATCH_THRESHOLD_M = 3;
+  const PLATFORM_WAY_MATCH_FALLBACK_M = 10;
   const PLATFORM_JUNCTION_BUFFER_M = 50;
   const PLATFORM_INSERTION_ENABLED = true;
   updateProgress(75, 'Fetching platform nodes');
@@ -1616,236 +1738,208 @@ async function generateInfrastructureForSections(confirmedSections, networkName,
     const ARM_FIELDS = ['fNode', 'tNode', 'dNode', 'xNode'];
     const findArmTo = (node, targetName) => ARM_FIELDS.find(f => node[f] === targetName) ?? null;
 
-    // Walk a link's real topology chain from `startKey` along `wayId`,
-    // collecting every intermediate OSM vertex with a cumulative distance
-    // (in km, arbitrary zero-point — NOT regional kilometrage) so the
-    // resulting polyline can be handed straight to projectOntoGeometry().
-    // Mirrors followChainToNode()'s own traversal/termination logic but
-    // additionally records geometry instead of only the reached key.
-    function reconstructLinkPolyline(startKey, wayId, targetTopoKey) {
-      const { lat: sLat, lon: sLon } = parseCoordKey(startKey);
-      const points = [{ lat: sLat, lon: sLon, km: 0 }];
-      let cumKm = 0;
-      let cursorKey = startKey;
-      let currentWayId = wayId;
-      const MAX_CHAIN_LENGTH = 1000;
+    const nodesByName = new Map(nodes.map(n => [n.name, n]));
+    // Every already-established junction/endpoint node from the original
+    // topology walk carries its own _topoKey - the set of these is exactly
+    // the set of points resolveWayBounds should treat as "an existing node,
+    // stop here". Static for the whole platform pass: newly-created
+    // platform nodes never get a _topoKey (they're mid-link insertions, not
+    // topology vertices), which is deliberate - the fresh lookup below
+    // (findCurrentChain) is what accounts for platforms already spliced in
+    // earlier in this same loop.
+    const nodeByTopoKey = new Map(nodes.filter(n => n._topoKey).map(n => [n._topoKey, n]));
+    const sectionNodeKeys = new Set(nodeByTopoKey.keys());
 
-      for (let step = 0; step < MAX_CHAIN_LENGTH; step++) {
-        const way = waysById.get(currentWayId);
-        if (!way || !way.coords || way.coords.length < 2) return null;
-
-        const coords = way.coords;
-        const firstKey = makeCoordKey(coords[0].lat, coords[0].lon);
-        const lastKey = makeCoordKey(coords[coords.length - 1].lat, coords[coords.length - 1].lon);
-
-        let seq, nextKey;
-        if (firstKey === cursorKey) { seq = coords; nextKey = lastKey; }
-        else if (lastKey === cursorKey) { seq = [...coords].reverse(); nextKey = firstKey; }
-        else return null; // cursor isn't an endpoint of this way — shouldn't happen
-
-        for (let i = 1; i < seq.length; i++) {
-          cumKm += haversineM(seq[i - 1], seq[i]) / 1000;
-          points.push({ lat: seq[i].lat, lon: seq[i].lon, km: cumKm });
+    // Locate the CURRENT immediate pair to splice into, starting from the
+    // two nodes a track way was originally resolved to bound. If nothing
+    // has touched this link yet, that's just (nodeA, nodeB) directly. If an
+    // earlier platform in this same run already spliced into it (e.g. two
+    // real, separate platform objects on the same physical track, such as a
+    // platform split either side of a bridge), walk forward through
+    // whichever already-inserted platform nodes sit in between - platforms
+    // are the only node type safe to walk through blindly, since they're by
+    // construction a simple pass-through insertion with exactly two arms.
+    function findCurrentChain(nodeA, nodeB) {
+      for (const startArm of ARM_FIELDS) {
+        const startName = nodeA[startArm];
+        if (!startName) continue;
+        const chain = [nodeA];
+        let cur = nodesByName.get(startName);
+        let cameFrom = nodeA.name;
+        let ok = false;
+        for (let hop = 0; hop < 30 && cur; hop++) {
+          chain.push(cur);
+          if (cur.name === nodeB.name) { ok = true; break; }
+          if (cur.railwayType !== 'platform') break; // wrong direction - not the target and not safe to pass through
+          const nextName = ARM_FIELDS.map(f => cur[f]).filter(Boolean).find(n => n !== cameFrom);
+          cameFrom = cur.name;
+          cur = nextName ? nodesByName.get(nextName) : null;
         }
-
-        cursorKey = nextKey;
-        if (cursorKey === targetTopoKey) return { points };
-
-        const nextConns = (adj.get(cursorKey) || []).filter(c => c.wayId !== currentWayId);
-        if (nextConns.length !== 1) return null; // dead end or a different junction — not our target
-        currentWayId = nextConns[0].wayId;
+        if (ok) return chain;
       }
       return null;
     }
 
-    // Reconstruct the real geometry of the link between two adjacent nodes,
-    // falling back to a straight line when either end lacks topology data
-    // (e.g. a Step 8e boundary node) or the chain can't be walked.
-    function linkPolyline(a, b) {
-      if (a._topoConns && a._topoKey && b._topoKey) {
-        for (const conn of a._topoConns) {
-          const result = reconstructLinkPolyline(a._topoKey, conn.wayId, b._topoKey);
-          if (result) return result.points;
-        }
-      }
-      return [
-        { lat: a.lat, lon: a.lon, km: 0 },
-        { lat: b.lat, lon: b.lon, km: haversineM(a, b) / 1000 },
-      ];
-    }
-
-    const nodesByName = new Map(nodes.map(n => [n.name, n]));
     // Deterministic order so repeated runs against the same data produce the
     // same result regardless of Overpass's own element ordering.
-    const sortedPlatforms = [...platforms].sort((a, b) => a.name.localeCompare(b.name));
+    const sortedPlatforms = [...platforms].sort((a, b) => Number(a.id) - Number(b.id));
     let insertedCount = 0;
 
     for (const platform of sortedPlatforms) {
       const point = { lat: platform.centLat, lon: platform.centLon };
-
-      // Rebuilt fresh each time: earlier insertions in this loop become new
-      // candidate links, so a second platform landing on an already-spliced
-      // link correctly narrows against the new, shorter remainder.
-      const candidates = [];
-      for (const node of nodes) {
-        for (const armField of ARM_FIELDS) {
-          const neighborName = node[armField];
-          if (!neighborName) continue;
-          const neighbor = nodesByName.get(neighborName);
-          if (!neighbor) continue;
-
-          const poly = linkPolyline(node, neighbor);
-          const { km: polyKm, projLat, projLon } = projectOntoGeometry(point, poly);
-          const distM = haversineM(point, { lat: projLat, lon: projLon });
-          candidates.push({ a: node, b: neighbor, armOnA: armField, poly, polyKm, projLat, projLon, distM });
-        }
-      }
-      candidates.sort((x, y) => x.distM - y.distM);
+      const platformGeometry = platform.geometry && platform.geometry.length > 0
+        ? platform.geometry
+        : [point]; // cached data from before geometry was retained - fall back to the centroid alone
 
       const debugTarget = process.env.DEBUG_PLATFORM_MATCH ? process.env.DEBUG_PLATFORM_MATCH.split(',').map(Number) : null;
       const isDebugTarget = debugTarget && haversineM(point, { lat: debugTarget[0], lon: debugTarget[1] }) < 500;
-      if (isDebugTarget) {
-        console.error(`\n=== platform ${platform.id} "${platform.name}" @ (${point.lat},${point.lon}) - top 8 candidates ===`);
-        for (const c of candidates.slice(0, 8)) {
-          const reconM = c.poly[c.poly.length - 1].km * 1000;
-          const straightM = haversineM(c.a, c.b);
-          console.error(
-            `  ${c.a.name} <-> ${c.b.name} (via ${c.armOnA}): distM=${c.distM.toFixed(1)} ` +
-            `reconLenM=${reconM.toFixed(1)} straightM=${straightM.toFixed(1)} ratio=${(reconM/straightM).toFixed(1)} ` +
-            `a.region=${c.a.region} b.region=${c.b.region} a.km=${c.a.km} b.km=${c.b.km}`
-          );
-        }
+
+      // An island platform serves multiple track faces from one OSM object -
+      // ref="1;2" (or comma-separated) is the tag for that. Resolve up to
+      // that many DISTINCT adjacent tracks; an ordinary wayside platform
+      // just needs the one nearest.
+      const faceCount = Math.max(1, (platform.ref || '').split(/[;,]/).map(s => s.trim()).filter(Boolean).length);
+
+      let nearbyWays = findNearbyTrackWays(platformGeometry, splitTopo.ways, PLATFORM_WAY_MATCH_THRESHOLD_M);
+      let usedFallback = false;
+      if (nearbyWays.length === 0) {
+        nearbyWays = findNearbyTrackWays(platformGeometry, splitTopo.ways, PLATFORM_WAY_MATCH_FALLBACK_M);
+        usedFallback = true;
       }
 
-      // Sanity check: a link's reconstructed length should be roughly in
-      // line with the straight-line distance between its own two endpoints.
-      // When it isn't - confirmed case: two endpoints 48m apart from EACH
-      // OTHER reconstructing to 16.6km of "track" - the chain walk has
-      // wandered off through unrelated, far-away topology before finding
-      // its way back to the target key, rather than reconstructing the
-      // short real link between them. A platform "matching" such a link
-      // within the normal distance threshold is coincidental, not real:
-      // it's landing on some faraway point the wayward reconstruction
-      // happens to pass through, not on the actual nearby track. Rather
-      // than give up the moment the nearest candidate fails this check,
-      // fall through to the next-nearest one - the genuinely correct link
-      // is often right behind it in the ranking.
-      const RECONSTRUCTION_SANITY_RATIO = 5;
-      const RECONSTRUCTION_SANITY_FLOOR_M = 300;
-      let best = null;
-      let rejectedCount = 0;
-      for (const c of candidates) {
-        if (c.distM > PLATFORM_MATCH_THRESHOLD_M) break; // sorted - nothing further can qualify either
-        const reconstructedLengthM = c.poly[c.poly.length - 1].km * 1000;
-        const straightLineM = haversineM(c.a, c.b);
-        if (reconstructedLengthM > RECONSTRUCTION_SANITY_FLOOR_M && reconstructedLengthM > straightLineM * RECONSTRUCTION_SANITY_RATIO) {
-          rejectedCount++;
+      if (isDebugTarget) {
+        console.error(`\n=== platform ${platform.id} "${platform.name}" ref=${platform.ref} @ (${point.lat},${point.lon}) - faceCount=${faceCount}, ${nearbyWays.length} nearby way(s)${usedFallback ? ' (fallback radius)' : ''} ===`);
+        for (const w of nearbyWays.slice(0, 8)) console.error(`  way ${w.wayId}: dist=${w.dist.toFixed(2)}m`);
+      }
+
+      if (nearbyWays.length === 0) {
+        warnings.push(`Platform "${platform.name}" (${platform.id}): no track within ${PLATFORM_WAY_MATCH_FALLBACK_M}m of its own edge — skipped.`);
+        continue;
+      }
+
+      // Resolve up to faceCount DISTINCT tracks (dedup by resolved node
+      // pair, not raw way ID - a platform can sit right at a junction-split
+      // boundary where two way IDs are really the same physical track).
+      const seenPairs = new Set();
+      const resolvedLinks = [];
+      for (const cand of nearbyWays) {
+        const bounds = resolveWayBounds(cand.wayId, waysById, adj, sectionNodeKeys);
+        if (!bounds) continue;
+        const pairKey = [bounds.aKey, bounds.bKey].sort().join('|');
+        if (seenPairs.has(pairKey)) continue;
+        seenPairs.add(pairKey);
+        resolvedLinks.push({ wayId: cand.wayId, dist: cand.dist, ...bounds });
+        if (resolvedLinks.length >= faceCount) break;
+      }
+
+      if (resolvedLinks.length === 0) {
+        warnings.push(`Platform "${platform.name}" (${platform.id}): found nearby track but couldn't resolve it to an ` +
+          `established link — skipped (needs manual review).`);
+        continue;
+      }
+      if (resolvedLinks.length < faceCount) {
+        warnings.push(`Platform "${platform.name}" (${platform.id}): ref suggests ${faceCount} track faces but only ` +
+          `${resolvedLinks.length} distinct nearby track(s) resolved — inserting what was found.`);
+      }
+
+      for (const link of resolvedLinks) {
+        const nodeA = nodeByTopoKey.get(link.aKey);
+        const nodeB = nodeByTopoKey.get(link.bKey);
+        if (!nodeA || !nodeB) {
+          warnings.push(`Platform "${platform.name}" (${platform.id}): resolved track bounds don't match any ` +
+            `known node — skipped (needs manual review).`);
           continue;
         }
-        best = c;
-        break;
-      }
 
-      if (!best) {
-        warnings.push(rejectedCount > 0
-          ? `Platform "${platform.name}": no track within ${PLATFORM_MATCH_THRESHOLD_M}m after discarding ` +
-            `${rejectedCount} candidate(s) with implausibly long track reconstructions relative to their ` +
-            `endpoints' distance apart — skipped (needs manual review).`
-          : `Platform "${platform.name}": no track within ${PLATFORM_MATCH_THRESHOLD_M}m — skipped.`);
-        continue;
-      }
-      const { a, b, armOnA, projLat, projLon } = best;
+        const chain = findCurrentChain(nodeA, nodeB) || findCurrentChain(nodeB, nodeA);
+        if (!chain) {
+          warnings.push(`Platform "${platform.name}" (${platform.id}): matched track "${nodeA.name}" / "${nodeB.name}" ` +
+            `isn't currently linked — skipped (needs manual review).`);
+          continue;
+        }
 
-      const nearJunction =
-        (['junction', 'diamond'].includes(a.railwayType) && haversineM({ lat: projLat, lon: projLon }, a) < PLATFORM_JUNCTION_BUFFER_M) ||
-        (['junction', 'diamond'].includes(b.railwayType) && haversineM({ lat: projLat, lon: projLon }, b) < PLATFORM_JUNCTION_BUFFER_M);
-      if (nearJunction) {
-        warnings.push(`Platform "${platform.name}": within ${PLATFORM_JUNCTION_BUFFER_M}m of a turnout/diamond — ` +
-          `skipped (splice into a junction arm needs manual review).`);
-        continue;
-      }
+        const chainCoords = chain.map(n => ({ lat: n.lat, lon: n.lon }));
+        const { segIdx, projLat, projLon } = nearestPointOnWay(point, chainCoords);
+        const a = chain[segIdx];
+        const b = chain[segIdx + 1];
 
-      const armOnB = findArmTo(b, a.name);
-      if (!armOnB) {
-        warnings.push(`Platform "${platform.name}": matched link "${a.name}" / "${b.name}" isn't ` +
-          `reciprocally linked — skipped (manual insertion needed).`);
-        continue;
-      }
+        const nearJunction =
+          (['junction', 'diamond'].includes(a.railwayType) && haversineM({ lat: projLat, lon: projLon }, a) < PLATFORM_JUNCTION_BUFFER_M) ||
+          (['junction', 'diamond'].includes(b.railwayType) && haversineM({ lat: projLat, lon: projLon }, b) < PLATFORM_JUNCTION_BUFFER_M);
+        if (nearJunction) {
+          warnings.push(`Platform "${platform.name}" (${platform.id}): within ${PLATFORM_JUNCTION_BUFFER_M}m of a turnout/diamond — ` +
+            `skipped (splice into a junction arm needs manual review).`);
+          continue;
+        }
 
-      // Regional kilometrage: project the platform's own real coordinates
-      // directly onto the shared regional centerline, the same way every
-      // other node gets its km - NOT by interpolating a fraction along the
-      // matched link's own reconstructed length between the two endpoints.
-      // Those aren't equivalent whenever the matched link is a siding/loop
-      // whose real physical length differs substantially from its two
-      // endpoints' regional-km delta (confirmed case: a ~1.5km real detour
-      // between two endpoints only ~90m apart in km - fraction-along-length
-      // compressed the platform to within metres of one endpoint's km,
-      // rather than the ~1km-away point on the centerline it actually
-      // projects to). A node near a diamond or an alt-route junction can
-      // carry up to 3 region slots (region/region2/region3), and the region
-      // THIS link actually belongs to isn't always either node's primary
-      // `region` field - search every slot combination for one they share.
-      const regionSlots = (n) => [['region', 'km'], ['region2', 'km2'], ['region3', 'km3']].filter(([rf]) => n[rf]);
+        const armOnA = findArmTo(a, b.name);
+        const armOnB = findArmTo(b, a.name);
+        if (!armOnA || !armOnB) {
+          warnings.push(`Platform "${platform.name}" (${platform.id}): matched link "${a.name}" / "${b.name}" isn't ` +
+            `reciprocally linked — skipped (manual insertion needed).`);
+          continue;
+        }
 
-      let region = a.region, km = a.km ?? 0;
-      outer:
-      for (const [aRegionField] of regionSlots(a)) {
-        for (const [bRegionField] of regionSlots(b)) {
-          if (a[aRegionField] === b[bRegionField]) {
-            region = a[aRegionField];
-            const regionPoints = geometryBySection.get(region);
-            km = regionPoints && regionPoints.length > 0
-              ? projectOntoGeometry(point, regionPoints).km
-              : a.km ?? 0;
-            break outer;
+        // Regional kilometrage: project the platform's own real coordinates
+        // directly onto the shared regional centerline, the same way every
+        // other node gets its km. A node near a diamond or an alt-route
+        // junction can carry up to 3 region slots (region/region2/region3),
+        // and the region THIS link actually belongs to isn't always either
+        // node's primary `region` field - search every slot combination for
+        // one they share.
+        const regionSlots = (n) => [['region', 'km'], ['region2', 'km2'], ['region3', 'km3']].filter(([rf]) => n[rf]);
+
+        let region = a.region, km = a.km ?? 0;
+        outer:
+        for (const [aRegionField] of regionSlots(a)) {
+          for (const [bRegionField] of regionSlots(b)) {
+            if (a[aRegionField] === b[bRegionField]) {
+              region = a[aRegionField];
+              const regionPoints = geometryBySection.get(region);
+              km = regionPoints && regionPoints.length > 0
+                ? projectOntoGeometry(point, regionPoints).km
+                : a.km ?? 0;
+              break outer;
+            }
           }
         }
-      }
 
-      if (isDebugTarget) {
-        const rp = geometryBySection.get(region);
-        console.error(
-          `  CHOSEN: ${a.name} <-> ${b.name} (armOnA=${armOnA}) | region=${region} ` +
-          `regionPointsFound=${!!rp} regionPointsLen=${rp ? rp.length : 0} | assigned km=${km}`
-        );
-      }
-
-      // Unique name
-      let platName = platform.name;
-      let pIdx = 0;
-      while (nodesByName.has(platName)) {
-        platName = `${platform.name} ${String.fromCharCode(65 + pIdx++)}`;
-      }
-
-      const platformNode = {
-        name: platName,
-        lat: projLat, lon: projLon, km,
-        region,
-        railwayType: 'platform',
-        signalledF: false,
-        signalledT: false,
-        fNode: a.name,
-        fOnBranch: fieldToBranch(armOnA),
-        tNode: b.name,
-        tOnBranch: fieldToBranch(armOnB),
-      };
-      nodes.push(platformNode);
-      nodesByName.set(platName, platformNode);
-
-      if (process.env.DEBUG_STAGE) {
-        const dt = process.env.DEBUG_STAGE.split(',').map(Number);
-        if (haversineM(platformNode, { lat: dt[0], lon: dt[1] }) < 500) {
-          console.error(`[insert] created ${platName}: km=${km} region=${region} fNode=${a.name} tNode=${b.name}`);
+        if (isDebugTarget) {
+          console.error(
+            `  CHOSEN (way ${link.wayId}, dist=${link.dist.toFixed(2)}m): ${a.name} <-> ${b.name} (armOnA=${armOnA}) | ` +
+            `region=${region} | assigned km=${km}`
+          );
         }
+
+        // Unique name
+        let platName = platform.name;
+        let pIdx = 0;
+        while (nodesByName.has(platName)) {
+          platName = `${platform.name} ${String.fromCharCode(65 + pIdx++)}`;
+        }
+
+        const platformNode = {
+          name: platName,
+          lat: projLat, lon: projLon, km,
+          region,
+          railwayType: 'platform',
+          signalledF: false,
+          signalledT: false,
+          fNode: a.name,
+          fOnBranch: fieldToBranch(armOnA),
+          tNode: b.name,
+          tOnBranch: fieldToBranch(armOnB),
+        };
+        nodes.push(platformNode);
+        nodesByName.set(platName, platformNode);
+
+        a[armOnA] = platName;
+        a[branchToBranchField(fieldToBranch(armOnA))] = 'F';
+        b[armOnB] = platName;
+        b[branchToBranchField(fieldToBranch(armOnB))] = 'T';
+
+        insertedCount++;
       }
-
-      a[armOnA] = platName;
-      a[branchToBranchField(fieldToBranch(armOnA))] = 'F';
-      b[armOnB] = platName;
-      b[branchToBranchField(fieldToBranch(armOnB))] = 'T';
-
-      insertedCount++;
     }
 
     if (insertedCount > 0) {
@@ -1924,8 +2018,10 @@ async function generateInfrastructureForSections(confirmedSections, networkName,
   // comment). Ordering and spacing are interdependent (fixing one can
   // reintroduce a violation of the other in a densely-meshed cluster), so
   // alternate the two until neither has anything left to fix, capped so a
-  // genuinely conflicting cluster can't loop forever.
-  for (let i = 0; i < 10; i++) {
+  // genuinely conflicting cluster can't loop forever. 25 (tested against a
+  // real network alongside enforceKmOrdering's own per-diamond-track passes
+  // above) is where this plateaus - going higher found nothing further.
+  for (let i = 0; i < 25; i++) {
     enforceKmOrdering(nodes);
     ensureKmSeparation(nodes, geometryBySection);
   }
