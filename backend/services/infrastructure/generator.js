@@ -1595,7 +1595,7 @@ async function generateInfrastructureForSections(confirmedSections, networkName,
       // Rebuilt fresh each time: earlier insertions in this loop become new
       // candidate links, so a second platform landing on an already-spliced
       // link correctly narrows against the new, shorter remainder.
-      let best = null;
+      const candidates = [];
       for (const node of nodes) {
         for (const armField of ARM_FIELDS) {
           const neighborName = node[armField];
@@ -1606,17 +1606,49 @@ async function generateInfrastructureForSections(confirmedSections, networkName,
           const poly = linkPolyline(node, neighbor);
           const { km: polyKm, projLat, projLon } = projectOntoGeometry(point, poly);
           const distM = haversineM(point, { lat: projLat, lon: projLon });
-          if (!best || distM < best.distM) {
-            best = { a: node, b: neighbor, armOnA: armField, poly, polyKm, projLat, projLon, distM };
-          }
+          candidates.push({ a: node, b: neighbor, armOnA: armField, poly, polyKm, projLat, projLon, distM });
         }
       }
+      candidates.sort((x, y) => x.distM - y.distM);
 
-      if (!best || best.distM > PLATFORM_MATCH_THRESHOLD_M) {
-        warnings.push(`Platform "${platform.name}": no track within ${PLATFORM_MATCH_THRESHOLD_M}m — skipped.`);
+      // Sanity check: a link's reconstructed length should be roughly in
+      // line with the straight-line distance between its own two endpoints.
+      // When it isn't - confirmed case: two endpoints 48m apart from EACH
+      // OTHER reconstructing to 16.6km of "track" - the chain walk has
+      // wandered off through unrelated, far-away topology before finding
+      // its way back to the target key, rather than reconstructing the
+      // short real link between them. A platform "matching" such a link
+      // within the normal distance threshold is coincidental, not real:
+      // it's landing on some faraway point the wayward reconstruction
+      // happens to pass through, not on the actual nearby track. Rather
+      // than give up the moment the nearest candidate fails this check,
+      // fall through to the next-nearest one - the genuinely correct link
+      // is often right behind it in the ranking.
+      const RECONSTRUCTION_SANITY_RATIO = 5;
+      const RECONSTRUCTION_SANITY_FLOOR_M = 300;
+      let best = null;
+      let rejectedCount = 0;
+      for (const c of candidates) {
+        if (c.distM > PLATFORM_MATCH_THRESHOLD_M) break; // sorted - nothing further can qualify either
+        const reconstructedLengthM = c.poly[c.poly.length - 1].km * 1000;
+        const straightLineM = haversineM(c.a, c.b);
+        if (reconstructedLengthM > RECONSTRUCTION_SANITY_FLOOR_M && reconstructedLengthM > straightLineM * RECONSTRUCTION_SANITY_RATIO) {
+          rejectedCount++;
+          continue;
+        }
+        best = c;
+        break;
+      }
+
+      if (!best) {
+        warnings.push(rejectedCount > 0
+          ? `Platform "${platform.name}": no track within ${PLATFORM_MATCH_THRESHOLD_M}m after discarding ` +
+            `${rejectedCount} candidate(s) with implausibly long track reconstructions relative to their ` +
+            `endpoints' distance apart — skipped (needs manual review).`
+          : `Platform "${platform.name}": no track within ${PLATFORM_MATCH_THRESHOLD_M}m — skipped.`);
         continue;
       }
-      const { a, b, armOnA, poly, polyKm, projLat, projLon } = best;
+      const { a, b, armOnA, projLat, projLon } = best;
 
       const nearJunction =
         (['junction', 'diamond'].includes(a.railwayType) && haversineM({ lat: projLat, lon: projLon }, a) < PLATFORM_JUNCTION_BUFFER_M) ||
@@ -1634,24 +1666,32 @@ async function generateInfrastructureForSections(confirmedSections, networkName,
         continue;
       }
 
-      // Regional kilometrage: interpolate between the two endpoints' own km
-      // along the fraction of the way this platform sits along the link's
-      // (arbitrary zero-point) reconstructed length. A node near a diamond or
-      // an alt-route junction can carry up to 3 region slots (region/region2/
-      // region3), and the region THIS link actually belongs to isn't always
-      // either node's primary `region` field - search every slot combination
-      // for one they actually share, rather than assuming primary vs primary.
-      const totalPolyKm = poly[poly.length - 1].km;
-      const t = totalPolyKm > 0 ? polyKm / totalPolyKm : 0;
+      // Regional kilometrage: project the platform's own real coordinates
+      // directly onto the shared regional centerline, the same way every
+      // other node gets its km - NOT by interpolating a fraction along the
+      // matched link's own reconstructed length between the two endpoints.
+      // Those aren't equivalent whenever the matched link is a siding/loop
+      // whose real physical length differs substantially from its two
+      // endpoints' regional-km delta (confirmed case: a ~1.5km real detour
+      // between two endpoints only ~90m apart in km - fraction-along-length
+      // compressed the platform to within metres of one endpoint's km,
+      // rather than the ~1km-away point on the centerline it actually
+      // projects to). A node near a diamond or an alt-route junction can
+      // carry up to 3 region slots (region/region2/region3), and the region
+      // THIS link actually belongs to isn't always either node's primary
+      // `region` field - search every slot combination for one they share.
       const regionSlots = (n) => [['region', 'km'], ['region2', 'km2'], ['region3', 'km3']].filter(([rf]) => n[rf]);
 
       let region = a.region, km = a.km ?? 0;
       outer:
-      for (const [aRegionField, aKmField] of regionSlots(a)) {
-        for (const [bRegionField, bKmField] of regionSlots(b)) {
-          if (a[aRegionField] === b[bRegionField] && a[aKmField] != null && b[bKmField] != null) {
+      for (const [aRegionField] of regionSlots(a)) {
+        for (const [bRegionField] of regionSlots(b)) {
+          if (a[aRegionField] === b[bRegionField]) {
             region = a[aRegionField];
-            km = a[aKmField] + t * (b[bKmField] - a[aKmField]);
+            const regionPoints = geometryBySection.get(region);
+            km = regionPoints && regionPoints.length > 0
+              ? projectOntoGeometry(point, regionPoints).km
+              : a.km ?? 0;
             break outer;
           }
         }
