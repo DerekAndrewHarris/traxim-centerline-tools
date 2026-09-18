@@ -290,6 +290,12 @@ function reprojectKmAlongTopology(nodes, geometryBySection) {
     return null;
   }
   function setKmOnGeo(node, geo, val) {
+    if (process.env.DEBUG_STAGE) {
+      const dt = process.env.DEBUG_STAGE.split(',').map(Number);
+      if (haversineM(node, { lat: dt[0], lon: dt[1] }) < 500) {
+        console.error(`[setKmOnGeo] ${node.name}: geo="${geo}" val=${val} (type=${typeof val}) node.region="${node.region}" match=${node.region === geo}`);
+      }
+    }
     if (node.region === geo) node.km = val;
     else if (node.region2 === geo) node.km2 = val;
     else if (node.region3 === geo) node.km3 = val;
@@ -358,17 +364,55 @@ function reprojectKmAlongTopology(nodes, geometryBySection) {
           const bwdProj = bwdPoints.length > 0 ? projectOntoGeometry({ lat: nb.lat, lon: nb.lon }, bwdPoints) : null;
           const fwdDist = fwdProj ? haversineM(nb, { lat: fwdProj.projLat, lon: fwdProj.projLon }) : Infinity;
           const bwdDist = bwdProj ? haversineM(nb, { lat: bwdProj.projLat, lon: bwdProj.projLon }) : Infinity;
+          const bestSliceDist = Math.min(fwdDist, bwdDist);
 
-          const useForward = fwdDist <= bwdDist;
-          const chosen = useForward ? fwdProj : bwdProj;
-          projKm = useForward ? Math.max(chosen.km, points[curIdx].km) : Math.min(chosen.km, points[curIdx].km);
-          nbIdx = useForward
-            ? indexAtOrBefore(points, curIdx, projKm)
-            : indexAtOrBefore(points, 0, projKm);
+          // Rescue: both slices above are bounded relative to curIdx, so if
+          // curIdx itself has already drifted far from the truth (an error
+          // inherited from earlier in this same walk), neither slice can
+          // reach the neighbour's real position - they can only clamp to
+          // whichever slice boundary is nearest, which is still wrong.
+          // Compare against the fully unconstrained projection, and use it
+          // instead whenever the slice-bounded result is implausibly bad
+          // (>300m off) AND the unconstrained one is dramatically better
+          // (<1/3 the distance) - confirmed case: a node stuck 17km from its
+          // true position via slice-bounded search matched within 12m
+          // unconstrained. Ordinary close-range ambiguity (the original dip
+          // bug this slicing was built to prevent) never trips this: ties
+          // there are decided in metres, nowhere near the 300m floor.
+          let useForward;
+          const unconstrainedProj = projectOntoGeometry({ lat: nb.lat, lon: nb.lon }, points);
+          const unconstrainedDist = haversineM(nb, { lat: unconstrainedProj.projLat, lon: unconstrainedProj.projLon });
+          const rescued = bestSliceDist > 300 && unconstrainedDist * 3 < bestSliceDist;
+          if (rescued) {
+            projKm = unconstrainedProj.km;
+          } else {
+            useForward = fwdDist <= bwdDist;
+            const chosen = useForward ? fwdProj : bwdProj;
+            projKm = useForward ? Math.max(chosen.km, points[curIdx].km) : Math.min(chosen.km, points[curIdx].km);
+          }
+          nbIdx = indexAtOrBefore(points, 0, projKm);
+
+          if (process.env.DEBUG_REPROJECT) {
+            const dt = process.env.DEBUG_REPROJECT.split(',').map(Number);
+            if (haversineM(nb, { lat: dt[0], lon: dt[1] }) < 500) {
+              console.error(
+                `[reproject] ${cur.name}(curIdx=${curIdx},km=${points[curIdx].km.toFixed(3)}) --${armField}--> ${nb.name}: ` +
+                `fwdDist=${fwdDist.toFixed(1)} bwdDist=${bwdDist.toFixed(1)} unconstrainedDist=${unconstrainedDist.toFixed(1)} ` +
+                `rescued=${rescued} useForward=${useForward} -> projKm=${projKm.toFixed(3)}`
+              );
+            }
+          }
         } else {
           const proj = projectOntoGeometry({ lat: nb.lat, lon: nb.lon }, points);
           projKm = proj.km;
           nbIdx = indexAtOrBefore(points, 0, projKm);
+
+          if (process.env.DEBUG_REPROJECT) {
+            const dt = process.env.DEBUG_REPROJECT.split(',').map(Number);
+            if (haversineM(nb, { lat: dt[0], lon: dt[1] }) < 500) {
+              console.error(`[reproject] ${cur.name}(curIdx=${curIdx}) --${armField} (unconstrained)--> ${nb.name}: -> projKm=${projKm.toFixed(3)}`);
+            }
+          }
         }
 
         setKmOnGeo(nb, region, projKm);
@@ -572,6 +616,19 @@ function enforceKmOrdering(nodes) {
     let anyFixed = false;
 
     for (const node of nodes) {
+      // Platform nodes already get their km from a direct projection onto
+      // the region's real geometry (see the platform-insertion step) - the
+      // most trustworthy source available, not derived from a topology
+      // walk that could itself be wrong. F/T "through" neighbours are
+      // assumed to progress monotonically, but a platform can legitimately
+      // sit on a passing loop/siding that diverges from and rejoins a
+      // mainline, genuinely dipping below both its mainline-side neighbours'
+      // km - that's correct, not an error. Confirmed failure mode: two
+      // adjacent platforms on such a loop kept "correcting" each other
+      // upward by the same margin every single pass, an unbounded feedback
+      // loop that dragged both several km away from their real position.
+      if (node.railwayType === 'platform') continue;
+
       const isDiamond = node.railwayType === 'diamond';
       const backwardArms = isDiamond ? ['fNode', 'dNode'] : ['fNode'];
       const forwardArms = isDiamond ? ['tNode', 'xNode'] : ['tNode', 'dNode'];
@@ -616,13 +673,47 @@ function enforceKmOrdering(nodes) {
           const validDecreasing = currentKm < backwardMin - EPS && currentKm >= forwardMin - EPS;
           if (validIncreasing || validDecreasing) continue;
 
+          // Nudge minimally past whichever bound is actually being violated,
+          // rather than jumping straight to the backward/forward midpoint.
+          // Confirmed failure mode: two nodes 17m apart (adjacent inserted
+          // platforms) landed in a near-tie, off by ~17m - a trivial,
+          // ordinary projection difference - while the FAR neighbour on the
+          // other side was 800m+ away. The midpoint of those two collapsed
+          // the node's genuinely-correct position onto a bogus point roughly
+          // halfway to the far neighbour, because the fix didn't distinguish
+          // "barely out of order with a close neighbour" from "actually
+          // needs to move a long way". A minimal nudge keeps a real, correct
+          // position intact whenever the violation is only a rounding-scale
+          // tie-break, and still falls back to the midpoint on the rare
+          // case where a small margin can't fit between both bounds at all.
+          const margin = MIN_NODE_SPACING_M / 1000;
           const increasing = (backwardMax + backwardMin) < (forwardMax + forwardMin);
+          let dbgTarget;
           if (increasing) {
             if (backwardMax >= forwardMax - EPS) continue; // neighbours themselves conflict - leave for another pass
-            setKmOnGeo(node, geo, (backwardMax + forwardMax) / 2);
+            let target = currentKm;
+            if (target <= backwardMax) target = backwardMax + margin;
+            if (target > forwardMax) target = forwardMax - margin;
+            if (target <= backwardMax || target > forwardMax) target = (backwardMax + forwardMax) / 2;
+            setKmOnGeo(node, geo, target);
+            dbgTarget = target;
           } else {
             if (backwardMin <= forwardMin + EPS) continue;
-            setKmOnGeo(node, geo, (backwardMin + forwardMin) / 2);
+            let target = currentKm;
+            if (target >= backwardMin) target = backwardMin - margin;
+            if (target < forwardMin) target = forwardMin + margin;
+            if (target >= backwardMin || target < forwardMin) target = (backwardMin + forwardMin) / 2;
+            setKmOnGeo(node, geo, target);
+            dbgTarget = target;
+          }
+          if (process.env.DEBUG_ORDERING) {
+            const dt = process.env.DEBUG_ORDERING.split(',').map(Number);
+            if (haversineM(node, { lat: dt[0], lon: dt[1] }) < 500) {
+              console.error(
+                `[order] ${node.name}: was=${currentKm.toFixed(4)} -> ${dbgTarget.toFixed(4)} | ` +
+                `backward=[${backwardKms.map(k=>k.toFixed(4))}] forward=[${forwardKms.map(k=>k.toFixed(4))}] increasing=${increasing}`
+              );
+            }
           }
           anyFixed = true;
         } else if (backwardKms.length >= 2 || forwardKms.length >= 2) {
@@ -1611,6 +1702,21 @@ async function generateInfrastructureForSections(confirmedSections, networkName,
       }
       candidates.sort((x, y) => x.distM - y.distM);
 
+      const debugTarget = process.env.DEBUG_PLATFORM_MATCH ? process.env.DEBUG_PLATFORM_MATCH.split(',').map(Number) : null;
+      const isDebugTarget = debugTarget && haversineM(point, { lat: debugTarget[0], lon: debugTarget[1] }) < 500;
+      if (isDebugTarget) {
+        console.error(`\n=== platform ${platform.id} "${platform.name}" @ (${point.lat},${point.lon}) - top 8 candidates ===`);
+        for (const c of candidates.slice(0, 8)) {
+          const reconM = c.poly[c.poly.length - 1].km * 1000;
+          const straightM = haversineM(c.a, c.b);
+          console.error(
+            `  ${c.a.name} <-> ${c.b.name} (via ${c.armOnA}): distM=${c.distM.toFixed(1)} ` +
+            `reconLenM=${reconM.toFixed(1)} straightM=${straightM.toFixed(1)} ratio=${(reconM/straightM).toFixed(1)} ` +
+            `a.region=${c.a.region} b.region=${c.b.region} a.km=${c.a.km} b.km=${c.b.km}`
+          );
+        }
+      }
+
       // Sanity check: a link's reconstructed length should be roughly in
       // line with the straight-line distance between its own two endpoints.
       // When it isn't - confirmed case: two endpoints 48m apart from EACH
@@ -1697,6 +1803,14 @@ async function generateInfrastructureForSections(confirmedSections, networkName,
         }
       }
 
+      if (isDebugTarget) {
+        const rp = geometryBySection.get(region);
+        console.error(
+          `  CHOSEN: ${a.name} <-> ${b.name} (armOnA=${armOnA}) | region=${region} ` +
+          `regionPointsFound=${!!rp} regionPointsLen=${rp ? rp.length : 0} | assigned km=${km}`
+        );
+      }
+
       // Unique name
       let platName = platform.name;
       let pIdx = 0;
@@ -1718,6 +1832,13 @@ async function generateInfrastructureForSections(confirmedSections, networkName,
       };
       nodes.push(platformNode);
       nodesByName.set(platName, platformNode);
+
+      if (process.env.DEBUG_STAGE) {
+        const dt = process.env.DEBUG_STAGE.split(',').map(Number);
+        if (haversineM(platformNode, { lat: dt[0], lon: dt[1] }) < 500) {
+          console.error(`[insert] created ${platName}: km=${km} region=${region} fNode=${a.name} tNode=${b.name}`);
+        }
+      }
 
       a[armOnA] = platName;
       a[branchToBranchField(fieldToBranch(armOnA))] = 'F';
@@ -1776,10 +1897,26 @@ async function generateInfrastructureForSections(confirmedSections, networkName,
   // each node's independently-projected km. See reprojectKmAlongTopology()
   // doc comment for why independent projection can produce a non-monotonic
   // ("dip") sequence between directly-linked nodes.
+  function debugSnapshot(label) {
+    if (!process.env.DEBUG_STAGE) return;
+    const dt = process.env.DEBUG_STAGE.split(',').map(Number);
+    for (const n of nodes) {
+      if (haversineM(n, { lat: dt[0], lon: dt[1] }) < 500) {
+        console.error(`[stage:${label}] ${n.name}: km=${n.km} region=${n.region} railwayType=${n.railwayType} lat=${n.lat} lon=${n.lon} fNode=${n.fNode} tNode=${n.tNode}`);
+      }
+    }
+    const nameCounts = new Map();
+    for (const n of nodes) nameCounts.set(n.name, (nameCounts.get(n.name) || 0) + 1);
+    const dupes = [...nameCounts.entries()].filter(([, c]) => c > 1);
+    if (dupes.length > 0) console.error(`[stage:${label}] DUPLICATE NAMES: ${JSON.stringify(dupes.slice(0, 10))}`);
+  }
+
   reprojectKmAlongTopology(nodes, geometryBySection);
+  debugSnapshot('after-reproject');
 
   // Enforce minimum km spacing on all shared geometries (primary + alt)
   ensureKmSeparation(nodes, geometryBySection);
+  debugSnapshot('after-sep1');
 
   // BFS reprojection above only cross-checks the ONE edge each node was
   // discovered through, not every edge it actually has - correct any that
@@ -1792,6 +1929,7 @@ async function generateInfrastructureForSections(confirmedSections, networkName,
     enforceKmOrdering(nodes);
     ensureKmSeparation(nodes, geometryBySection);
   }
+  debugSnapshot('after-order-loop');
 
   // ── Step 11b: Geometry reference pruning ──
   // Principle: each link must be unambiguously attributable to exactly one
@@ -1928,6 +2066,7 @@ async function generateInfrastructureForSections(confirmedSections, networkName,
     const prunedCount = nodes.filter(n => !n.region2 && !n.region3).length;
     warnings.push(`Geometry pruning: ${prunedCount} of ${nodes.length} nodes now single-geometry. ${ambiguousLinks} directed links remain ambiguous.`);
   }
+  debugSnapshot('after-pruning');
 
   updateProgress(85, 'Computing display positions');
   // ── Step 12: Clean up internal annotations ──
