@@ -432,7 +432,7 @@ function reprojectKmAlongTopology(nodes, geometryBySection) {
  * MIN_NODE_SPACING_M / 1000 km apart.  Iteratively pushes km values apart
  * from their midpoint when they are too close.
  */
-function ensureKmSeparation(nodes, geometryBySection) {
+function ensureKmSeparation(nodes, geometryBySection, justFixed) {
   const minKmSpacing = MIN_NODE_SPACING_M / 1000;
   const EPS = 1e-9;  // floating-point tolerance for km comparisons
   const nodeByName = new Map(nodes.map(n => [n.name, n]));
@@ -483,7 +483,30 @@ function ensureKmSeparation(nodes, geometryBySection) {
   // itself too close to — blindly extending one direction to all of them
   // was pushing some nodes to the wrong side of a node they're directly
   // linked to.
+  //
+  // Exception: when this call runs right after enforceKmOrdering (which
+  // hands its own touched (node, geo) pairs in as `justFixed`), a node it
+  // just placed has already had its side of this relationship decided by a
+  // hard topological rule (which arm is backward/forward, and for a
+  // diamond, which of its two independent tracks) - a real constraint, not
+  // a soft contextual guess. Overriding that here with the plain km-average
+  // heuristic can flip the very order enforceKmOrdering just established,
+  // which then looks wrong to it again next pass - confirmed on real data
+  // as sustained back-and-forth (and, worse, slow one-directional drift)
+  // between the two passes that never settled within the retry budget.
+  // When exactly one side of the pair was just fixed, keep its side of the
+  // relationship fixed and only let the OTHER (untouched) node move to
+  // make room - spacing still gets enforced, but never by re-litigating a
+  // relationship enforceKmOrdering just settled.
   function decideLoHi(a, b, geo) {
+    if (justFixed) {
+      const aFixed = justFixed.has(`${a.name}|${geo}`);
+      const bFixed = justFixed.has(`${b.name}|${geo}`);
+      if (aFixed !== bFixed) {
+        const kmA = getKmOnGeo(a, geo), kmB = getKmOnGeo(b, geo);
+        return kmA <= kmB ? [a, b] : [b, a];
+      }
+    }
     const avgOtherKm = (node, excludeName) => {
       let sum = 0, count = 0;
       for (const [af] of arms) {
@@ -609,6 +632,11 @@ function enforceKmOrdering(nodes) {
   // to still disagree afterwards is left alone rather than fought over
   // indefinitely.
   const neighbourNudgeAttempted = new Set();
+  // Every (node, geo) this call actually changes - handed back to the
+  // caller so ensureKmSeparation (run right after, every pass) can avoid
+  // immediately re-deciding the direction of a pair it just fixed. See
+  // ensureKmSeparation's decideLoHi doc comment for why that matters.
+  const touched = new Set();
 
   function getKmOnGeo(node, geo) {
     if (node.region === geo) return node.km;
@@ -617,6 +645,7 @@ function enforceKmOrdering(nodes) {
     return null;
   }
   function setKmOnGeo(node, geo, val) {
+    touched.add(`${node.name}|${geo}`);
     if (node.region === geo) node.km = val;
     else if (node.region2 === geo) node.km2 = val;
     else if (node.region3 === geo) node.km3 = val;
@@ -859,6 +888,8 @@ function enforceKmOrdering(nodes) {
     }
     if (!anyFixed) break;
   }
+
+  return touched;
 }
 
 /**
@@ -2115,8 +2146,8 @@ async function generateInfrastructureForSections(confirmedSections, networkName,
   // real network alongside enforceKmOrdering's own per-diamond-track passes
   // above) is where this plateaus - going higher found nothing further.
   for (let i = 0; i < 25; i++) {
-    enforceKmOrdering(nodes);
-    ensureKmSeparation(nodes, geometryBySection);
+    const justFixed = enforceKmOrdering(nodes);
+    ensureKmSeparation(nodes, geometryBySection, justFixed);
   }
   debugSnapshot('after-order-loop');
 
