@@ -1705,7 +1705,19 @@ function buildAlternativeCenterline(
         // so slice(0,-1) drops it.  This is opposite to the forward gap bridge.
         const ordered = bestGapForward ? [...gapPts].reverse() : gapPts;
         console.log(`[Alt Gap Bridge BWD] Jumped ${(bestGapDist * 111000).toFixed(1)}m to way ${bestGapWay}`);
+        const preChain = chain;
         chain = [...ordered.slice(0, -1), ...chain];
+        // The forward extension refuses to fold back on itself
+        // (isChainDoublingBack); the head extension never had that guard, so it
+        // could wander round a yard's ladder of tracks and prepend a lasso -
+        // a 1.9km U-turn at Le Piagge, whose two legs then fought over the km
+        // of every node linking them. Judge it as the mirror image: reverse
+        // the chain so the head becomes the end.
+        if (isChainDoublingBack([...chain].reverse())) {
+          console.log(`[Alt Chain] Stopped head extension: chain doubled back after gap bridge to way ${bestGapWay}`);
+          chain = preChain;
+          break;
+        }
         visited.add(bestGapWay);
         headKey = coordKey(chain[0]);
         headDist = minDistanceToLineMeters(chain[0], mainCenterlineCoords);
@@ -1732,7 +1744,13 @@ function buildAlternativeCenterline(
     const ordered = isForward ? pts : [...pts].reverse();
 
     // Prepend to chain (excluding the shared endpoint)
+    const preChain = chain;
     chain = [...ordered.slice(0, -1), ...chain];
+    if (isChainDoublingBack([...chain].reverse())) {
+      console.log(`[Alt Chain] Stopped head extension: chain doubled back after adding way ${nextWayId}`);
+      chain = preChain;
+      break;
+    }
     visited.add(nextWayId);
     headKey = coordKey(chain[0]);
 

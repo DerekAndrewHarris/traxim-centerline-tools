@@ -570,7 +570,11 @@ function resolveKmConstraints(nodes, geometryBySection) {
     let cons = [];
     for (const e of edges) {
       const sa = sense[e.ai] * flip[compOf[e.ai]], sb = sense[e.bi] * flip[compOf[e.bi]];
-      if (sa * e.ra !== -(sb * e.rb)) { stats.droppedEdges++; continue; } // parity-inconsistent
+      if (sa * e.ra !== -(sb * e.rb)) { // parity-inconsistent
+        stats.droppedEdges++;
+        if (debug) console.error(`[km-solve] dropped (branch parity) ${members[e.ai].name} <-> ${members[e.bi].name} on ${geo}`);
+        continue;
+      }
       const forwardIsHigher = e.ra * sa > 0; // is b higher than a?
       cons.push(forwardIsHigher ? { lo: e.ai, hi: e.bi } : { lo: e.bi, hi: e.ai });
     }
@@ -596,19 +600,25 @@ function resolveKmConstraints(nodes, geometryBySection) {
       };
       for (let v = 0; v < members.length; v++) if (index[v] === -1) strong(v);
       const before = cons.length;
+      if (debug) for (const c of cons) if (sccOf[c.lo] === sccOf[c.hi]) console.error(`[km-solve] dropped (cycle) ${members[c.lo].name} -> ${members[c.hi].name} on ${geo}`);
       cons = cons.filter(c => sccOf[c.lo] !== sccOf[c.hi]);
       stats.droppedEdges += before - cons.length;
     }
     if (cons.length === 0) continue;
 
-    // Keep nodes inside the geometry's own km range (unless already outside).
+    // Nodes must end up inside the geometry's own km range: generateInfrastructure
+    // clamps every km to [min, max] afterwards, so a node the solver left just
+    // outside (e.g. an alias on an alt route that starts a little way from the
+    // node) would be dragged onto the boundary AFTER spacing was solved, landing
+    // on top of its neighbour (two nodes at exactly 0.000). Make the range a
+    // hard bound here so spacing is solved with it, packing inwards from the end.
     const pts = geometryBySection ? geometryBySection.get(geo) : null;
     let gMin = -Infinity, gMax = Infinity;
     if (pts && pts.length > 0) { gMin = Math.min(...pts.map(p => p.km)); gMax = Math.max(...pts.map(p => p.km)); }
-    const blo = x0.map(v => Math.min(gMin, v)), bhi = x0.map(v => Math.max(gMax, v));
+    const blo = x0.map(() => gMin), bhi = x0.map(() => gMax);
 
     // Dykstra's alternating projections.
-    const x = x0.slice();
+    const x = x0.map(v => Math.min(gMax, Math.max(gMin, v)));
     const pl = new Array(cons.length).fill(0), ph = new Array(cons.length).fill(0), pb = new Array(members.length).fill(0);
     let sweeps = 0, worst = Infinity;
     for (; sweeps < MAX_SWEEPS; sweeps++) {
@@ -2602,6 +2612,16 @@ async function generateInfrastructureForSections(confirmedSections, networkName,
     }
     if (postCount > 0) warnings.push(`Post-alias pruning: removed ${postCount} additional geometry refs.`);
   }
+
+  // Step 16 gives a node its km on an alias region as the km of the NEAREST
+  // geometry point - with no regard to spacing or order, and always the very end
+  // of the alt when the node sits just beyond it. Two nodes both landing on that
+  // end point end up at exactly the same km (a pair at 0.000, 0m apart), and an
+  // alias can equally sit out of order against neighbours that hold a real
+  // projected km on the same region. Solve ordering and spacing again now that
+  // every region a node belongs to is final; where nothing is violated this
+  // changes nothing.
+  resolveKmConstraints(nodes, geometryBySection);
 
   updateProgress(93, 'Building CSV output');
 

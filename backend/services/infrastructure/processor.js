@@ -701,6 +701,24 @@ function enforceReciprocalLinks(nodes, warnings) {
       const reciprocalBranch = targetNode[targetArmBranchField];
 
       if (reciprocalName !== node.name || reciprocalBranch !== sourceBranch) {
+        // Two of THIS node's arms both claim the same arm of the target (e.g. F's
+        // T and D arms both "land on" G's T arm, when G only has one arm to
+        // give). The target already points back at us via a DIFFERENT arm of
+        // ours that does claim it, so that pair is the real link and this claim
+        // is the duplicate. Falling through to the overwrite below just flips
+        // the target's back-reference between the two claims in turn, leaving
+        // whichever one was processed first pointing at a branch that no longer
+        // refers to it - a link that isn't reciprocal.
+        if (reciprocalName === node.name && reciprocalBranch && reciprocalBranch !== sourceBranch &&
+            node[branchToNodeField(reciprocalBranch)] === targetName) {
+          warnings.push(
+            `Duplicate link: "${node.name}" ${sourceBranch}-arm and ${reciprocalBranch}-arm both claim "${targetName}" ${targetBranch}-arm; ` +
+            `it already points back at the ${reciprocalBranch}-arm. Clearing the duplicate ${sourceBranch}-arm.`
+          );
+          node[armField] = '';
+          node[branchField] = '';
+          continue;
+        }
         if (reciprocalName && reciprocalName !== node.name) {
           // Target arm is already occupied by a DIFFERENT node.
           // Check if that other node's corresponding arm points back correctly
