@@ -7,6 +7,7 @@
 
 // Configuration constants
 const COORD_PRECISION = 7; // Degrees (~1cm precision for OSM nodes)
+export const ALT_DIVERGENCE_THRESHOLD_M = 75; // Metres - an alt route must get at least this far from every accepted centerline
 const PARALLEL_THRESHOLD_M = 20; // Metres - parallel track detection threshold
 
 /**
@@ -873,7 +874,8 @@ export function splitWaysAtIntermediateJunctions(wayIds, wayGeometry, wayNodes, 
 }
 
 /**
- * Detect alternative routes that diverge >50m from the main centerline.
+ * Detect alternative routes that diverge more than ALT_DIVERGENCE_THRESHOLD_M (75m)
+ * from the main centerline and from every other accepted alternative.
  *
  * @param {string[]} allWayIds - ALL way IDs (incl. parallel dupes) for alternatives
  * @param {Map<string, {lat,lon}[]>} wayGeometry
@@ -882,7 +884,20 @@ export function splitWaysAtIntermediateJunctions(wayIds, wayGeometry, wayNodes, 
  * @returns {Array<{wayIds: string[], coords: {lat,lon}[], divergencePoint: {lat,lon}, convergencePoint: {lat,lon}|null, lengthKm: number, maxDeviationM: number, reconverged: boolean}>}
  */
 export function detectAlternativeRoutes(allWayIds, wayGeometry, mainChainWayIds, mainCenterlineCoords) {
-  const DIVERGENCE_THRESHOLD_M = 50;
+  // The passes below are order-sensitive (which candidate is tried first
+  // decides what counts as "already covered" for the ones after it), and
+  // way order is whatever Overpass returned - different from run to run.
+  // Identical input was therefore giving different alternative-route sets,
+  // which is why triangles/branches appeared "erratically". Fix the order.
+  allWayIds = [...allWayIds].sort((a, b) => (Number(a) - Number(b)) || (String(a) < String(b) ? -1 : String(a) > String(b) ? 1 : 0));
+
+  // One threshold for "is this really a separate route": a route (or connector,
+  // or spur) must get at least this far from every centerline already accepted.
+  // Large yards can legitimately be ~50m wide, so anything under 75m is track
+  // width / yard layout, not an alternative route. (This used to be 50m here
+  // with 75m applied only to two of the later checks, which let routes reaching
+  // just 54-63m through.)
+  const DIVERGENCE_THRESHOLD_M = ALT_DIVERGENCE_THRESHOLD_M;
   const CONVERGENCE_THRESHOLD_M = 8;
   const MAX_CORRIDOR_DEVIATION_M = 5000;
   const MIN_ALTERNATIVE_LENGTH_M = 1000;
@@ -919,7 +934,7 @@ export function detectAlternativeRoutes(allWayIds, wayGeometry, mainChainWayIds,
 
   if (divergingWayIds.length === 0) return [];
 
-  console.log(`[Alt Routes] ${excludedWayIds.length} excluded ways, ${divergingWayIds.length} diverging (>50m from main)`);
+  console.log(`[Alt Routes] ${excludedWayIds.length} excluded ways, ${divergingWayIds.length} diverging (>${DIVERGENCE_THRESHOLD_M}m from main)`);
 
   // Build connectivity graph for excluded ways
   const excludedEndpointIndex = buildEndpointIndex(excludedWayIds, wayGeometry);
@@ -934,18 +949,27 @@ export function detectAlternativeRoutes(allWayIds, wayGeometry, mainChainWayIds,
 
     console.log(`[Alt Routes P${passLabel}] Processing candidate: way ${start.wayId}, forward=${start.isForward}`);
 
-    // Check this start diverges from ALL existing alternatives too
+    // Skip a start way that just duplicates an existing alternative, i.e. the
+    // WHOLE way lies within the divergence band of one. Every sampled point
+    // must be that close: a way that merely touches an existing alt at one end
+    // (a junction, or a connector leaving another route) is exactly what we
+    // want to evaluate, and testing "any sampled point is close" (as this once
+    // did) discarded those - and, by marking the way processed, discarded the
+    // candidate for its other direction too, so whether a connector/triangle
+    // was found depended on which end happened to be tried first.
     const startPts = wayGeometry.get(start.wayId);
     if (startPts && startPts.length >= 2 && alternatives.length > 0) {
       const step = Math.max(1, Math.floor(startPts.length / 3));
-      let minDistToAnyAlt = Infinity;
+      let farthestFromAlts = 0;
       for (let i = 0; i < startPts.length; i += step) {
+        let nearestAlt = Infinity;
         for (const alt of alternatives) {
           const dist = minDistanceToLineMeters(startPts[i], alt.coords);
-          if (dist < minDistToAnyAlt) minDistToAnyAlt = dist;
+          if (dist < nearestAlt) nearestAlt = dist;
         }
+        if (nearestAlt > farthestFromAlts) farthestFromAlts = nearestAlt;
       }
-      if (minDistToAnyAlt < DIVERGENCE_THRESHOLD_M) {
+      if (farthestFromAlts < DIVERGENCE_THRESHOLD_M) {
         processed.add(start.wayId);
         return;
       }
@@ -965,7 +989,7 @@ export function detectAlternativeRoutes(allWayIds, wayGeometry, mainChainWayIds,
     const routeLengthM = calculateRouteLengthMeters(chain);
     if (routeLengthM < MIN_ALTERNATIVE_LENGTH_M) { console.log(`[Alt Routes P${passLabel}]   → too short: ${(routeLengthM/1000).toFixed(2)}km < 1km`); return; }
     if (maxDeviation > MAX_CORRIDOR_DEVIATION_M) { console.log(`[Alt Routes P${passLabel}]   → max deviation ${maxDeviation.toFixed(0)}m > 5km`); return; }
-    if (maxDeviation < DIVERGENCE_THRESHOLD_M) { console.log(`[Alt Routes P${passLabel}]   → never diverges from main (maxDev=${maxDeviation.toFixed(0)}m < 50m)`); return; }
+    if (maxDeviation < DIVERGENCE_THRESHOLD_M) { console.log(`[Alt Routes P${passLabel}]   → never diverges from main (maxDev=${maxDeviation.toFixed(0)}m < ${DIVERGENCE_THRESHOLD_M}m)`); return; }
 
     const waySignature = [...visited].sort().join(',');
     if (seenWaySets.includes(waySignature)) return;
@@ -982,7 +1006,7 @@ export function detectAlternativeRoutes(allWayIds, wayGeometry, mainChainWayIds,
         }
         const avgDistToAlt = totalDistToAlt / cnt;
         if (avgDistToAlt < DIVERGENCE_THRESHOLD_M) {
-          console.log(`[Alt Routes P${passLabel}]   → redundant with existing alt (avgDistToAlt=${avgDistToAlt.toFixed(0)}m < 50m)`);
+          console.log(`[Alt Routes P${passLabel}]   → redundant with existing alt (avgDistToAlt=${avgDistToAlt.toFixed(0)}m < ${DIVERGENCE_THRESHOLD_M}m)`);
           return;
         }
       }
@@ -997,7 +1021,7 @@ export function detectAlternativeRoutes(allWayIds, wayGeometry, mainChainWayIds,
     }
     const avgSep = totalSep / sepCount;
 
-    if (reconverged && avgSep < 75) { console.log(`[Alt Routes P${passLabel}]   → reconverged parallel (avgSep=${avgSep.toFixed(0)}m)`); return; }
+    if (reconverged && avgSep < DIVERGENCE_THRESHOLD_M) { console.log(`[Alt Routes P${passLabel}]   → reconverged parallel (avgSep=${avgSep.toFixed(0)}m)`); return; }
     if (routeLengthM < 2000 && visited.size < 5 && !reconverged) { console.log(`[Alt Routes P${passLabel}]   → short non-reconverging (${(routeLengthM/1000).toFixed(2)}km, ${visited.size} ways)`); return; }
 
     // NOTE: previously rejected candidates whose centroid fell outside the
@@ -1047,14 +1071,14 @@ export function detectAlternativeRoutes(allWayIds, wayGeometry, mainChainWayIds,
   }
   console.log(`[Alt Routes] Pass 1 found ${alternatives.length} alternative routes`);
 
-  // ── PASS 2: Orphan diverging ways (>50m from ALL centerlines) ──
+  // ── PASS 2: Orphan diverging ways (>threshold from ALL centerlines) ──
   // After pass 1, find ways still far from main + all pass-1 alt centerlines.
   // These are tunnels/bypasses that don't have a terminus — they connect to the
   // main line at both ends. Start traversal from their junction with the main chain.
   const allCenterlines = [mainCenterlineCoords, ...alternatives.map(a => a.coords)];
 
   // Find orphan ways: excluded ways not yet processed where ANY sampled point is
-  // >50m from all centerlines. A tunnel connecting to the main line at both ends
+  // >threshold from all centerlines. A tunnel connecting to the main line at both ends
   // will have endpoints near the centerline but its middle section far away —
   // any point being far is enough to warrant investigation.
   const orphanWayIds = excludedWayIds.filter(wid => {
@@ -1076,7 +1100,7 @@ export function detectAlternativeRoutes(allWayIds, wayGeometry, mainChainWayIds,
   });
 
   if (orphanWayIds.length > 0) {
-    console.log(`[Alt Routes] Pass 2: ${orphanWayIds.length} orphan ways (>50m from all centerlines)`);
+    console.log(`[Alt Routes] Pass 2: ${orphanWayIds.length} orphan ways (>${DIVERGENCE_THRESHOLD_M}m from all centerlines)`);
 
     // For each orphan way, try starting traversal from both ends.
     // buildAlternativeCenterline will chain through connected excluded ways
@@ -1113,7 +1137,7 @@ export function detectAlternativeRoutes(allWayIds, wayGeometry, mainChainWayIds,
   {
     const MIN_SPUR_LENGTH_M = 150;
     const SPUR_JUNCTION_TOUCH_M = 25; // is the spur's start actually attached to known track?
-    const SPUR_DIVERGENCE_M = 75;     // must diverge by this much to count as a real spur, not just track width (large yards can legitimately be ~50m wide)
+    const SPUR_DIVERGENCE_M = DIVERGENCE_THRESHOLD_M;
     const pass2Count = alternatives.length;
 
     for (const [key, wids] of excludedEndpointIndex) {
@@ -1218,6 +1242,133 @@ export function detectAlternativeRoutes(allWayIds, wayGeometry, mainChainWayIds,
 
     if (alternatives.length > pass2Count) {
       console.log(`[Alt Routes] Pass 3 found ${alternatives.length - pass2Count} dead-end spurs`);
+    }
+  }
+
+  // ── PASS 4: Connectors and leftover branches ──
+  // A connector is a route that leaves one known track and rejoins another -
+  // e.g. the chord of a triangular junction. None of the earlier passes can
+  // find it: pass 1 needs a dead end, pass 2 chains until it reaches the MAIN
+  // line only (a connector between the main line and an alt route walks
+  // straight onto that alt's own ways and wanders off), and both discard
+  // anything under 1km. Whether a triangle got generated used to depend on
+  // luck - which end of it a pass happened to try first, and how the sampled
+  // points fell against nearby alts.
+  //
+  // Here: take an excluded way that gets clear of EVERY known centerline
+  // (main and all accepted alts), and grow it in both directions until each
+  // end either touches a known centerline or runs out (a dead end). At least
+  // one end must touch, so it's attached to the network. A route touching at
+  // both ends is a connector and must depart by the divergence threshold
+  // somewhere; one ending in a dead end is a branch and, like pass 3's spurs,
+  // must stay that far away on average. Either way yard crossovers (short,
+  // hugging existing track) aren't picked up. This also sweeps up track that
+  // pass 1/2 candidates covered only partially: those passes reject a chain
+  // wholesale as redundant if it shares ways with an accepted alt, so which of
+  // two overlapping routes survived - and whether the unshared stretch was
+  // left with no geometry at all - depended on the order tried.
+  {
+    const MIN_CONNECTOR_LENGTH_M = 150;
+    const MAX_CONNECTOR_LENGTH_M = 5000;
+    const CONNECTOR_TOUCH_M = 25;
+    const pass3Count = alternatives.length;
+    const acceptedWayIds = new Set(alternatives.flatMap(a => a.wayIds.map(String)));
+    const nearestCentrelineM = (pt) => {
+      let best = minDistanceToLineMeters(pt, mainCenterlineCoords);
+      for (const alt of alternatives) {
+        const d = minDistanceToLineMeters(pt, alt.coords);
+        if (d < best) best = d;
+      }
+      return best;
+    };
+    const farthestFromCentrelinesM = (pts) => {
+      const step = Math.max(1, Math.floor(pts.length / 8));
+      let far = 0;
+      for (let i = 0; i < pts.length; i += step) far = Math.max(far, nearestCentrelineM(pts[i]));
+      return far;
+    };
+
+    for (const seedId of excludedWayIds) {
+      if (acceptedWayIds.has(String(seedId))) continue;
+      const seedPts = wayGeometry.get(seedId);
+      if (!seedPts || seedPts.length < 2) continue;
+      if (farthestFromCentrelinesM(seedPts) <= DIVERGENCE_THRESHOLD_M) continue;
+
+      let chain = [...seedPts];
+      const used = new Set([String(seedId)]);
+      const usedIds = [seedId];
+      const blocked = (wid) => used.has(String(wid)) || acceptedWayIds.has(String(wid));
+
+      // Grow one end until it touches a known centreline ('touch'), runs out
+      // of ways ('dead'), or goes wrong ('fail').
+      const grow = (atTail) => {
+        for (let step = 0; step < 80; step++) {
+          const endPt = atTail ? chain[chain.length - 1] : chain[0];
+          if (nearestCentrelineM(endPt) <= CONNECTOR_TOUCH_M) return 'touch';
+          const key = coordKey(endPt);
+          const cands = [...(excludedEndpointIndex.get(key) ?? [])].filter(w => !blocked(w));
+          if (cands.length === 0) return 'dead';
+          let nextId;
+          if (cands.length === 1) {
+            nextId = cands[0];
+          } else {
+            const refIdx = atTail ? Math.max(0, chain.length - 5) : Math.min(5, chain.length - 1);
+            const dir = atTail
+              ? { dlat: endPt.lat - chain[refIdx].lat, dlon: endPt.lon - chain[refIdx].lon }
+              : { dlat: endPt.lat - chain[refIdx].lat, dlon: endPt.lon - chain[refIdx].lon };
+            nextId = chooseThroughWay(cands, key, dir, wayGeometry, true);
+            if (nextId === null) return 'dead';
+          }
+          const npts = wayGeometry.get(nextId);
+          if (!npts || npts.length < 2) return 'fail';
+          if (atTail) {
+            const fwd = coordKey(npts[0]) === key;
+            chain.push(...(fwd ? npts : [...npts].reverse()).slice(1));
+          } else {
+            const fwd = coordKey(npts[npts.length - 1]) === key;
+            chain = [...(fwd ? npts : [...npts].reverse()).slice(0, -1), ...chain];
+          }
+          used.add(String(nextId));
+          usedIds.push(nextId);
+          if (calculateRouteLengthMeters(chain) > MAX_CONNECTOR_LENGTH_M) return 'fail';
+        }
+        return 'fail';
+      };
+
+      const tailEnd = grow(true);
+      if (tailEnd === 'fail') continue;
+      const headEnd = grow(false);
+      if (headEnd === 'fail') continue;
+      if (tailEnd === 'dead' && headEnd === 'dead') continue; // floating fragment, not attached
+      const isConnector = tailEnd === 'touch' && headEnd === 'touch';
+
+      const lengthM = calculateRouteLengthMeters(chain);
+      if (lengthM < MIN_CONNECTOR_LENGTH_M) continue;
+      if (isConnector) {
+        if (farthestFromCentrelinesM(chain) <= DIVERGENCE_THRESHOLD_M) continue;
+      } else {
+        const sampleStep = Math.max(1, Math.floor(chain.length / 8));
+        let sepSum = 0, sepN = 0;
+        for (let i = 0; i < chain.length; i += sampleStep) { sepSum += nearestCentrelineM(chain[i]); sepN++; }
+        if (sepSum / sepN < DIVERGENCE_THRESHOLD_M) continue;
+      }
+
+      const maxDeviation = Math.max(...chain.map(p => minDistanceToLineMeters(p, mainCenterlineCoords)));
+      usedIds.forEach(wid => { processed.add(wid); acceptedWayIds.add(String(wid)); });
+      alternatives.push({
+        wayIds: usedIds,
+        coords: chain,
+        divergencePoint: chain[0],
+        convergencePoint: isConnector ? chain[chain.length - 1] : null,
+        lengthKm: lengthM / 1000,
+        maxDeviationM: maxDeviation,
+        reconverged: isConnector
+      });
+      console.log(`[Alt Routes P4] ✓ ${isConnector ? 'CONNECTOR' : 'BRANCH'}: ${(lengthM / 1000).toFixed(2)}km, ${usedIds.length} ways, from ${chain[0].lat.toFixed(5)},${chain[0].lon.toFixed(5)} to ${chain[chain.length - 1].lat.toFixed(5)},${chain[chain.length - 1].lon.toFixed(5)}`);
+    }
+
+    if (alternatives.length > pass3Count) {
+      console.log(`[Alt Routes] Pass 4 found ${alternatives.length - pass3Count} connector(s)/branch(es)`);
     }
   }
 
@@ -1528,9 +1679,15 @@ function buildAlternativeCenterline(
 
   // ── Convergence trimming: remove tails that run close to main ──
   // If the alt converges to run parallel with main, trim the parallel section
-  // but keep the very last point as the convergence endpoint.
+  // and end the alt at the FIRST point that comes within range of main.
   // Scan the entire chain to find the divergent core (last/first points above
   // threshold), tolerating scattered near-boundary points.
+  //
+  // The end point must be the next point along the alt's own track, NOT the
+  // chain's original far end. Keeping the far end (as this once did) drew a
+  // straight chord across the whole trimmed stretch - 1.6km in one confirmed
+  // case, leaving the tunnel portal at Vezzano and cutting straight across
+  // country to the junction instead of following the corridor.
   const CONVERGENCE_TRIM_M = 25;
   if (chain.length >= 6) {
     // Compute distance to main for every point
@@ -1548,19 +1705,17 @@ function buildAlternativeCenterline(
       if (dists[i] >= CONVERGENCE_TRIM_M) { firstDivergent = i; break; }
     }
 
-    // Trim tail: keep up to lastDivergent, plus original last point as connection
+    // Trim tail: keep up to lastDivergent, plus the next point along the track
     if (lastDivergent < chain.length - 3) {
-      const trimmed = chain.length - 1 - lastDivergent - 1;
-      const lastPt = chain[chain.length - 1];
-      chain = [...chain.slice(0, lastDivergent + 1), lastPt];
+      const trimmed = chain.length - 1 - (lastDivergent + 1);
+      chain = chain.slice(0, lastDivergent + 2);
       dists.length = lastDivergent + 2; // keep dists array in sync
       console.log(`[Alt Chain] Convergence-trimmed ${trimmed} tail points within ${CONVERGENCE_TRIM_M}m of main`);
     }
 
-    // Trim head: keep from firstDivergent onward, plus original first point as connection
+    // Trim head: keep from firstDivergent onward, plus the point just before it
     if (firstDivergent > 2) {
-      const firstPt = chain[0];
-      chain = [firstPt, ...chain.slice(firstDivergent)];
+      chain = chain.slice(firstDivergent - 1);
       console.log(`[Alt Chain] Convergence-trimmed ${firstDivergent - 1} head points within ${CONVERGENCE_TRIM_M}m of main`);
     }
   }

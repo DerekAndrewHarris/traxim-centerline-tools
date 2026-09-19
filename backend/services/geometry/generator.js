@@ -11,7 +11,7 @@
  *   3. Detect parallel ways (same endpoints + close proximity)
  *   4. Deduplicate: keep one representative per parallel group
  *   5. Chain ways via graph traversal (F→T heuristic from terminus)
- *   5b. Detect alternative routes (>50m divergence from main centerline)
+ *   5b. Detect alternative routes (>75m divergence from main centerline)
  *   6. Spline-smooth + resample at target spacing (Cardinal → Bezier → resample)
  *   7. Elevation fetch + interpolation
  *   8. Compute chainage via Vincenty, write CSV
@@ -267,7 +267,7 @@ export async function generateGeometryForSegment(segmentLabel, segmentBbox, outp
 
     if (alternativeRoutes.length > 0) {
       warnings.push(
-        `Detected ${alternativeRoutes.length} alternative route(s) diverging >50m from main centerline.`
+        `Detected ${alternativeRoutes.length} alternative route(s) diverging >75m from main centerline.`
       );
     }
     console.log(`[Geometry Generator] Detected ${alternativeRoutes.length} alternative routes`);
