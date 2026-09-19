@@ -874,6 +874,110 @@ export function splitWaysAtIntermediateJunctions(wayIds, wayGeometry, wayNodes, 
 }
 
 /**
+ * Continue a traced chain a fixed distance further along the track it is
+ * already following, past the point where it met another centerline. Alt
+ * routes are traced until they come within convergence range of the main line
+ * or another alt, then carried on a little further so the two geometries
+ * overlap slightly - giving node placement some slack where they interface,
+ * rather than one geometry ending exactly where the other begins.
+ *
+ * @param {{lat,lon}[]} chain
+ * @param {boolean} atTail - extend the end of the chain (true) or its start (false)
+ * @param {number} metres
+ * @param {Map<string, Set<string>>} endpointIndex
+ * @param {Map<string, {lat,lon}[]>} wayGeometry
+ * @param {(wayId: string) => boolean} isBlocked - ways that must not be used
+ * @returns {{chain: {lat,lon}[], usedWayIds: string[]}}
+ */
+function extendTrace(chain, atTail, metres, endpointIndex, wayGeometry, isBlocked) {
+  const usedWayIds = [];
+  let remaining = metres;
+  for (let guard = 0; guard < 20 && remaining > 0; guard++) {
+    const endPt = atTail ? chain[chain.length - 1] : chain[0];
+    const key = coordKey(endPt);
+    const cands = [...(endpointIndex.get(key) ?? [])].filter(w => !isBlocked(w));
+    if (cands.length === 0) break;
+    let nextId;
+    if (cands.length === 1) {
+      nextId = cands[0];
+    } else {
+      const refIdx = atTail ? Math.max(0, chain.length - 5) : Math.min(5, chain.length - 1);
+      const dir = { dlat: endPt.lat - chain[refIdx].lat, dlon: endPt.lon - chain[refIdx].lon };
+      nextId = chooseThroughWay(cands, key, dir, wayGeometry, true);
+      if (nextId === null) break;
+    }
+    const pts = wayGeometry.get(nextId);
+    if (!pts || pts.length < 2) break;
+    const oriented = coordKey(pts[0]) === key ? pts : [...pts].reverse();
+    const taken = [];
+    let prev = oriented[0];
+    for (let i = 1; i < oriented.length && remaining > 0; i++) {
+      const seg = haversineMeters(prev.lat, prev.lon, oriented[i].lat, oriented[i].lon);
+      if (seg <= remaining) {
+        taken.push(oriented[i]);
+        remaining -= seg;
+        prev = oriented[i];
+      } else {
+        const t = remaining / seg;
+        taken.push({ lat: prev.lat + t * (oriented[i].lat - prev.lat), lon: prev.lon + t * (oriented[i].lon - prev.lon) });
+        remaining = 0;
+      }
+    }
+    if (taken.length === 0) break;
+    chain = atTail ? [...chain, ...taken] : [...taken.reverse(), ...chain];
+    usedWayIds.push(nextId);
+  }
+  return { chain, usedWayIds };
+}
+
+/**
+ * Cut a traced chain back so it runs exactly overlapM past the first point
+ * that meets another track, at each end. The first/last way of a chain can
+ * itself run alongside that other track for hundreds of metres; without this
+ * the overlap would be that whole way, not a short shared stretch.
+ *
+ * @param {{lat,lon}[]} chain
+ * @param {(pt: {lat,lon}) => boolean} isNear - is this point in contact with another track?
+ * @param {number} overlapM
+ */
+function trimToContact(chain, isNear, overlapM) {
+  if (overlapM <= 0 || chain.length < 3) return chain;
+  const segM = (p, q) => haversineMeters(p.lat, p.lon, q.lat, q.lon);
+  const walkOut = (from, list) => {
+    // points of `list` (ordered outwards from `from`), up to overlapM of path
+    const out = [];
+    let budget = overlapM, prev = from;
+    for (const p of list) {
+      if (budget <= 0) break;
+      const seg = segM(prev, p);
+      if (seg <= budget) { out.push(p); budget -= seg; prev = p; }
+      else { const t = budget / seg; out.push({ lat: prev.lat + t * (p.lat - prev.lat), lon: prev.lon + t * (p.lon - prev.lon) }); budget = 0; }
+    }
+    return out;
+  };
+
+  // Tail: first point of the final run of "near" points, then overlapM beyond.
+  let near = chain.map(isNear);
+  let lastFar = -1;
+  for (let i = chain.length - 1; i >= 0; i--) { if (!near[i]) { lastFar = i; break; } }
+  if (lastFar >= 0 && lastFar < chain.length - 2) {
+    const contact = chain[lastFar + 1];
+    chain = [...chain.slice(0, lastFar + 2), ...walkOut(contact, chain.slice(lastFar + 2))];
+  }
+
+  // Head: mirror image.
+  near = chain.map(isNear);
+  let firstFar = -1;
+  for (let i = 0; i < chain.length; i++) { if (!near[i]) { firstFar = i; break; } }
+  if (firstFar > 1) {
+    const contact = chain[firstFar - 1];
+    const outwards = chain.slice(0, firstFar - 1).reverse();
+    chain = [...walkOut(contact, outwards).reverse(), ...chain.slice(firstFar - 1)];
+  }
+  return chain;
+}
+
+/**
  * Detect alternative routes that diverge more than ALT_DIVERGENCE_THRESHOLD_M (75m)
  * from the main centerline and from every other accepted alternative.
  *
@@ -898,7 +1002,8 @@ export function detectAlternativeRoutes(allWayIds, wayGeometry, mainChainWayIds,
   // with 75m applied only to two of the later checks, which let routes reaching
   // just 54-63m through.)
   const DIVERGENCE_THRESHOLD_M = ALT_DIVERGENCE_THRESHOLD_M;
-  const CONVERGENCE_THRESHOLD_M = 8;
+  const CONVERGENCE_THRESHOLD_M = 8;   // within this of the main line = it has met that track
+  const CONVERGENCE_OVERLAP_M = 30;    // ...then keep tracing this much further (see extendTrace)
   const MAX_CORRIDOR_DEVIATION_M = 5000;
   const MIN_ALTERNATIVE_LENGTH_M = 1000;
 
@@ -978,7 +1083,7 @@ export function detectAlternativeRoutes(allWayIds, wayGeometry, mainChainWayIds,
     const result = buildAlternativeCenterline(
       start.wayId, start.isForward, excludedEndpointIndex, wayGeometry,
       mainCenterlineCoords, MAX_CORRIDOR_DEVIATION_M, CONVERGENCE_THRESHOLD_M,
-      excludedWayIds.length
+      excludedWayIds.length, CONVERGENCE_OVERLAP_M
     );
 
     if (!result) { console.log(`[Alt Routes P${passLabel}]   → buildAlternativeCenterline returned null`); return; }
@@ -1270,7 +1375,7 @@ export function detectAlternativeRoutes(allWayIds, wayGeometry, mainChainWayIds,
   {
     const MIN_CONNECTOR_LENGTH_M = 150;
     const MAX_CONNECTOR_LENGTH_M = 5000;
-    const CONNECTOR_TOUCH_M = 25;
+    const CONNECTOR_TOUCH_M = CONVERGENCE_THRESHOLD_M;
     const pass3Count = alternatives.length;
     const acceptedWayIds = new Set(alternatives.flatMap(a => a.wayIds.map(String)));
     const nearestCentrelineM = (pt) => {
@@ -1342,6 +1447,16 @@ export function detectAlternativeRoutes(allWayIds, wayGeometry, mainChainWayIds,
       if (tailEnd === 'dead' && headEnd === 'dead') continue; // floating fragment, not attached
       const isConnector = tailEnd === 'touch' && headEnd === 'touch';
 
+      // Where it meets a known track, carry on overlapM past first contact so
+      // the two geometries share a short stretch (same rule as passes 1-2).
+      for (const [atTail, endKind] of [[true, tailEnd], [false, headEnd]]) {
+        if (endKind !== 'touch') continue;
+        const ext = extendTrace(chain, atTail, CONVERGENCE_OVERLAP_M, excludedEndpointIndex, wayGeometry, blocked);
+        chain = ext.chain;
+        ext.usedWayIds.forEach(w => { used.add(String(w)); usedIds.push(w); });
+      }
+      chain = trimToContact(chain, p => nearestCentrelineM(p) < CONNECTOR_TOUCH_M, CONVERGENCE_OVERLAP_M);
+
       const lengthM = calculateRouteLengthMeters(chain);
       if (lengthM < MIN_CONNECTOR_LENGTH_M) continue;
       if (isConnector) {
@@ -1411,7 +1526,8 @@ export function detectAlternativeRoutes(allWayIds, wayGeometry, mainChainWayIds,
  */
 function buildAlternativeCenterline(
   startWayId, startForward, endpointIndex, wayGeometry,
-  mainCenterlineCoords, maxAllowedDeviation, convergenceThreshold, totalWays
+  mainCenterlineCoords, maxAllowedDeviation, convergenceThreshold, totalWays,
+  overlapM = 0
 ) {
   const startPts = wayGeometry.get(startWayId);
   if (!startPts || startPts.length < 2) return null;
@@ -1531,7 +1647,15 @@ function buildAlternativeCenterline(
     incomingDir = directionFromChainTail(chain);
   }
 
-  // Forward traversal complete. Now extend backward from the head of the chain
+  // Forward traversal complete. If it met another track, carry on a little
+  // further so the geometries overlap (see extendTrace).
+  if (reconverged && overlapM > 0) {
+    const ext = extendTrace(chain, true, overlapM, endpointIndex, wayGeometry, wid => visited.has(wid));
+    chain = ext.chain;
+    ext.usedWayIds.forEach(w => visited.add(w));
+  }
+
+  // Now extend backward from the head of the chain
   // to close any gap at the start end toward the main line.
   let headKey = coordKey(chain[0]);
   let headDist = minDistanceToLineMeters(chain[0], mainCenterlineCoords);
@@ -1618,6 +1742,12 @@ function buildAlternativeCenterline(
     if (headDist > maxAllowedDeviation) break;
   }
 
+  if (headReconverged && overlapM > 0) {
+    const ext = extendTrace(chain, false, overlapM, endpointIndex, wayGeometry, wid => visited.has(wid));
+    chain = ext.chain;
+    ext.usedWayIds.forEach(w => visited.add(w));
+  }
+
   // If forward end reconverged and backward end also reconverged, mark as fully reconverged
   if (reconverged && headReconverged) {
     reconverged = true;
@@ -1677,48 +1807,20 @@ function buildAlternativeCenterline(
     }
   }
 
-  // ── Convergence trimming: remove tails that run close to main ──
-  // If the alt converges to run parallel with main, trim the parallel section
-  // and end the alt at the FIRST point that comes within range of main.
-  // Scan the entire chain to find the divergent core (last/first points above
-  // threshold), tolerating scattered near-boundary points.
+  // ── Overlap trimming ──
+  // A route is traced until it comes within convergenceThreshold of the main
+  // line, and then carried on a further overlapM (see
+  // extendTrace) so the two geometries share a short parallel stretch and
+  // node placement has some slack where they interface. The last (or first)
+  // way of the chain can itself be long and run alongside that other track
+  // for hundreds of metres, so cut it back to exactly overlapM past the first
+  // point that meets the other track.
   //
-  // The end point must be the next point along the alt's own track, NOT the
-  // chain's original far end. Keeping the far end (as this once did) drew a
-  // straight chord across the whole trimmed stretch - 1.6km in one confirmed
-  // case, leaving the tunnel portal at Vezzano and cutting straight across
-  // country to the junction instead of following the corridor.
-  const CONVERGENCE_TRIM_M = 25;
-  if (chain.length >= 6) {
-    // Compute distance to main for every point
-    const dists = chain.map(p => minDistanceToLineMeters(p, mainCenterlineCoords));
-
-    // Find the last point from the tail that's clearly divergent (>= threshold)
-    let lastDivergent = chain.length - 1;
-    for (let i = chain.length - 1; i >= 0; i--) {
-      if (dists[i] >= CONVERGENCE_TRIM_M) { lastDivergent = i; break; }
-    }
-
-    // Find the first point from the head that's clearly divergent
-    let firstDivergent = 0;
-    for (let i = 0; i < chain.length; i++) {
-      if (dists[i] >= CONVERGENCE_TRIM_M) { firstDivergent = i; break; }
-    }
-
-    // Trim tail: keep up to lastDivergent, plus the next point along the track
-    if (lastDivergent < chain.length - 3) {
-      const trimmed = chain.length - 1 - (lastDivergent + 1);
-      chain = chain.slice(0, lastDivergent + 2);
-      dists.length = lastDivergent + 2; // keep dists array in sync
-      console.log(`[Alt Chain] Convergence-trimmed ${trimmed} tail points within ${CONVERGENCE_TRIM_M}m of main`);
-    }
-
-    // Trim head: keep from firstDivergent onward, plus the point just before it
-    if (firstDivergent > 2) {
-      chain = chain.slice(firstDivergent - 1);
-      console.log(`[Alt Chain] Convergence-trimmed ${firstDivergent - 1} head points within ${CONVERGENCE_TRIM_M}m of main`);
-    }
-  }
+  // This replaces an earlier scheme that trimmed everything within 25m of
+  // main and then kept the chain's far end as the finish point, which both
+  // ended routes short of where they actually meet the other track and drew
+  // a straight chord across the stretch it removed.
+  chain = trimToContact(chain, p => minDistanceToLineMeters(p, mainCenterlineCoords) < convergenceThreshold, overlapM);
 
   return { chain, visited, maxDeviation, reconverged };
 }

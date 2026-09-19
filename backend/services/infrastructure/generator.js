@@ -1622,7 +1622,6 @@ async function generateInfrastructureForSections(confirmedSections, networkName,
 
   if (platforms.length > 0) {
     const ARM_FIELDS = ['fNode', 'tNode', 'dNode', 'xNode'];
-    const findArmTo = (node, targetName) => ARM_FIELDS.find(f => node[f] === targetName) ?? null;
 
     const nodesByName = new Map(nodes.map(n => [n.name, n]));
     // Every already-established junction/endpoint node from the original
@@ -1631,7 +1630,7 @@ async function generateInfrastructureForSections(confirmedSections, networkName,
     // stop here". Static for the whole platform pass: newly-created
     // platform nodes never get a _topoKey (they're mid-link insertions, not
     // topology vertices), which is deliberate - the fresh lookup below
-    // (findCurrentChain) is what accounts for platforms already spliced in
+    // (chainsBetween) is what accounts for platforms already spliced in
     // earlier in this same loop.
     const nodeByTopoKey = new Map(nodes.filter(n => n._topoKey).map(n => [n._topoKey, n]));
     const sectionNodeKeys = new Set(nodeByTopoKey.keys());
@@ -1645,7 +1644,14 @@ async function generateInfrastructureForSections(confirmedSections, networkName,
     // whichever already-inserted platform nodes sit in between - platforms
     // are the only node type safe to walk through blindly, since they're by
     // construction a simple pass-through insertion with exactly two arms.
-    function findCurrentChain(nodeA, nodeB) {
+    //
+    // A node pair can be joined by MORE than one link (a passing loop: A.T-B.T
+    // and A.D-B.D, or crossed, A.T-B.D and A.D-B.T). The first arm that
+    // happens to reach the target is not necessarily the track the platform
+    // is on, so every arm's chain is returned and the caller picks the right
+    // one - see chainForLink below.
+    function chainsBetween(nodeA, nodeB) {
+      const found = [];
       for (const startArm of ARM_FIELDS) {
         const startName = nodeA[startArm];
         if (!startName) continue;
@@ -1661,9 +1667,69 @@ async function generateInfrastructureForSections(confirmedSections, networkName,
           cameFrom = cur.name;
           cur = nextName ? nodesByName.get(nextName) : null;
         }
-        if (ok) return chain;
+        if (ok) found.push({ startNode: nodeA, startArm, chain });
+      }
+      return found;
+    }
+
+    // Walk the OSM way graph outward from a node along one of ITS connections
+    // (the way IDs that leave it), collecting every way passed on the way to the
+    // next established node. Same walk resolveWayBounds/followChainToNode do,
+    // but keeping the ways so we can tell which connection carries a given way.
+    function waysAlongConnection(startKey, firstWayId) {
+      const wayIds = new Set([firstWayId]);
+      const w0 = waysById.get(firstWayId);
+      if (!w0 || !w0.coords || w0.coords.length < 2) return null;
+      const firstKey = makeCoordKey(w0.coords[0].lat, w0.coords[0].lon);
+      const lastKey = makeCoordKey(w0.coords[w0.coords.length - 1].lat, w0.coords[w0.coords.length - 1].lon);
+      let curKey = firstKey === startKey ? lastKey : lastKey === startKey ? firstKey : null;
+      if (curKey === null) return null;
+      let curWay = firstWayId;
+      for (let n = 0; n < 1000; n++) {
+        if (sectionNodeKeys.has(curKey)) return { reachedKey: curKey, wayIds };
+        const next = (adj.get(curKey) || []).filter(c => c.wayId !== curWay);
+        if (next.length !== 1) return { reachedKey: curKey, wayIds };
+        curWay = next[0].wayId;
+        curKey = next[0].otherKey;
+        wayIds.add(curWay);
       }
       return null;
+    }
+
+    // Which of `node`'s arms is the physical link that carries `wayId` on
+    // towards `otherKey`? Uses the node's own OSM connections and the same
+    // branch classification that assigned the arms in the first place.
+    function armCarryingWay(node, otherKey, wayId) {
+      if (!node._topoKey) return null;
+      const conns = node._topoConns ?? adj.get(node._topoKey) ?? [];
+      for (const conn of conns) {
+        const along = waysAlongConnection(node._topoKey, conn.wayId);
+        if (!along || along.reachedKey !== otherKey || !along.wayIds.has(wayId)) continue;
+        const branch = determineBranch(node._topoKey, conns, conn.wayId, waysById, node.km, null);
+        return branch ? branchToNodeField(branch) : null;
+      }
+      return null;
+    }
+
+    // The chain of nodes (A ... B, through any platforms already spliced in)
+    // for the specific link `link` describes. Returns null if it can't be
+    // told apart from another link between the same two nodes.
+    function chainForLink(nodeA, nodeB, link) {
+      const fromA = chainsBetween(nodeA, nodeB);
+      const fromB = chainsBetween(nodeB, nodeA);
+      if (fromA.length === 1) return { ...fromA[0], ambiguous: false };
+      if (fromA.length === 0 && fromB.length === 1) return { ...fromB[0], ambiguous: false };
+      if (fromA.length === 0 && fromB.length === 0) return null;
+
+      // More than one link joins these nodes - decide by the way the platform
+      // actually sits on.
+      const armA = armCarryingWay(nodeA, link.bKey, link.wayId);
+      const hitA = armA && fromA.find(c => c.startArm === armA);
+      if (hitA) return { ...hitA, ambiguous: false };
+      const armB = armCarryingWay(nodeB, link.aKey, link.wayId);
+      const hitB = armB && fromB.find(c => c.startArm === armB);
+      if (hitB) return { ...hitB, ambiguous: false };
+      return { ambiguous: true };
     }
 
     // Deterministic order so repeated runs against the same data produce the
@@ -1737,12 +1803,18 @@ async function generateInfrastructureForSections(confirmedSections, networkName,
           continue;
         }
 
-        const chain = findCurrentChain(nodeA, nodeB) || findCurrentChain(nodeB, nodeA);
-        if (!chain) {
+        const picked = chainForLink(nodeA, nodeB, link);
+        if (!picked) {
           warnings.push(`Platform "${platform.name}" (${platform.id}): matched track "${nodeA.name}" / "${nodeB.name}" ` +
             `isn't currently linked — skipped (needs manual review).`);
           continue;
         }
+        if (picked.ambiguous) {
+          warnings.push(`Platform "${platform.name}" (${platform.id}): "${nodeA.name}" and "${nodeB.name}" are joined by more than one ` +
+            `link (a loop) and it couldn't be determined which track the platform is on — skipped (needs manual review).`);
+          continue;
+        }
+        const { chain, startNode, startArm } = picked;
 
         const chainCoords = chain.map(n => ({ lat: n.lat, lon: n.lon }));
         const { segIdx, projLat, projLon } = nearestPointOnWay(point, chainCoords);
@@ -1758,8 +1830,24 @@ async function generateInfrastructureForSections(confirmedSections, networkName,
           continue;
         }
 
-        const armOnA = findArmTo(a, b.name);
-        const armOnB = findArmTo(b, a.name);
+        // Arms on each side of THIS link. A plain "first arm pointing at the neighbour" lookup returns the first arm
+        // pointing at the neighbour, which is wrong when the two are joined by
+        // two links (a loop): it would splice into, and re-point the branch
+        // letters of, whichever link happens to come first - leaving the other
+        // link's letters stale (an arm claiming to connect to a branch that now
+        // holds the platform). The chain's own start arm identifies the first
+        // hop; the far end is then whatever branch that arm says it lands on.
+        const unique = (node, targetName) => {
+          const arms = ARM_FIELDS.filter(f => node[f] === targetName);
+          return arms.length === 1 ? arms[0] : null;
+        };
+        const armOnA = (a === startNode && segIdx === 0) ? startArm : unique(a, b.name);
+        let armOnB = null;
+        if (armOnA) {
+          const landsOn = a[branchToBranchField(fieldToBranch(armOnA))];
+          const viaLetter = landsOn ? branchToNodeField(landsOn) : null;
+          armOnB = (viaLetter && b[viaLetter] === a.name) ? viaLetter : unique(b, a.name);
+        }
         if (!armOnA || !armOnB) {
           warnings.push(`Platform "${platform.name}" (${platform.id}): matched link "${a.name}" / "${b.name}" isn't ` +
             `reciprocally linked — skipped (manual insertion needed).`);
