@@ -19,7 +19,6 @@ import path from 'path';
 import { overpassFetch } from '../osm/overpass.js';
 import { ipv4Fetch } from '../osm/ipv4fetch.js';
 import {
-  MIN_NODE_SPACING_M,
   SNAP_THRESHOLD_M,
   haversineM,
   sanitiseName,
@@ -364,8 +363,26 @@ function reprojectKmAlongTopology(nodes, geometryBySection) {
           // anti-dip guarantee for the ordinary case.
           const fwdPoints = points.slice(curIdx);
           const bwdPoints = points.slice(0, curIdx + 1);
-          const fwdProj = fwdPoints.length > 0 ? projectOntoGeometry({ lat: nb.lat, lon: nb.lon }, fwdPoints) : null;
-          const bwdProj = bwdPoints.length > 0 ? projectOntoGeometry({ lat: nb.lat, lon: nb.lon }, bwdPoints) : null;
+          // projectOntoGeometry deliberately extrapolates past the END of the
+          // array it's given (right for a real geometry end, where chainage
+          // continues). But curIdx is an artificial cut in the middle of the
+          // line, and extrapolating along the cut segment's direction can
+          // reach hundreds of metres to a point that merely lies on the
+          // straight continuation - making a node 700m further along look
+          // like it's 0.6m from the cut. Confirmed: a node 4m from the line
+          // at km 12.673 was assigned km 11.975 (the cut) because of this.
+          // Bound the result to the cut wherever the cut is artificial.
+          const boundedSlice = (proj, slicePoints, atStartCut, atEndCut) => {
+            if (!proj) return proj;
+            const first = slicePoints[0], lastPt = slicePoints[slicePoints.length - 1];
+            if (atStartCut && proj.km < first.km) return { km: first.km, projLat: first.lat, projLon: first.lon };
+            if (atEndCut && proj.km > lastPt.km) return { km: lastPt.km, projLat: lastPt.lat, projLon: lastPt.lon };
+            return proj;
+          };
+          const fwdProj = fwdPoints.length > 0
+            ? boundedSlice(projectOntoGeometry({ lat: nb.lat, lon: nb.lon }, fwdPoints), fwdPoints, curIdx > 0, false) : null;
+          const bwdProj = bwdPoints.length > 0
+            ? boundedSlice(projectOntoGeometry({ lat: nb.lat, lon: nb.lon }, bwdPoints), bwdPoints, false, curIdx < points.length - 1) : null;
           const fwdDist = fwdProj ? haversineM(nb, { lat: fwdProj.projLat, lon: fwdProj.projLon }) : Infinity;
           const bwdDist = bwdProj ? haversineM(nb, { lat: bwdProj.projLat, lon: bwdProj.projLon }) : Infinity;
           const bestSliceDist = Math.min(fwdDist, bwdDist);
@@ -428,468 +445,213 @@ function reprojectKmAlongTopology(nodes, geometryBySection) {
 }
 
 /**
- * Ensure connected node pairs sharing a region have km values at least
- * MIN_NODE_SPACING_M / 1000 km apart.  Iteratively pushes km values apart
- * from their midpoint when they are too close.
+ * Single mechanism for km ordering AND minimum spacing.
+ *
+ * Earlier, ordering and spacing were two separate passes that fought
+ * because each guessed direction locally and neither knew what the other
+ * had settled. But direction isn't a local guess: F is always the backward
+ * side of a node and T/D (or X for a diamond) the forward side, so the
+ * direction of every connection follows from branch letters alone. Walking
+ * the graph, each node's "sense" (whether forward means higher or lower km)
+ * is fixed relative to its neighbour by simple parity - e.g. joining A's T to
+ * B's F keeps the same sense; joining A's T to B's T reverses it. Only ONE
+ * free choice remains per connected component per geometry - the global
+ * sign - which is settled by whichever sign agrees with the actual km
+ * differences (weighted by size, so the real trend of a long line outvotes
+ * the handful of tiny local violations we're here to fix).
+ *
+ * That turns every connection into a hard constraint "x_hi - x_lo >= gap",
+ * with lo/hi decided by topology. The nearest-to-original km assignment
+ * satisfying all of them at once is found with Dykstra's alternating
+ * projections (each violated pair is pushed apart symmetrically; increments
+ * are remembered so the result is the true minimum-displacement solution,
+ * not just any feasible one). Because every cluster is solved simultaneously,
+ * a tightly-packed nest of turnouts spreads the correction across its members
+ * instead of squeezing whichever node happens to be checked last.
+ *
+ * Constraint cycles (only possible from inconsistent source data) can't be
+ * satisfied by any assignment - those connections are left untouched and
+ * reported rather than being allowed to destabilise their neighbours.
  */
-function ensureKmSeparation(nodes, geometryBySection, justFixed) {
-  const minKmSpacing = MIN_NODE_SPACING_M / 1000;
-  const EPS = 1e-9;  // floating-point tolerance for km comparisons
+function resolveKmConstraints(nodes, geometryBySection) {
+  // Traxim's real minimum is 25.1 m. Kilometrages are written to 3 decimal
+  // places (whole metres), so each of a pair can round by up to 0.5 m towards
+  // the other; the solver gap has to cover that loss too, or a gap solved as
+  // exactly 25.5 m can be written out as 25.0 m. 25.1 + 1.0 + 0.1 spare.
+  const TRAXIM_MIN_GAP_M = 25.1, OUTPUT_ROUNDING_M = 1.0, SPARE_M = 0.1;
+  const GAP_KM = (TRAXIM_MIN_GAP_M + OUTPUT_ROUNDING_M + SPARE_M) / 1000;
+  const MAX_SWEEPS = 20000;
+  const TOL_KM = 1e-7;
   const nodeByName = new Map(nodes.map(n => [n.name, n]));
-  const arms = [['fNode','fOnBranch'], ['tNode','tOnBranch'], ['dNode','dOnBranch'], ['xNode','xOnBranch']];
+  const ARMS = [['fNode', 'fOnBranch', 'F'], ['tNode', 'tOnBranch', 'T'], ['dNode', 'dOnBranch', 'D'], ['xNode', 'xOnBranch', 'X']];
+  const debug = process.env.DEBUG_KM;
 
-  // Helpers to read/write km for any geometry slot on a node
-  function getKmOnGeo(node, geo) {
-    if (node.region === geo) return node.km;
-    if (node.region2 === geo) return node.km2;
-    if (node.region3 === geo) return node.km3;
-    return null;
-  }
-  function setKmOnGeo(node, geo, val) {
+  const getKm = (node, geo) => (node.region === geo ? node.km : node.region2 === geo ? node.km2 : node.region3 === geo ? node.km3 : null);
+  const setKm = (node, geo, val) => {
     if (node.region === geo) node.km = val;
     else if (node.region2 === geo) node.km2 = val;
     else if (node.region3 === geo) node.km3 = val;
-  }
-  function getGeos(node) {
-    const geos = [node.region];
-    if (node.region2) geos.push(node.region2);
-    if (node.region3) geos.push(node.region3);
-    return geos;
-  }
-
-  // Geometry bounds cache
-  const geoBounds = new Map();
-  function getBounds(geo) {
-    if (geoBounds.has(geo)) return geoBounds.get(geo);
-    const pts = geometryBySection.get(geo);
-    const bounds = (pts && pts.length > 0)
-      ? { min: Math.min(...pts.map(p => p.km)), max: Math.max(...pts.map(p => p.km)) }
-      : { min: -Infinity, max: Infinity };
-    geoBounds.set(geo, bounds);
-    return bounds;
-  }
-
-  // Decide which of two same-geo nodes should sit at the lower km, using
-  // each one's OTHER same-geo neighbours (excluding each other) as context:
-  // whichever node's wider neighbourhood sits at a higher average km should
-  // itself become the higher one. This is the ONLY place that decides
-  // direction — both the initial pairwise pass and the cascading propagate
-  // step below call it fresh for every pair, rather than propagate
-  // inheriting a fixed direction from whatever pair originally triggered
-  // it. A node in a densely-interconnected cluster (e.g. three diamonds
-  // directly linked to each other) can have neighbours on both sides, so a
-  // direction that's correct for the pair that triggered a push is not
-  // necessarily correct for every OTHER neighbour that push then finds
-  // itself too close to — blindly extending one direction to all of them
-  // was pushing some nodes to the wrong side of a node they're directly
-  // linked to.
-  //
-  // Exception: when this call runs right after enforceKmOrdering (which
-  // hands its own touched (node, geo) pairs in as `justFixed`), a node it
-  // just placed has already had its side of this relationship decided by a
-  // hard topological rule (which arm is backward/forward, and for a
-  // diamond, which of its two independent tracks) - a real constraint, not
-  // a soft contextual guess. Overriding that here with the plain km-average
-  // heuristic can flip the very order enforceKmOrdering just established,
-  // which then looks wrong to it again next pass - confirmed on real data
-  // as sustained back-and-forth (and, worse, slow one-directional drift)
-  // between the two passes that never settled within the retry budget.
-  // When exactly one side of the pair was just fixed, keep its side of the
-  // relationship fixed and only let the OTHER (untouched) node move to
-  // make room - spacing still gets enforced, but never by re-litigating a
-  // relationship enforceKmOrdering just settled.
-  function decideLoHi(a, b, geo) {
-    if (justFixed) {
-      const aFixed = justFixed.has(`${a.name}|${geo}`);
-      const bFixed = justFixed.has(`${b.name}|${geo}`);
-      if (aFixed !== bFixed) {
-        const kmA = getKmOnGeo(a, geo), kmB = getKmOnGeo(b, geo);
-        return kmA <= kmB ? [a, b] : [b, a];
-      }
-    }
-    const avgOtherKm = (node, excludeName) => {
-      let sum = 0, count = 0;
-      for (const [af] of arms) {
-        const nm = node[af];
-        if (!nm || nm === excludeName) continue;
-        const nb = nodeByName.get(nm);
-        if (!nb) continue;
-        const k = getKmOnGeo(nb, geo);
-        if (k != null) { sum += k; count++; }
-      }
-      return count > 0 ? sum / count : null;
-    };
-    const avgA = avgOtherKm(a, b.name);
-    const avgB = avgOtherKm(b, a.name);
-    if (avgA != null && avgB != null && Math.abs(avgA - avgB) > EPS) {
-      return avgA > avgB ? [b, a] : [a, b];
-    }
-    const kmA = getKmOnGeo(a, geo), kmB = getKmOnGeo(b, geo);
-    return kmA <= kmB ? [a, b] : [b, a];
-  }
-
-  // Push two too-close nodes apart around their midpoint (clamped to
-  // geometry bounds), then recursively check whichever of THEIR other
-  // neighbours are now too close, re-deciding direction for each one.
-  function pushApart(nodeA, nodeB, geo, visited) {
-    const kmA = getKmOnGeo(nodeA, geo), kmB = getKmOnGeo(nodeB, geo);
-    const midKm = (kmA + kmB) / 2;
-    const { min: gMin, max: gMax } = getBounds(geo);
-
-    let kmLow = midKm - minKmSpacing / 2;
-    let kmHigh = midKm + minKmSpacing / 2;
-    if (kmLow < gMin) { kmLow = gMin; kmHigh = kmLow + minKmSpacing; }
-    if (kmHigh > gMax) { kmHigh = gMax; kmLow = kmHigh - minKmSpacing; }
-    kmLow = Math.floor(kmLow * 1000) / 1000;
-    kmHigh = Math.ceil(kmHigh * 1000) / 1000;
-
-    const [loNode, hiNode] = decideLoHi(nodeA, nodeB, geo);
-    setKmOnGeo(loNode, geo, kmLow);
-    setKmOnGeo(hiNode, geo, kmHigh);
-
-    for (const pushedNode of [loNode, hiNode]) {
-      const pushedKm = getKmOnGeo(pushedNode, geo);
-      for (const [armField] of arms) {
-        const otherName = pushedNode[armField];
-        if (!otherName) continue;
-        const other = nodeByName.get(otherName);
-        if (!other || other === loNode || other === hiNode || visited.has(other.name)) continue;
-        const otherKm = getKmOnGeo(other, geo);
-        if (otherKm == null) continue;
-        if (Math.abs(pushedKm - otherKm) >= minKmSpacing - EPS) continue;
-
-        visited.add(pushedNode.name);
-        pushApart(pushedNode, other, geo, visited);
-      }
-    }
-  }
-
-  // Outer loop: scan all connected pairs; when a violation is found, push
-  // the pair apart.
-  for (let iter = 0; iter < 10; iter++) {
-    let changed = false;
-    for (const node of nodes) {
-      for (const [armField] of arms) {
-        const targetName = node[armField];
-        if (!targetName) continue;
-        const target = nodeByName.get(targetName);
-        if (!target) continue;
-
-        const sharedGeos = getGeos(node).filter(g => getGeos(target).includes(g));
-        for (const geo of sharedGeos) {
-          const nKm = getKmOnGeo(node, geo);
-          const tKm = getKmOnGeo(target, geo);
-          if (nKm == null || tKm == null) continue;
-          if (Math.abs(nKm - tKm) >= minKmSpacing - EPS) continue;
-
-          pushApart(node, target, geo, new Set([node.name, target.name]));
-          changed = true;
-        }
-      }
-    }
-    if (!changed) break;
-  }
-}
-
-/**
- * Correct nodes whose km falls on the wrong side of neighbours it's directly
- * linked to. reprojectKmAlongTopology() assigns each node's km by walking a
- * BFS spanning tree - a node's value comes from whichever ONE edge first
- * reached it in the queue, and its OTHER edges (real connections that just
- * weren't the BFS parent) are never cross-checked. In a simple chain that's
- * fine, but in a densely-meshed junction cluster (several interlinked
- * diamonds/turnouts) a node can end up locally consistent along the path it
- * was discovered through while still disagreeing with a sibling connection -
- * exactly what the Network Editor's own validator flags (it checks a node's
- * km against ALL of its F/T/D/X neighbours, not just one).
- *
- * F is always the backward (lower- or higher-km, whichever this chain's
- * direction is - see below) side and T is always the opposite, forward
- * side. For a diamond, D is aligned with F's side and X is aligned with T's
- * side (see determineBranch()'s D/X assignment, which pairs D with F and X
- * with T by angular alignment) - so D joins the backward group and X joins
- * the forward group. For a turnout, D is itself the diverging branch
- * alongside T, both forward.
- *
- * Direction (whether "backward" means lower or higher km) isn't fixed
- * globally - it depends on which end of the region's geometry this part of
- * the topology walk started from - so it's inferred per node from the
- * neighbours' own relative values rather than assumed.
- */
-function enforceKmOrdering(nodes) {
-  const EPS = 1e-9;
-  const ARMS_ALL = ['fNode', 'tNode', 'dNode', 'xNode'];
-  const nodeByName = new Map(nodes.map(n => [n.name, n]));
-  // Nudging a neighbour (rather than the node currently being checked) can
-  // fight with that neighbour's OWN check of ITS OWN neighbours - moving it
-  // to satisfy this relationship can violate a different one, which then
-  // moves it back next pass, forever (confirmed on real data: several
-  // clusters never converged, unlike the plain same-node nudge above, which
-  // provably terminates via the interval-intersection guard). Since we
-  // can't cheaply prove convergence for a cross-node move the way we can
-  // for a same-node one, cap each ordered pair to a single attempt for the
-  // whole run - one real correction is applied, but a pair that turns out
-  // to still disagree afterwards is left alone rather than fought over
-  // indefinitely.
-  const neighbourNudgeAttempted = new Set();
-  // Every (node, geo) this call actually changes - handed back to the
-  // caller so ensureKmSeparation (run right after, every pass) can avoid
-  // immediately re-deciding the direction of a pair it just fixed. See
-  // ensureKmSeparation's decideLoHi doc comment for why that matters.
-  const touched = new Set();
-
-  function getKmOnGeo(node, geo) {
-    if (node.region === geo) return node.km;
-    if (node.region2 === geo) return node.km2;
-    if (node.region3 === geo) return node.km3;
+  };
+  // +1: this branch leads forward from its node; -1: backward.
+  const roleOf = (node, letter) => {
+    if (letter === 'F') return -1;
+    if (letter === 'D') return node.railwayType === 'diamond' ? -1 : 1;
+    return 1;
+  };
+  // Which of `other`'s own branches connects back to `node` (via node's arm
+  // `armOnBranchField`, used only to disambiguate a double link).
+  const letterOnOther = (node, armOnBranchField, other) => {
+    const cands = ARMS.filter(([f]) => other[f] === node.name).map(a => a[2]);
+    if (cands.length === 1) return cands[0];
+    const declared = node[armOnBranchField];
+    if (cands.length > 1) return cands.includes(declared) ? declared : cands[0];
     return null;
-  }
-  function setKmOnGeo(node, geo, val) {
-    touched.add(`${node.name}|${geo}`);
-    if (node.region === geo) node.km = val;
-    else if (node.region2 === geo) node.km2 = val;
-    else if (node.region3 === geo) node.km3 = val;
-  }
-  function getGeos(node) {
-    const geos = [node.region];
-    if (node.region2) geos.push(node.region2);
-    if (node.region3) geos.push(node.region3);
-    return geos;
-  }
+  };
 
-  // Diamonds now check two independent tracks per node (see below), so a
-  // cluster of interlinked diamonds needs more passes to fully settle than
-  // before. Tested empirically against a real network: 8 passes left
-  // several genuine violations unconverged; 25 clears everything that's
-  // going to converge; 50 found nothing further - the remainder are
-  // genuinely conflicting neighbours (see the bailouts below), not a
-  // convergence issue.
-  const MAX_PASSES = 25;
-  for (let pass = 0; pass < MAX_PASSES; pass++) {
-    let anyFixed = false;
-    let neighbourNudgeCount = 0;
+  const geos = new Set();
+  for (const n of nodes) for (const g of [n.region, n.region2, n.region3]) if (g) geos.add(g);
 
-    for (const node of nodes) {
-      // Platforms used to be skipped here entirely: when platform-to-link
-      // matching worked by comparing distances to reconstructed link
-      // geometry across the whole network (since replaced - see platform
-      // insertion's own history), a mismatched link could put a platform's
-      // real, correctly-projected km genuinely far from a "neighbour" that
-      // was never really adjacent to begin with, and two such platforms
-      // would "correct" each other upward every pass in an unbounded
-      // feedback loop. Now that platforms are matched to their own adjacent
-      // track way directly (resolveWayBounds), their F/T neighbours are
-      // reliably real, so ordinary ordering enforcement is safe again and
-      // cleans up the small (tens-of-metres) ties that independent
-      // projection naturally leaves between closely-spaced platforms.
-      // A diamond is two independent straight tracks crossing with no
-      // switching between them (F<->T and D<->X) - unlike a turnout, where
-      // T and D are alternative forward routes from one F approach. Check
-      // each track separately, matching the Network Editor's own validator
-      // (fixed this session): D and X must never be cross-checked against
-      // F/T's own range, or a track that's genuinely fine gets judged
-      // against a completely unrelated track's km.
-      const isDiamond = node.railwayType === 'diamond';
-      const trackPairs = isDiamond
-        ? [[['fNode'], ['tNode']], [['dNode'], ['xNode']]]
-        : [[['fNode'], ['tNode', 'dNode']]];
+  const stats = { moved: 0, maxMoveM: 0, droppedEdges: 0, unresolved: 0, components: 0 };
+  const movers = [];
 
-      // For a diamond, both tracks constrain the SAME single km value, but
-      // are checked independently - if their two requirements don't
-      // overlap at all (confirmed real case: F<->T wanted (32.081, 32.116],
-      // D<->X wanted [32.148, 32.888), no overlap), fixing one to satisfy it
-      // immediately re-breaks the other, and the two chase each other every
-      // single pass forever - the CSV just captures whichever value the run
-      // happened to stop on, not a converged answer. Compute both tracks'
-      // required interval FIRST, intersect them, and only ever move into a
-      // value both agree on; if they don't agree at all, leave the node
-      // alone rather than oscillate (matches the existing "neighbours
-      // conflict" bailout below, just extended across a diamond's tracks).
-      function requiredInterval(geo, backwardArms, forwardArms) {
-        const backwardKms = [], backwardNodes = [];
-        for (const arm of backwardArms) {
-          const nb = nodeByName.get(node[arm]);
-          if (!nb) continue;
-          const k = getKmOnGeo(nb, geo);
-          if (k != null) { backwardKms.push(k); backwardNodes.push(nb); }
-        }
-        const forwardKms = [], forwardNodes = [];
-        for (const arm of forwardArms) {
-          const nb = nodeByName.get(node[arm]);
-          if (!nb) continue;
-          const k = getKmOnGeo(nb, geo);
-          if (k != null) { forwardKms.push(k); forwardNodes.push(nb); }
-        }
-        if (backwardKms.length === 0 && forwardKms.length === 0) return null;
-        if (backwardKms.length > 0 && forwardKms.length > 0) {
-          const backwardMax = Math.max(...backwardKms), backwardMin = Math.min(...backwardKms);
-          const forwardMax = Math.max(...forwardKms), forwardMin = Math.min(...forwardKms);
-          const increasing = (backwardMax + backwardMin) < (forwardMax + forwardMin);
-          // Track which actual neighbour node is responsible for the lo/hi
-          // bound (not just the number) - needed so a genuine conflict
-          // between two tracks (below) can identify exactly which node on
-          // each side to reconsider, rather than the interval alone.
-          const loNode = increasing ? backwardNodes[backwardKms.indexOf(backwardMax)] : forwardNodes[forwardKms.indexOf(forwardMin)];
-          const hiNode = increasing ? forwardNodes[forwardKms.indexOf(forwardMax)] : backwardNodes[backwardKms.indexOf(backwardMin)];
-          return increasing
-            ? { kind: 'through', lo: backwardMax + EPS, hi: forwardMax + EPS, backwardKms, forwardKms, backwardNodes, forwardNodes, loNode, hiNode }
-            : { kind: 'through', lo: forwardMin - EPS, hi: backwardMin - EPS, backwardKms, forwardKms, backwardNodes, forwardNodes, loNode, hiNode };
-        }
-        // Endpoint: every same-region neighbour on this track is on one
-        // side - valid outside that group's span, not wedged inside it.
-        // Only meaningful with 2+ on that side (a single lone neighbour has
-        // nothing to be "wedged between" - no constraint at all). Not a
-        // bounded interval (unbounded below or above), handled separately
-        // below rather than folded into the intersection.
-        const group = backwardKms.length > 0 ? backwardKms : forwardKms;
-        return group.length >= 2 ? { kind: 'endpoint', group } : null;
-      }
+  for (const geo of geos) {
+    const members = nodes.filter(n => getKm(n, geo) != null);
+    const idx = new Map(members.map((n, i) => [n.name, i]));
+    const x0 = members.map(n => getKm(n, geo));
 
-      for (const geo of getGeos(node)) {
-        if (!geo) continue;
-        const currentKm = getKmOnGeo(node, geo);
-        if (currentKm == null) continue;
-
-        const reqs = trackPairs.map(([b, f]) => requiredInterval(geo, b, f)).filter(Boolean);
-        if (reqs.length === 0) continue;
-
-        // Endpoint-style requirements (2+ same-side neighbours) can't be
-        // combined with a "through" interval the same way - handle each on
-        // its own, same as before splitting this into a helper.
-        const throughReqs = reqs.filter(r => r.kind === 'through');
-        const endpointReqs = reqs.filter(r => r.kind === 'endpoint');
-
-        if (throughReqs.length > 0) {
-          const lo = Math.max(...throughReqs.map(r => r.lo));
-          const hi = Math.min(...throughReqs.map(r => r.hi));
-          if (currentKm > lo - EPS && currentKm <= hi + EPS) {
-            // Already valid for every through track at once.
-          } else if (lo <= hi) {
-            // Nudge minimally past whichever bound is violated, rather than
-            // jumping straight to a midpoint - a barely-out-of-order tie
-            // with a close neighbour shouldn't collapse onto a point
-            // roughly halfway to a much more distant one.
-            const margin = MIN_NODE_SPACING_M / 1000;
-            let target = currentKm;
-            if (target <= lo) target = Math.min(hi, lo + margin);
-            if (target > hi) target = Math.max(lo, hi - margin);
-            setKmOnGeo(node, geo, target);
-            if (process.env.DEBUG_ORDERING) {
-              const dt = process.env.DEBUG_ORDERING.split(',').map(Number);
-              if (haversineM(node, { lat: dt[0], lon: dt[1] }) < 500) {
-                console.error(`[order] ${node.name}: was=${currentKm.toFixed(4)} -> ${target.toFixed(4)} | interval=[${lo.toFixed(4)},${hi.toFixed(4)}]`);
-              }
-            }
-            anyFixed = true;
-          } else {
-            // lo > hi: no value satisfies every through track at once - not
-            // fixable by moving the current node alone. This happens either
-            // with a single track (this node's own backward and forward
-            // neighbours are themselves in the wrong relative order) or,
-            // for a diamond, when its two independent tracks (F<->T and
-            // D<->X) each pin it to disjoint ranges. Either way, the actual
-            // outlier is one of the specific neighbour nodes that produced
-            // the binding lo/hi bound - find those two nodes and, using
-            // each neighbour's own OTHER same-region neighbours as context
-            // (the same technique ensureKmSeparation already uses to decide
-            // push direction), nudge whichever one disagrees with its own
-            // broader neighbourhood, rather than leaving the cluster
-            // unresolved.
-            const loReq = throughReqs.reduce((a, b) => (b.lo > a.lo ? b : a));
-            const hiReq = throughReqs.reduce((a, b) => (b.hi < a.hi ? b : a));
-            const loNode = loReq.loNode;
-            const hiNode = hiReq.hiNode;
-
-            function avgOtherKm(refNode, excludeNames) {
-              let sum = 0, count = 0;
-              for (const arm of ARMS_ALL) {
-                const nm = refNode[arm];
-                if (!nm || excludeNames.includes(nm)) continue;
-                const other = nodeByName.get(nm);
-                if (!other) continue;
-                const k = getKmOnGeo(other, geo);
-                if (k != null) { sum += k; count++; }
-              }
-              return count > 0 ? sum / count : null;
-            }
-
-            // Keyed by the unordered node pair (not lo/hi specifically) -
-            // which one comes out "lo" vs "hi" can flip pass to pass as
-            // nearby kms shift, and a direction-sensitive key would let the
-            // same two nodes fight forever under alternating keys.
-            const nudgeKey = loNode && hiNode ? `${geo}|${[loNode.name, hiNode.name].sort().join('~')}` : null;
-            if (loNode && hiNode && loNode !== hiNode && !neighbourNudgeAttempted.has(nudgeKey)) {
-              const ctxLo = avgOtherKm(loNode, [node.name, hiNode.name]);
-              const ctxHi = avgOtherKm(hiNode, [node.name, loNode.name]);
-              const loKm = getKmOnGeo(loNode, geo), hiKm = getKmOnGeo(hiNode, geo);
-              // Both nodes' OWN current km are numerically reversed (that's
-              // the conflict). Rather than just picking a direction, judge
-              // each one against ITS OWN broader neighbourhood: the node
-              // whose actual km deviates furthest from what its other
-              // neighbours suggest is the more likely error, so nudge that
-              // one - the other one's value is left as the anchor. Needs
-              // both contexts to make a confident call; without one, leave
-              // alone rather than guess.
-              if (ctxLo != null && ctxHi != null) {
-                neighbourNudgeAttempted.add(nudgeKey);
-                const devLo = Math.abs(loKm - ctxLo);
-                const devHi = Math.abs(hiKm - ctxHi);
-                const margin = MIN_NODE_SPACING_M / 1000;
-                let moved, movedTo;
-                if (devLo >= devHi) {
-                  // loNode's actual km is further from its own neighbours'
-                  // average than hiNode's is - loNode is the outlier;
-                  // pull it down below hiNode.
-                  movedTo = hiKm - margin;
-                  setKmOnGeo(loNode, geo, movedTo);
-                  moved = loNode;
-                } else {
-                  movedTo = loKm + margin;
-                  setKmOnGeo(hiNode, geo, movedTo);
-                  moved = hiNode;
-                }
-                if (process.env.DEBUG_ORDERING_ALL) {
-                  console.error(`[order-neighbour] ${node.name}: ${loNode.name}(${loKm.toFixed(4)},ctx=${ctxLo.toFixed(4)},dev=${devLo.toFixed(4)}) vs ${hiNode.name}(${hiKm.toFixed(4)},ctx=${ctxHi.toFixed(4)},dev=${devHi.toFixed(4)}) reversed - moved ${moved.name} -> ${movedTo.toFixed(4)}`);
-                }
-                if (process.env.DEBUG_ORDERING) {
-                  const dt = process.env.DEBUG_ORDERING.split(',').map(Number);
-                  if (haversineM(node, { lat: dt[0], lon: dt[1] }) < 500) {
-                    console.error(`[order-neighbour] ${node.name}: ${loNode.name}(${loKm.toFixed(4)},ctx=${ctxLo.toFixed(4)},dev=${devLo.toFixed(4)}) vs ${hiNode.name}(${hiKm.toFixed(4)},ctx=${ctxHi.toFixed(4)},dev=${devHi.toFixed(4)}) reversed - moved ${moved.name} -> ${movedTo.toFixed(4)}`);
-                  }
-                }
-                anyFixed = true;
-                neighbourNudgeCount++;
-              }
-            }
-            // else: no clear outlier identifiable (missing context, or the
-            // two bounding neighbours coincide) - leave this node's km
-            // untouched rather than oscillate chasing an impossible target.
-          }
-        }
-
-        for (const req of endpointReqs) {
-          const groupMin = Math.min(...req.group);
-          const groupMax = Math.max(...req.group);
-          if (currentKm <= groupMin + EPS || currentKm >= groupMax - EPS) continue; // already outside - valid
-
-          const margin = MIN_NODE_SPACING_M / 1000;
-          if (currentKm - groupMin < groupMax - currentKm) {
-            setKmOnGeo(node, geo, groupMin - margin);
-          } else {
-            setKmOnGeo(node, geo, groupMax + margin);
-          }
-          anyFixed = true;
-        }
+    const edges = [];
+    const seen = new Set();
+    for (const a of members) {
+      for (const [f, bf, la] of ARMS) {
+        const b = a[f] ? nodeByName.get(a[f]) : null;
+        if (!b || b === a || !idx.has(b.name)) continue;
+        const lb = letterOnOther(a, bf, b);
+        if (!lb) continue;
+        const key = [a.name, la, b.name, lb].join('|');
+        const rkey = [b.name, lb, a.name, la].join('|');
+        if (seen.has(key) || seen.has(rkey)) continue;
+        seen.add(key);
+        edges.push({ ai: idx.get(a.name), bi: idx.get(b.name), ra: roleOf(a, la), rb: roleOf(b, lb) });
       }
     }
+    if (edges.length === 0) continue;
 
-    if (process.env.DEBUG_ORDERING_ALL) {
-      console.error(`[pass ${pass}] anyFixed=${anyFixed} neighbourNudges=${neighbourNudgeCount}`);
+    // Sense (+1 = forward is higher km) of every node, by parity.
+    const adj = members.map(() => []);
+    for (const e of edges) { adj[e.ai].push({ o: e.bi, mine: e.ra, theirs: e.rb }); adj[e.bi].push({ o: e.ai, mine: e.rb, theirs: e.ra }); }
+    const sense = new Array(members.length).fill(0);
+    const compOf = new Array(members.length).fill(-1);
+    let compCount = 0;
+    for (let s0 = 0; s0 < members.length; s0++) {
+      if (sense[s0] !== 0) continue;
+      sense[s0] = 1; compOf[s0] = compCount;
+      const q = [s0];
+      while (q.length) {
+        const cur = q.shift();
+        for (const { o, mine, theirs } of adj[cur]) {
+          if (sense[o] === 0) { sense[o] = -mine * sense[cur] / theirs; compOf[o] = compCount; q.push(o); }
+        }
+      }
+      compCount++;
     }
-    if (!anyFixed) break;
+    // Global sign per component: whichever agrees with the size-weighted km trend.
+    const vote = new Array(compCount).fill(0);
+    const voteCount = new Array(compCount).fill(0);
+    for (const e of edges) {
+      if (sense[e.ai] * e.ra !== -sense[e.bi] * e.rb) continue; // parity-inconsistent edge - no say
+      const predicted = e.ra * sense[e.ai];
+      const actual = x0[e.bi] - x0[e.ai];
+      vote[compOf[e.ai]] += predicted * actual;
+      voteCount[compOf[e.ai]] += predicted * Math.sign(actual);
+    }
+    const flip = vote.map((v, c) => (v < 0 || (v === 0 && voteCount[c] < 0)) ? -1 : 1);
+
+    // Constraints: x[hi] - x[lo] >= GAP_KM.
+    let cons = [];
+    for (const e of edges) {
+      const sa = sense[e.ai] * flip[compOf[e.ai]], sb = sense[e.bi] * flip[compOf[e.bi]];
+      if (sa * e.ra !== -(sb * e.rb)) { stats.droppedEdges++; continue; } // parity-inconsistent
+      const forwardIsHigher = e.ra * sa > 0; // is b higher than a?
+      cons.push(forwardIsHigher ? { lo: e.ai, hi: e.bi } : { lo: e.bi, hi: e.ai });
+    }
+
+    // Drop constraints inside any directed cycle (Tarjan SCC) - unsatisfiable.
+    {
+      const out = members.map(() => []);
+      cons.forEach((c, i) => out[c.lo].push({ to: c.hi, i }));
+      const index = new Array(members.length).fill(-1), low = new Array(members.length).fill(0);
+      const onStack = new Array(members.length).fill(false), sccOf = new Array(members.length).fill(-1);
+      const stack = []; let counter = 0, sccCount = 0;
+      const strong = (v) => {
+        index[v] = low[v] = counter++; stack.push(v); onStack[v] = true;
+        for (const { to } of out[v]) {
+          if (index[to] === -1) { strong(to); low[v] = Math.min(low[v], low[to]); }
+          else if (onStack[to]) low[v] = Math.min(low[v], index[to]);
+        }
+        if (low[v] === index[v]) {
+          let w;
+          do { w = stack.pop(); onStack[w] = false; sccOf[w] = sccCount; } while (w !== v);
+          sccCount++;
+        }
+      };
+      for (let v = 0; v < members.length; v++) if (index[v] === -1) strong(v);
+      const before = cons.length;
+      cons = cons.filter(c => sccOf[c.lo] !== sccOf[c.hi]);
+      stats.droppedEdges += before - cons.length;
+    }
+    if (cons.length === 0) continue;
+
+    // Keep nodes inside the geometry's own km range (unless already outside).
+    const pts = geometryBySection ? geometryBySection.get(geo) : null;
+    let gMin = -Infinity, gMax = Infinity;
+    if (pts && pts.length > 0) { gMin = Math.min(...pts.map(p => p.km)); gMax = Math.max(...pts.map(p => p.km)); }
+    const blo = x0.map(v => Math.min(gMin, v)), bhi = x0.map(v => Math.max(gMax, v));
+
+    // Dykstra's alternating projections.
+    const x = x0.slice();
+    const pl = new Array(cons.length).fill(0), ph = new Array(cons.length).fill(0), pb = new Array(members.length).fill(0);
+    let sweeps = 0, worst = Infinity;
+    for (; sweeps < MAX_SWEEPS; sweeps++) {
+      for (let c = 0; c < cons.length; c++) {
+        const { lo, hi } = cons[c];
+        const yl = x[lo] + pl[c], yh = x[hi] + ph[c];
+        const v = GAP_KM - (yh - yl);
+        let nl = yl, nh = yh;
+        if (v > 0) { nl = yl - v / 2; nh = yh + v / 2; }
+        pl[c] = yl - nl; ph[c] = yh - nh;
+        x[lo] = nl; x[hi] = nh;
+      }
+      for (let i = 0; i < x.length; i++) {
+        const y = x[i] + pb[i];
+        const ny = Math.min(bhi[i], Math.max(blo[i], y));
+        pb[i] = y - ny; x[i] = ny;
+      }
+      worst = 0;
+      for (const { lo, hi } of cons) worst = Math.max(worst, GAP_KM - (x[hi] - x[lo]));
+      if (worst < TOL_KM) break;
+    }
+    if (worst > 1e-4) stats.unresolved++;
+    stats.components += compCount;
+    if (debug) console.error(`[km-solve] geo=${geo} nodes=${members.length} constraints=${cons.length} sweeps=${sweeps} worstShortfall=${(worst * 1000).toFixed(3)}m`);
+
+    for (let i = 0; i < members.length; i++) {
+      const moved = Math.abs(x[i] - x0[i]);
+      if (moved < 1e-9) continue;
+      setKm(members[i], geo, Math.round(x[i] * 1e6) / 1e6);
+      stats.moved++;
+      stats.maxMoveM = Math.max(stats.maxMoveM, moved * 1000);
+      const ctx = [];
+      for (const c of cons) { if (c.lo === i || c.hi === i) { const o = c.lo === i ? c.hi : c.lo; ctx.push((c.lo === i ? 'fwd ' : 'bwd ') + members[o].name + ' ' + x0[o].toFixed(3) + '->' + x[o].toFixed(3)); } }
+      movers.push({ name: members[i].name, geo, m: moved * 1000, ctx: '[' + members[i].lat + ',' + members[i].lon + '] ' + x0[i].toFixed(3) + '->' + x[i].toFixed(3) + ' | ' + ctx.join(' ; ') });
+    }
   }
 
-  return touched;
+  if (debug) {
+    movers.sort((a, b) => b.m - a.m);
+    console.error(`[km-solve] moved=${stats.moved} maxMove=${stats.maxMoveM.toFixed(1)}m droppedEdges=${stats.droppedEdges} unresolvedGeos=${stats.unresolved}`);
+    for (const m of movers.slice(0, 15)) console.error(`[km-solve]   ${m.name} (${m.geo}): ${m.m.toFixed(1)}m  ${m.ctx}`);
+  }
+  return stats;
 }
 
 /**
@@ -1799,7 +1561,7 @@ async function generateInfrastructureForSections(confirmedSections, networkName,
   // ── Step 9: Spatial separation (disabled) ──
   // Lat/lon positions are no longer moved.  The minimum 30 m spacing
   // requirement applies to kilometrage, not physical coordinates.
-  // ensureKmSeparation (called after Step 11) handles the km rule.
+  // resolveKmConstraints (called after Step 11) handles the km rule.
 
   updateProgress(80, 'Enforcing reciprocal links');
   // ── Step 10: Enforce reciprocal links ──
@@ -2132,23 +1894,11 @@ async function generateInfrastructureForSections(confirmedSections, networkName,
   reprojectKmAlongTopology(nodes, geometryBySection);
   debugSnapshot('after-reproject');
 
-  // Enforce minimum km spacing on all shared geometries (primary + alt)
-  ensureKmSeparation(nodes, geometryBySection);
-  debugSnapshot('after-sep1');
-
-  // BFS reprojection above only cross-checks the ONE edge each node was
-  // discovered through, not every edge it actually has - correct any that
-  // still disagree with a direct neighbour (see enforceKmOrdering doc
-  // comment). Ordering and spacing are interdependent (fixing one can
-  // reintroduce a violation of the other in a densely-meshed cluster), so
-  // alternate the two until neither has anything left to fix, capped so a
-  // genuinely conflicting cluster can't loop forever. 25 (tested against a
-  // real network alongside enforceKmOrdering's own per-diamond-track passes
-  // above) is where this plateaus - going higher found nothing further.
-  for (let i = 0; i < 25; i++) {
-    const justFixed = enforceKmOrdering(nodes);
-    ensureKmSeparation(nodes, geometryBySection, justFixed);
-  }
+  // Ordering and minimum spacing are solved together as one constraint
+  // problem (see resolveKmConstraints) - BFS reprojection above only
+  // cross-checks the ONE edge each node was discovered through, and the
+  // solver settles every remaining connection at once.
+  resolveKmConstraints(nodes, geometryBySection);
   debugSnapshot('after-order-loop');
 
   // ── Step 11b: Geometry reference pruning ──
