@@ -2735,7 +2735,7 @@ function buildInfrastructureCsv(nodes, networkName, nodeCount, connectionCount) 
         '', // Km4
         isDiamond ? '' : 'T', // Default branch — no default for a diamond crossing
         '40',
-        isDiamond ? '10' : '20', // Width — 10 gives diamonds a better crossing angle in the Network Editor
+        '20', // Width — same for turnouts and diamonds (the Network Editor now draws diamonds with horizontal ends)
         node.rotation ?? 0,
         node.flip ? 'True' : 'False',
         'True', // Draw
