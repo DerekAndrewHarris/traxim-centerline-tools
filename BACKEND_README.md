@@ -177,25 +177,18 @@ GET  /api/file-generator/infrastructure/jobs/:jobId
 These can each take a few minutes — the OSM queries behind them (Overpass relation/way
 fetches) are the bottleneck, not the local processing.
 
-## Integration with Traxim Controller
+## Agent access (through the Traxim Controller)
 
-For production deployment, import routes into `../Traxim-Live-Control-Interface-for-Web/server.js`:
+_Added October 2026. Full design, tool list and deployment steps: `documentation/FILE_GENERATOR_AGENT_ACCESS.md` in the Controller repo (Traxim-Live-Control-Interface-for-Web)._
 
-```javascript
-// In Traxim-Live-Control-Interface-for-Web/server.js
+AI agents use the File Generator only through the Traxim Controller's MCP connector (`generator_` tools). The Controller checks the user's login and calls this service **server to server** on `127.0.0.1:3001`, under `/internal/agent/...` (`backend/routes/agent.js`). The generation logic stays here.
 
-import fileGeneratorRoutes from '../traxim-centerline-tools/backend/routes/index.js';
-import { cleanupOldSessions } from '../traxim-centerline-tools/backend/utils/tempFiles.js';
-import cron from 'node-cron';
-
-// Mount routes
-app.use('/api/file-generator', fileGeneratorRoutes);
-
-// Setup cleanup cron (daily at 2 AM)
-cron.schedule('0 2 * * *', async () => {
-  await cleanupOldSessions();
-});
-```
+- **Who is calling:** headers `X-Traxim-Internal-Key` (shared secret `TRAXIM_INTERNAL_KEY`, same value in both services) and `X-Traxim-User-Id`. nginx does not forward `/internal/`, requests that came through nginx (`X-Forwarded-For`/`X-Real-IP`) are refused, and without the key every call is refused. No key configured = agent routes off (503); the website is unaffected. See `backend/utils/internalAuth.js`.
+- **Ownership:** agent sessions store `agent.ownerId` in `session.json`; every agent route answers 404 for anything that is not the caller's. The public `/api/file-generator` routes answer 404 for agent sessions and agent jobs (`backend/utils/publicSessionGuard.js`), so the website's anonymous API cannot reach them.
+- **Workflow:** `backend/services/agent/agentSessions.js`: waypoints -> section search (a background job; search boxes worked out on the server, `searchBoxes.js`) -> numbered section list -> the user's choice recorded -> one combined job (geometry, then infrastructure; Regions.csv is written by the geometry step) -> outputs-only ZIP (`Infrastructure.csv`, `Regions.csv`, `Geometry/*.csv`).
+- **Limits** (`backend/services/agent/limits.js`, env overrides): 20 generations per hour per user, 5,000 infrastructure nodes per generation (checked when the infrastructure step has built the nodes, before `Infrastructure.csv` is written), 30 new sessions per hour, 25 waypoints, 2 jobs waiting or running per user.
+- The shared job code is in `backend/services/generation/pipeline.js` (used by both the website's routes and the agent job).
+- Browser view of an agent session: `/TraximCenterlineTools/?session=<id>` (read-only, needs the Traxim login; data comes from the Controller).
 
 ## Session Lifecycle
 
@@ -207,7 +200,7 @@ cron.schedule('0 2 * * *', async () => {
 ## Job Queue
 
 **In-memory queue** for background processing:
-- Max 3 concurrent jobs (configurable)
+- Max 3 concurrent jobs (set `MAX_CONCURRENT_JOBS`, 1-16)
 - Progress tracking via polling
 - Auto-cleanup of completed jobs after 1 hour
 
@@ -272,11 +265,13 @@ PORT=3001
 TEMP_FILES_DIR=./temp-sessions
 SESSION_EXPIRY_HOURS=24
 OVERPASS_API_URL=https://overpass-api.de/api/interpreter
+MAX_CONCURRENT_JOBS=3
+# Agent access: TRAXIM_INTERNAL_KEY (secret, never in git) and AGENT_* limits, see .env.example
 ```
 
 ## Security
 
-- **No authentication:** Public API (as requested)
+- **No authentication** on the website API (`/api/file-generator`), as before. Agent sessions are separate: see "Agent access" above.
 - **Session isolation:** UUID-based directories prevent collisions
 - **Path validation:** All file operations validated against session directory
 - **Automatic cleanup:** Expired sessions deleted daily

@@ -143,6 +143,10 @@ export async function queryRailwaySections(bboxes) {
       type: routeType,
       operator: rel.tags?.operator || '',
       ref: rel.tags?.ref || '',
+      // Extra tags for a readable summary (agent section list); often blank.
+      from: rel.tags?.from || '',
+      to: rel.tags?.to || '',
+      network: rel.tags?.network || '',
       wayIds,
       segmentIndices
       // geometry is attached below, after dedup, via a dedicated fetch —
@@ -198,6 +202,9 @@ export async function queryRailwaySections(bboxes) {
       type: railway, // e.g., "rail", "light_rail", "subway"
       operator: way.tags?.operator || '',
       ref: way.tags?.ref || '',
+      from: '',
+      to: '',
+      network: '',
       wayIds: [String(way.id)],
       segmentIndices: Array.from(elemBboxIndices.get(String(way.id)) ?? [0]).sort((a, b) => a - b)
     };
