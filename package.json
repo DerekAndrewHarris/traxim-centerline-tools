@@ -7,7 +7,7 @@
   "scripts": {
     "dev": "node --watch backend/server.js",
     "start": "node backend/server.js",
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "node --test \"test/*.test.js\""
   },
   "keywords": [
     "traxim",

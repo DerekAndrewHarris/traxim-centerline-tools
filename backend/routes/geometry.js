@@ -6,7 +6,7 @@
 import express from 'express';
 import { generateGeometryForSegment } from '../services/geometry/generator.js';
 import { prefetchRelationWayIds } from '../services/osm/osmGeometry.js';
-import { generateRegionsCsv, DEFAULTS_WARNING as REGIONS_DEFAULTS_WARNING } from '../services/regions/generator.js';
+import { generateRegionsCsv, readGeometryRegionNames, orderRegionNames, DEFAULTS_WARNING as REGIONS_DEFAULTS_WARNING } from '../services/regions/generator.js';
 import { REGION_COLOURS } from '../services/infrastructure/generator.js';
 import jobQueue from '../utils/jobQueue.js';
 import { asyncHandler } from '../utils/errorHandler.js';
@@ -99,6 +99,24 @@ router.post('/generate', asyncHandler(async (req, res) => {
       const results = [];
       const geometryDir = path.join(session.path, 'geometry');
 
+      // Remove the previous run's geometry outputs first. Otherwise a rerun
+      // in the same session (e.g. after re-confirming different places, or
+      // when a segment now has fewer alternative routes) leaves old files
+      // behind, and they would still be zipped for download and read by the
+      // infrastructure step, without matching rows in the new Regions.csv.
+      // Nothing in this folder is a cache: OSM caches live in the session root.
+      try {
+        for (const f of await fs.readdir(geometryDir)) {
+          if (f.endsWith('.csv') || f.endsWith('_topology.json')) {
+            await fs.unlink(path.join(geometryDir, f));
+          }
+        }
+      } catch (clearErr) {
+        if (clearErr.code !== 'ENOENT') {
+          console.warn(`[Geometry API] Could not clear old geometry files: ${clearErr.message}`);
+        }
+      }
+
       // Pre-fetch relation way IDs once for all unique relations used across segments.
       // This avoids repeating expensive Overpass family-expansion queries (one per
       // unique relation, not once per segment × per relation).
@@ -164,17 +182,21 @@ router.post('/generate', asyncHandler(async (req, res) => {
       // alternative routes are each their own file, each with its own region
       // name in that file's own first column (see generator.js: segmentLabel /
       // altLabel), and Traxim correlates Regions.csv rows to geometry files by
-      // that exact name. Only successful segments contribute rows. Written to
+      // that exact name. The names are read back from the files on disk, so a
+      // failed segment or a failed alternative route gets no row. Written to
       // the session ROOT (not geometryDir) so it's naturally excluded from the
       // geometry-only ZIP and naturally included in the "download all" ZIP.
+      // This is the ONLY writer of Regions.csv (the infrastructure step reads
+      // the same geometry files and must not rewrite it).
       let regionsWarning = null;
-      const regionNames = [];
-      for (const r of results) {
-        if (r.error) continue;
-        regionNames.push(r.section);
-        for (let n = 1; n <= (r.alternativeCount || 0); n++) {
-          regionNames.push(`${r.section}_alt${n}`);
-        }
+      let regionNames = [];
+      try {
+        regionNames = orderRegionNames(
+          await readGeometryRegionNames(geometryDir),
+          segments.map(s => s.label)
+        );
+      } catch (namesErr) {
+        console.error(`[Geometry API] Could not read region names from geometry files:`, namesErr);
       }
       console.log(`[Geometry API] Regions.csv: ${regionNames.length} region(s) from ${results.length} segment result(s) - ` +
         regionNames.map(n => `"${n}"`).join(', '));

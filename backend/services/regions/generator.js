@@ -30,6 +30,9 @@
  * the user.
  */
 
+import fs from 'fs/promises';
+import path from 'path';
+
 const DEFAULT_OPPOSING_DELAY = 90;
 const DEFAULT_FOLLOWING_DELAY = 90;
 const DEFAULT_SUPERELEVATION = 120;
@@ -71,4 +74,73 @@ export function generateRegionsCsv(regionNames, colourPalette) {
   });
 
   return lines.join('\n') + '\n';
+}
+
+// ── Region names from the geometry files actually on disk ──────────────────
+//
+// Traxim matches each Regions.csv row to a geometry file by the region name in
+// that file's own first column, so Regions.csv must list exactly the geometry
+// files the user downloads: no more (a row for a file that was never written,
+// e.g. an alternative route that failed) and no fewer (e.g. the `_altN` rows
+// that the infrastructure step used to drop). Reading the names back from the
+// files themselves is the only way to guarantee that.
+
+/**
+ * True for a file in the geometry folder that is a Traxim geometry input.
+ * `_wayids.csv` files are diagnostics (OSM way id lists), not geometry, and
+ * `_topology.json` files are not CSV at all.
+ * @param {string} fileName
+ * @returns {boolean}
+ */
+export function isGeometryCsvFile(fileName) {
+  return fileName.endsWith('.csv') && !fileName.endsWith('_wayids.csv');
+}
+
+/**
+ * Read the region name (first column of the first data row) from each
+ * geometry CSV in a folder. Files with no data row are skipped.
+ * @param {string} geometryDir
+ * @returns {Promise<string[]>} region names, unordered
+ */
+export async function readGeometryRegionNames(geometryDir) {
+  let files;
+  try {
+    files = await fs.readdir(geometryDir);
+  } catch (err) {
+    if (err.code === 'ENOENT') return [];
+    throw err;
+  }
+  const names = [];
+  for (const file of files.filter(isGeometryCsvFile).sort()) {
+    const content = await fs.readFile(path.join(geometryDir, file), 'utf-8');
+    const firstDataLine = content.split(/\r?\n/).find(l => l.trim() && !l.startsWith('#'));
+    if (!firstDataLine) continue;
+    const name = firstDataLine.split(',')[0].trim();
+    if (name && !names.includes(name)) names.push(name);
+  }
+  return names;
+}
+
+/**
+ * Put region names into route order: segments in the order given, each
+ * segment's main file first, then its `_alt1`, `_alt2`, ... files in number
+ * order. Names that don't belong to any listed segment go last, A-Z.
+ * @param {string[]} names - region names (e.g. from readGeometryRegionNames)
+ * @param {string[]} segmentLabels - segment labels in route order
+ * @returns {string[]} a new, ordered array
+ */
+export function orderRegionNames(names, segmentLabels) {
+  const key = (name) => {
+    const m = name.match(/^(.*)_alt(\d+)$/);
+    const base = m ? m[1] : name;
+    const alt = m ? parseInt(m[2], 10) : 0;
+    const idx = segmentLabels.indexOf(base);
+    return { idx: idx === -1 ? Infinity : idx, alt };
+  };
+  return [...names].sort((a, b) => {
+    const ka = key(a), kb = key(b);
+    if (ka.idx !== kb.idx) return ka.idx - kb.idx;
+    if (ka.alt !== kb.alt) return ka.alt - kb.alt;
+    return a < b ? -1 : a > b ? 1 : 0;
+  });
 }
