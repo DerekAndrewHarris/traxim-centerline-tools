@@ -1579,6 +1579,164 @@ function enablePanel(panelId, collapsePrevious = true) {
     }
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// Agent session view (?session=<id>)
+//
+// Sessions created by an AI agent (through the Traxim Controller connector)
+// can be looked at here, read-only, on the map. The agent and the user
+// choose the sections in the chat; this view is optional and changes
+// nothing. The data comes from the Traxim Controller (/api/agent/generator/
+// ...), which checks the normal Traxim login cookie and that the session
+// belongs to the logged-in user. Normal use of this page needs no login.
+// ═══════════════════════════════════════════════════════════════════════════
+
+const CONTROLLER_GENERATOR_API = '/api/agent/generator/sessions';
+const SESSION_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+
+function escapeHtml(value) {
+    return String(value == null ? '' : value)
+        .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+
+/** Session id from ?session=..., or null. */
+function agentSessionIdFromUrl() {
+    const value = new URLSearchParams(window.location.search).get('session');
+    return value ? value.trim().toLowerCase() : null;
+}
+
+/** Leave the view and start an ordinary (no login) session. */
+function leaveAgentView() {
+    window.location.href = window.location.pathname;
+}
+
+function showAgentViewMessage(html) {
+    let banner = document.getElementById('agentViewBanner');
+    if (!banner) {
+        banner = document.createElement('div');
+        banner.id = 'agentViewBanner';
+        banner.className = 'instruction-box';
+        banner.style.marginBottom = '15px';
+        const panels = document.querySelector('.control-panels');
+        panels.insertBefore(banner, panels.firstChild);
+    }
+    banner.innerHTML = html +
+        '<p><button id="btnLeaveAgentView" class="btn-secondary btn-small">Start a new session of my own (no login needed)</button></p>';
+    document.getElementById('btnLeaveAgentView').addEventListener('click', leaveAgentView);
+}
+
+async function openAgentSessionView(sessionId) {
+    // Nothing on this page can change an agent session: lock the workflow.
+    ['panel-route', 'panel-sections', 'panel-download-geometry', 'panel-infrastructure', 'panel-download'].forEach(id => {
+        const panel = document.getElementById(id);
+        panel.classList.add('disabled');
+        panel.classList.add('collapsed');
+    });
+    showSessionStatus('Agent session (view only)', 'active');
+
+    if (!SESSION_ID_PATTERN.test(sessionId)) {
+        showAgentViewMessage('<p><strong>This link is not valid.</strong> Check it was copied in full.</p>');
+        return;
+    }
+
+    showAgentViewMessage('<p>Loading the agent session...</p>');
+    let response;
+    try {
+        response = await fetch(`${CONTROLLER_GENERATOR_API}/${sessionId}/view`, { credentials: 'same-origin' });
+    } catch (error) {
+        showAgentViewMessage(`<p><strong>Could not reach Traxim.</strong> ${escapeHtml(error.message)}</p>`);
+        return;
+    }
+
+    if (response.status === 401) {
+        showAgentViewMessage(
+            '<p><strong>Please log in to see this session.</strong></p>' +
+            '<p>This session was created by an AI agent for a Traxim account. To view it, ' +
+            '<a href="/login.html" target="_blank" rel="noopener">log in to Traxim</a> (opens in a new tab) ' +
+            'with the same account you use with the agent, then come back here and reload this page.</p>' +
+            '<p style="font-size:12px;opacity:0.8;">Logging in is only needed to view sessions created with an agent. ' +
+            'The File Generator itself needs no login.</p>'
+        );
+        return;
+    }
+    if (response.status === 403) {
+        showAgentViewMessage('<p><strong>Guest accounts cannot use the File Generator with an agent.</strong> Log in with your own Traxim account.</p>');
+        return;
+    }
+    if (response.status === 404) {
+        showAgentViewMessage(
+            '<p><strong>Session not found.</strong> It may have expired (sessions are deleted after 24 hours), ' +
+            'or it belongs to a different Traxim account than the one you are logged in with.</p>'
+        );
+        return;
+    }
+    if (!response.ok) {
+        showAgentViewMessage(`<p><strong>Could not load the session</strong> (error ${response.status}). Please try again later.</p>`);
+        return;
+    }
+
+    const view = await response.json();
+    renderAgentSessionView(sessionId, view);
+}
+
+function renderAgentSessionView(sessionId, view) {
+    const map = view.map || {};
+    const chosen = (view.confirmation && view.confirmation.section_numbers) || [];
+
+    // Waypoints
+    // Escaped here because drawGeocodedLocations puts them into popup HTML.
+    state.geocodedLocations = (map.waypoints || []).map(w => ({
+        name: escapeHtml(w.name), lat: w.lat, lon: w.lon, displayName: escapeHtml(w.display_name || w.name)
+    }));
+    if (state.geocodedLocations.length > 0) drawGeocodedLocations(state.geocodedLocations);
+
+    // Search boxes and candidate sections (chosen ones only, once the user has chosen)
+    state.searchBboxes = map.search_bboxes || [];
+    state.availableSections = map.sections || [];
+    state.selectedSections = chosen.length > 0
+        ? chosen.map(n => n - 1)
+        : state.availableSections.map((_, i) => i);
+    drawSections(state.availableSections);
+
+    // Generated geometry, if any
+    mapLayers.geometry.clearLayers();
+    (map.geometry_lines || []).forEach(line => {
+        L.polyline(line.coords, {
+            color: line.isAlt ? '#ab47bc' : '#ff1493', weight: 4,
+            opacity: line.isAlt ? 0.85 : 0.9, dashArray: line.isAlt ? '4, 4' : null
+        }).bindPopup(`<strong>${escapeHtml(line.label)}</strong>`).addTo(mapLayers.geometry);
+    });
+
+    const sectionRows = (view.sections || []).map(s => {
+        const isChosen = chosen.includes(s.number);
+        const details = [s.ref && `ref ${s.ref}`, s.from && s.to && `${s.from} to ${s.to}`, s.operator,
+            s.length_km != null && `${s.length_km} km of track mapped`].filter(Boolean).map(escapeHtml).join(' | ');
+        return `<li style="margin-bottom:6px;${chosen.length && !isChosen ? 'opacity:0.55;' : ''}">` +
+            `<strong>${s.number}. ${escapeHtml(s.name)}</strong>${isChosen ? ' &#10003; chosen' : ''}` +
+            (details ? `<br><span style="font-size:11px;">${details}</span>` : '') + '</li>';
+    }).join('');
+
+    const download = view.state === 'ready'
+        ? `<p><a class="btn-primary" style="display:inline-block;padding:8px 14px;text-decoration:none;" href="${CONTROLLER_GENERATOR_API}/${sessionId}/download">Download the files (ZIP)</a></p>`
+        : '';
+
+    showAgentViewMessage(
+        `<p><strong>Agent session${view.label ? ': ' + escapeHtml(view.label) : ''}</strong> (view only)</p>` +
+        `<p>${escapeHtml(view.what_next || '')}</p>` +
+        '<p style="font-size:12px;">Choose the sections in your chat with the agent. This page only shows them on the map; nothing here changes the session.' +
+        (chosen.length ? ' Lines on the map: the sections chosen in the chat.' : ' Lines on the map: every section found (each in its own colour; hover a line to see its name).') +
+        '</p>' +
+        download +
+        (sectionRows ? `<ol style="list-style:none;padding-left:0;margin-top:10px;">${sectionRows}</ol>` : '') +
+        `<p style="font-size:11px;opacity:0.7;">Session expires ${escapeHtml(new Date(view.expires_at).toLocaleString())}.</p>`
+    );
+
+    const geometryCoords = (map.geometry_lines || []).flatMap(l => l.coords);
+    if (geometryCoords.length > 0) {
+        osmMap.fitBounds(geometryCoords, { padding: [30, 30] });
+    }
+}
+
 /**
  * Initialize Event Listeners
  */
@@ -1643,6 +1801,14 @@ document.addEventListener('DOMContentLoaded', function() {
         }
     });
 
-    // Auto-create session on load
-    createSession();
+    // A link from an AI agent (?session=<id>) opens that session read-only;
+    // otherwise auto-create an ordinary session on load, as always.
+    const agentSessionId = agentSessionIdFromUrl();
+    if (agentSessionId) {
+        document.getElementById('btnNewSession').addEventListener('click', leaveAgentView, true);
+        document.getElementById('btnNewSession').removeEventListener('click', createSession);
+        openAgentSessionView(agentSessionId);
+    } else {
+        createSession();
+    }
 });
