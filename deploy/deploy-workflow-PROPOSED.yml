@@ -1,0 +1,43 @@
+# PROPOSED replacement for .github/workflows/deploy.yml (not active: GitHub only runs files
+# inside .github/workflows). Copy it over .github/workflows/deploy.yml ONLY after the server
+# has the deploy-fg user, its key, the sudoers rule and /usr/local/bin/deploy-file-generator,
+# and the repository secrets SSH_USERNAME / SSH_PRIVATE_KEY have been changed to deploy-fg and
+# its new private key (step-by-step instructions: the October 2026 deploy-key proposal).
+
+name: Deploy to Server
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+# Never run two deploys at once.
+concurrency:
+  group: deploy-file-generator
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-24.04
+
+    steps:
+    # All the real work (git reset to origin/main, build id, permissions, restart, check) is in the
+    # root-owned script on the server - see deploy/deploy-file-generator.sh in this repo.
+    - name: Install it on the server
+      uses: appleboy/ssh-action@v1.0.0
+      with:
+        host: ${{ secrets.SSH_HOST }}
+        username: ${{ secrets.SSH_USERNAME }}
+        key: ${{ secrets.SSH_PRIVATE_KEY }}
+        script: sudo /usr/local/bin/deploy-file-generator
+
+    - name: Check the live service
+      run: |
+        sleep 3
+        curl -fsS https://tools.traximrail.com/api/file-generator/health | grep -q '"operational"' \
+          && echo "File Generator API is responding" \
+          || { echo "File Generator API did not respond as expected"; exit 1; }
