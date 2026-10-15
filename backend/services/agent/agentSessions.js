@@ -653,7 +653,7 @@ export async function getAgentJobStatus(userId, jobId) {
   const record = kind === 'generation' ? meta.agent.generation : meta.agent.search;
   const job = jobQueue.getJob(jobId);
 
-  const response = { job_id: jobId, kind, session_id: meta.id };
+  const response = { job_id: jobId, kind, session_id: meta.id, session_expires_at: meta.expiresAt };
   if (record.status === 'completed' || record.status === 'done') {
     response.status = 'completed';
   } else if (record.status === 'failed') {

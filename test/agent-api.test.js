@@ -374,6 +374,7 @@ test('combined job: geometry then infrastructure; outputs-only ZIP; owner-only d
   const { jobId, status } = await generateAndWait(id);
   assert.equal(status.status, 'completed', JSON.stringify(status));
   assert.equal(status.kind, 'generation');
+  assert.ok(status.session_expires_at, 'expiry given for the download link');
   assert.equal(status.summary.infrastructure_nodes, 120);
   assert.equal(status.summary.node_limit, 5000);
   assert.equal(status.summary.legs_generated, 2);
