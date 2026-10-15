@@ -2770,35 +2770,11 @@ export const REGION_COLOURS = [
   'Orange', 'DodgerBlue', 'Yellow', 'Aqua', 'Chartreuse', 'Violet'
 ];
 
-/**
- * Build Regions.csv content from the confirmed sections list.
- * Row 2 is a fixed blank-region boilerplate row required by the Traxim
- * Regions file format; every column besides Region Name, Colour and Train
- * Graph Order is a fixed default, matching the standard Traxim template.
- * @param {Array<{name: string}>} confirmedSections - in UI display order
- * @returns {string} CSV content
- */
-function buildRegionsCsv(confirmedSections) {
-  const lines = [
-    '#Region Name, Colour, Train Graph Order,Opposing delay,Following Delay,Reverse Section,Nominal Superelevation,Nominal cant deficiency,',
-    ',White,1,0,0,FALSE,,Normal,Passenger'
-  ];
-
-  confirmedSections.forEach((section, i) => {
-    const colour = REGION_COLOURS[i % REGION_COLOURS.length];
-    const order = i + 2; // row 2 (blank region) occupies order 1
-    lines.push(`${section.name},${colour},${order},90,90,FALSE,120,75,110`);
-  });
-
-  return lines.join('\n') + '\n';
-}
-
 export {
   generateInfrastructureForSections,
   fetchStationsFromOverpass,
   fetchPlatformsFromOverpass,
   fetchRailwayTopologyFromOverpass,
   parseGeometryCsv,
-  buildInfrastructureCsv,
-  buildRegionsCsv
+  buildInfrastructureCsv
 };
