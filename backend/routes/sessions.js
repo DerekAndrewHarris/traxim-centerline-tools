@@ -17,6 +17,7 @@ import {
 import { generateSessionZip } from '../utils/zipGenerator.js';
 import { generateLinesKML, readGeometryCSV } from '../utils/kmlGenerator.js';
 import { asyncHandler, AppError } from '../utils/errorHandler.js';
+import { readMapOverlays } from '../services/generation/pipeline.js';
 
 const router = express.Router();
 
@@ -120,76 +121,8 @@ router.get('/:id/map-overlays', asyncHandler(async (req, res) => {
   const session = await getSession(id);
   if (!session.exists) throw new AppError('Session not found or expired', 404);
 
-  const sessionPath = session.path;
-  const result = { searchBboxes: [], corridorBboxes: [], geometryLines: [], topologyWays: [], corridorPolygons: [] };
-
-  // 1. Read session.json for bboxes & confirmed section metadata
-  try {
-    const raw = await fs.readFile(path.join(sessionPath, 'session.json'), 'utf-8');
-    const meta = JSON.parse(raw);
-
-    if (Array.isArray(meta.searchBboxes)) {
-      result.searchBboxes = meta.searchBboxes;
-    }
-
-    // Corridor bboxes from confirmed sections
-    if (Array.isArray(meta.confirmedSections)) {
-      for (const sec of meta.confirmedSections) {
-        if (sec.corridorBbox) {
-          result.corridorBboxes.push({ name: sec.name, bbox: sec.corridorBbox });
-        }
-      }
-    }
-  } catch { /* session.json may not exist yet */ }
-
-  // 2. Read geometry CSVs for centerline + alt polylines
-  const geometryDir = path.join(sessionPath, 'geometry');
-  try {
-    const files = await fs.readdir(geometryDir);
-    const csvFiles = files.filter(f => f.endsWith('.csv') && !f.includes('_wayids'));
-    for (const csvFile of csvFiles) {
-      const content = await fs.readFile(path.join(geometryDir, csvFile), 'utf-8');
-      const coords = [];
-      for (const line of content.split('\n')) {
-        const parts = line.split(',');
-        // CSV columns vary; lat is index 1, lon is index 2 in the standard geometry CSV
-        const lat = parseFloat(parts[1]);
-        const lon = parseFloat(parts[2]);
-        if (isFinite(lat) && isFinite(lon)) coords.push([lat, lon]);
-      }
-      if (coords.length >= 2) {
-        const label = csvFile.replace(/\.csv$/, '').replace(/_/g, ' ');
-        const isAlt = /_alt\d+$/.test(csvFile.replace(/\.csv$/, ''));
-        result.geometryLines.push({ label, isAlt, coords });
-      }
-    }
-  } catch { /* geometry dir may not exist yet */ }
-
-  // 3. Read osm_topology.json for raw OSM way polylines
-  try {
-    const raw = await fs.readFile(path.join(sessionPath, 'osm_topology.json'), 'utf-8');
-    const topo = JSON.parse(raw);
-    if (Array.isArray(topo.ways)) {
-      for (const w of topo.ways) {
-        if (Array.isArray(w.coords) && w.coords.length >= 2) {
-          result.topologyWays.push({
-            id: w.id,
-            coords: w.coords.map(c => [c.lat, c.lon]),
-            tags: w.tags || {}
-          });
-        }
-      }
-    }
-  } catch { /* topology file may not exist yet */ }
-
-  // 4. Read corridor_polygons.json for ~1km buffer around centerline
-  try {
-    const raw = await fs.readFile(path.join(sessionPath, 'corridor_polygons.json'), 'utf-8');
-    const polys = JSON.parse(raw);
-    if (Array.isArray(polys)) {
-      result.corridorPolygons = polys;
-    }
-  } catch { /* corridor polygons may not exist yet */ }
+  // Shared with the agent session view (services/generation/pipeline.js)
+  const result = await readMapOverlays(session.path);
 
   res.json(result);
 }));

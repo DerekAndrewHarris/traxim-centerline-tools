@@ -4,14 +4,10 @@
  */
 
 import express from 'express';
-import { generateGeometryForSegment } from '../services/geometry/generator.js';
-import { prefetchRelationWayIds } from '../services/osm/osmGeometry.js';
-import { generateRegionsCsv, readGeometryRegionNames, orderRegionNames, DEFAULTS_WARNING as REGIONS_DEFAULTS_WARNING } from '../services/regions/generator.js';
-import { REGION_COLOURS } from '../services/infrastructure/generator.js';
+import { buildGeometrySegments, runGeometryGeneration } from '../services/generation/pipeline.js';
 import jobQueue from '../utils/jobQueue.js';
 import { asyncHandler } from '../utils/errorHandler.js';
 import { getSession, getSessionFilePath } from '../utils/tempFiles.js';
-import path from 'path';
 import fs from 'fs/promises';
 
 const router = express.Router();
@@ -62,244 +58,21 @@ router.post('/generate', asyncHandler(async (req, res) => {
   }
   
   // Build segments from geocoded places + searchBboxes
-  const geocodedPlaces = sessionData.geocodedPlaces || [];
-  const segments = [];
-  for (let i = 0; i < searchBboxes.length; i++) {
-    const placeA = geocodedPlaces[i];
-    const placeB = geocodedPlaces[i + 1];
-    const labelA = placeA ? (placeA.stationName || placeA.place || `Place_${i}`) : `Place_${i}`;
-    const labelB = placeB ? (placeB.stationName || placeB.place || `Place_${i + 1}`) : `Place_${i + 1}`;
-    
-    // Find confirmed sections whose segmentIndices include this segment index
-    const relevantSections = confirmedSections.filter(
-      s => Array.isArray(s.segmentIndices) && s.segmentIndices.includes(i)
-    );
-    
-    segments.push({
-      label: `${labelA} - ${labelB}`,
-      bbox: searchBboxes[i],
-      startPoint: placeA ? { lat: placeA.lat, lon: placeA.lon } : null,
-      endPoint: placeB ? { lat: placeB.lat, lon: placeB.lon } : null,
-      sections: relevantSections
-    });
-  }
+  const segments = buildGeometrySegments(sessionData);
   
   console.log(`[Geometry API] Starting segment-based generation for session ${sessionId} (${segments.length} segments)`);
-  
-  // Create job
+
+  // Create job (the work itself is in services/generation/pipeline.js,
+  // shared with the agent's combined generation job)
   const jobId = jobQueue.createJob(
     'geometry-generation',
     {
       sessionId,
+      sessionPath: session.path,
       spacingMetres,
       segments
     },
-    async (data, updateProgress) => {
-      const { sessionId, spacingMetres, segments } = data;
-      const results = [];
-      const geometryDir = path.join(session.path, 'geometry');
-
-      // Remove the previous run's geometry outputs first. Otherwise a rerun
-      // in the same session (e.g. after re-confirming different places, or
-      // when a segment now has fewer alternative routes) leaves old files
-      // behind, and they would still be zipped for download and read by the
-      // infrastructure step, without matching rows in the new Regions.csv.
-      // Nothing in this folder is a cache: OSM caches live in the session root.
-      try {
-        for (const f of await fs.readdir(geometryDir)) {
-          if (f.endsWith('.csv') || f.endsWith('_topology.json')) {
-            await fs.unlink(path.join(geometryDir, f));
-          }
-        }
-      } catch (clearErr) {
-        if (clearErr.code !== 'ENOENT') {
-          console.warn(`[Geometry API] Could not clear old geometry files: ${clearErr.message}`);
-        }
-      }
-
-      // Pre-fetch relation way IDs once for all unique relations used across segments.
-      // This avoids repeating expensive Overpass family-expansion queries (one per
-      // unique relation, not once per segment × per relation).
-      const allSections = segments.flatMap(seg => seg.sections ?? []);
-      const relationWayIdCache = allSections.length > 0
-        ? await prefetchRelationWayIds(allSections)
-        : null;
-
-      // Process each segment (pair of adjacent places). Segments are generated in
-      // route order, one at a time — priorCenterlines accumulates each completed
-      // segment's own raw chain so later segments' alt-route detection can recognise
-      // "this candidate is just an earlier segment's mainline, walked backward past
-      // our shared waypoint" (see priorCenterlines doc in generator.js).
-      const priorCenterlines = [];
-      for (let i = 0; i < segments.length; i++) {
-        const segment = segments[i];
-
-        const segProgress = Math.floor((i / segments.length) * 100);
-        await updateProgress(
-          segProgress,
-          `Processing segment ${i + 1}/${segments.length}: ${segment.label}`
-        );
-
-        try {
-          const result = await generateGeometryForSegment(
-            segment.label,
-            segment.bbox,
-            geometryDir,
-            spacingMetres,
-            segment.startPoint,
-            segment.endPoint,
-            (progress, step) => {
-              const overallProgress = segProgress + Math.floor((progress / 100) * (100 / segments.length));
-              updateProgress(overallProgress, `${segment.label}: ${step}`);
-            },
-            segment.sections,
-            relationWayIdCache,
-            session.path,
-            priorCenterlines
-          );
-
-          // rawCoords is only for the next segments' alt-route detection — keep it
-          // out of the client-facing job result (it can be thousands of points).
-          const { rawCoords, ...publicResult } = result;
-          if (rawCoords) priorCenterlines.push(rawCoords);
-
-          results.push({
-            section: segment.label,
-            ...publicResult
-          });
-
-        } catch (error) {
-          console.error(`[Geometry API] Failed to generate geometry for segment '${segment.label}':`, error.message);
-          results.push({
-            section: segment.label,
-            error: error.message
-          });
-        }
-      }
-
-      // Regions.csv needs one row per geometry FILE actually produced, not per
-      // confirmed OSM relation - a segment's main centerline and each of its
-      // alternative routes are each their own file, each with its own region
-      // name in that file's own first column (see generator.js: segmentLabel /
-      // altLabel), and Traxim correlates Regions.csv rows to geometry files by
-      // that exact name. The names are read back from the files on disk, so a
-      // failed segment or a failed alternative route gets no row. Written to
-      // the session ROOT (not geometryDir) so it's naturally excluded from the
-      // geometry-only ZIP and naturally included in the "download all" ZIP.
-      // This is the ONLY writer of Regions.csv (the infrastructure step reads
-      // the same geometry files and must not rewrite it).
-      let regionsWarning = null;
-      let regionNames = [];
-      try {
-        regionNames = orderRegionNames(
-          await readGeometryRegionNames(geometryDir),
-          segments.map(s => s.label)
-        );
-      } catch (namesErr) {
-        console.error(`[Geometry API] Could not read region names from geometry files:`, namesErr);
-      }
-      console.log(`[Geometry API] Regions.csv: ${regionNames.length} region(s) from ${results.length} segment result(s) - ` +
-        regionNames.map(n => `"${n}"`).join(', '));
-      try {
-        const regionsCsv = generateRegionsCsv(regionNames, REGION_COLOURS);
-        const regionsPath = path.join(session.path, 'Regions.csv');
-        await fs.writeFile(regionsPath, regionsCsv, 'utf-8');
-        regionsWarning = REGIONS_DEFAULTS_WARNING;
-        console.log(`[Geometry API] Wrote Regions.csv to ${regionsPath} (${regionNames.length} region(s), ${regionsCsv.length} bytes)`);
-      } catch (regionsErr) {
-        console.error(`[Geometry API] Failed to write Regions.csv:`, regionsErr);
-      }
-
-      // Merge infrastructure-format topology from all segments and write a
-      // single osm_topology.json so the infrastructure pipeline can skip its
-      // own Overpass query.
-      try {
-        const seenWayIds = new Set();
-        const seenNodeIds = new Set();
-        const allWays = [];
-        const allTaggedNodes = [];
-
-        for (const r of results) {
-          if (!r.infraTopology) continue;
-          for (const w of r.infraTopology.ways) {
-            if (!seenWayIds.has(w.id)) { seenWayIds.add(w.id); allWays.push(w); }
-          }
-          for (const n of r.infraTopology.taggedNodes) {
-            if (!seenNodeIds.has(n.id)) { seenNodeIds.add(n.id); allTaggedNodes.push(n); }
-          }
-        }
-
-        if (allWays.length > 0) {
-          const topoPath = path.join(session.path, 'osm_topology.json');
-          await fs.writeFile(topoPath, JSON.stringify({ ways: allWays, taggedNodes: allTaggedNodes }), 'utf-8');
-          console.log(`[Geometry API] Wrote osm_topology.json (${allWays.length} ways, ${allTaggedNodes.length} tagged nodes)`);
-        }
-      } catch (topoErr) {
-        console.warn(`[Geometry API] Failed to write osm_topology.json: ${topoErr.message}`);
-      }
-
-      // Strip infraTopology from results before returning (large payload)
-      for (const r of results) delete r.infraTopology;
-
-      // Update session metadata with real corridorBboxes derived from centerline
-      // geometry (replacing the preliminary ones set at /confirm from searchBboxes).
-      // Also write corridor_polygons.json for map visualization.
-      try {
-        const corridorBboxes = [];
-        const corridorPolygons = [];
-        for (const r of results) {
-          if (r.corridorBbox) corridorBboxes.push(r.corridorBbox);
-          if (r.bufferPolygon && r.bufferPolygon.length > 0) corridorPolygons.push(r.bufferPolygon);
-        }
-
-        if (corridorBboxes.length > 0) {
-          const freshData = JSON.parse(await fs.readFile(sessionPath, 'utf-8'));
-          // Assign corridorBbox per confirmedSection based on its segmentIndices
-          if (freshData.confirmedSections) {
-            for (const cs of freshData.confirmedSections) {
-              const relevant = (cs.segmentIndices || [])
-                .filter(idx => idx < corridorBboxes.length)
-                .map(idx => corridorBboxes[idx]);
-              if (relevant.length > 0) {
-                cs.corridorBbox = {
-                  minLat: Math.min(...relevant.map(b => b.minLat)),
-                  maxLat: Math.max(...relevant.map(b => b.maxLat)),
-                  minLon: Math.min(...relevant.map(b => b.minLon)),
-                  maxLon: Math.max(...relevant.map(b => b.maxLon))
-                };
-              }
-            }
-          }
-          freshData.corridorBboxes = corridorBboxes;
-          await fs.writeFile(sessionPath, JSON.stringify(freshData, null, 2), 'utf-8');
-          console.log(`[Geometry API] Updated session with ${corridorBboxes.length} real corridorBbox(es)`);
-        }
-
-        if (corridorPolygons.length > 0) {
-          const polyPath = path.join(session.path, 'corridor_polygons.json');
-          await fs.writeFile(polyPath, JSON.stringify(corridorPolygons), 'utf-8');
-          console.log(`[Geometry API] Wrote corridor_polygons.json (${corridorPolygons.length} polygon(s))`);
-        }
-      } catch (cbErr) {
-        console.warn(`[Geometry API] Failed to update corridorBbox: ${cbErr.message}`);
-      }
-
-      // Strip corridor data from results (already persisted)
-      for (const r of results) {
-        delete r.corridorBbox;
-        delete r.bufferPolygon;
-      }
-      
-      await updateProgress(100, 'All segments processed');
-      
-      return {
-        sessionId,
-        totalSections: segments.length,
-        successfulSections: results.filter(r => !r.error).length,
-        results,
-        regionsWarning
-      };
-    }
+    (data, updateProgress) => runGeometryGeneration(data, updateProgress)
   );
   
   res.json({

@@ -1,0 +1,495 @@
+/**
+ * Generation pipeline: the work behind the geometry and infrastructure jobs.
+ *
+ * Moved here (October 2026) from the bodies of the two route handlers in
+ * routes/geometry.js and routes/infrastructure.js, unchanged, so that the
+ * website's two separate jobs and the agent's single combined job
+ * (services/agent/agentSessions.js) run exactly the same code.
+ */
+
+import path from 'path';
+import fs from 'fs/promises';
+import fsSync from 'fs';
+import { generateGeometryForSegment } from '../geometry/generator.js';
+import { prefetchRelationWayIds } from '../osm/osmGeometry.js';
+import { generateRegionsCsv, readGeometryRegionNames, orderRegionNames, DEFAULTS_WARNING as REGIONS_DEFAULTS_WARNING } from '../regions/generator.js';
+import { REGION_COLOURS, generateInfrastructureForSections } from '../infrastructure/generator.js';
+import { updateSessionMetadata } from '../../utils/tempFiles.js';
+
+/**
+ * Error thrown when a generated network has more nodes than allowed.
+ * Only the agent job sets a limit; the website has none.
+ */
+export class NodeLimitError extends Error {
+  constructor(nodeCount, maxNodes) {
+    super(
+      `The generated network has ${nodeCount} nodes, more than the limit of ${maxNodes} for one generation. ` +
+      `No files were produced. Split the route into smaller parts (fewer waypoints, or fewer sections per ` +
+      `session) and generate each part separately; the parts can be joined afterwards in the Network Editor.`
+    );
+    this.name = 'NodeLimitError';
+    this.nodeCount = nodeCount;
+    this.maxNodes = maxNodes;
+  }
+}
+
+/**
+ * Enrich the user's selected sections with the data the search found
+ * (altOsmId, segmentIndices, wayIds...) and a preliminary corridor box.
+ * Same logic the website's POST /geography/confirm has always used.
+ *
+ * @param {Array<{osmId, osmType, name?}>} selectedSections
+ * @param {Array<object>} candidateSections - from session.json
+ * @param {Array<{minLat,minLon,maxLat,maxLon}>} searchBboxes - from session.json
+ * @returns {Array<object>} confirmedSections
+ */
+export function enrichConfirmedSections(selectedSections, candidateSections, searchBboxes) {
+  return selectedSections.map(sel => {
+    // Find matching candidate to get altOsmId, segmentIndices, wayIds, etc.
+    const candidate = candidateSections.find(
+      c => String(c.osmId) === String(sel.osmId) && c.osmType === sel.osmType
+    );
+
+    const enriched = {
+      osmId: sel.osmId,
+      osmType: sel.osmType,
+      name: sel.name || (candidate ? candidate.name : `Section_${sel.osmId}`),
+      ...(candidate ? {
+        altOsmId: candidate.altOsmId || undefined,
+        type: candidate.type,
+        operator: candidate.operator,
+        ref: candidate.ref,
+        wayIds: candidate.wayIds,
+        segmentIndices: candidate.segmentIndices
+      } : {})
+    };
+
+    // Compute corridorBbox from searchBboxes + segmentIndices
+    const indices = enriched.segmentIndices || [0];
+    const relevantBboxes = indices
+      .filter(i => i < searchBboxes.length)
+      .map(i => searchBboxes[i]);
+
+    if (relevantBboxes.length > 0) {
+      enriched.corridorBbox = {
+        minLat: Math.min(...relevantBboxes.map(b => b.minLat)),
+        minLon: Math.min(...relevantBboxes.map(b => b.minLon)),
+        maxLat: Math.max(...relevantBboxes.map(b => b.maxLat)),
+        maxLon: Math.max(...relevantBboxes.map(b => b.maxLon))
+      };
+    }
+
+    return enriched;
+  });
+}
+
+/**
+ * One segment per pair of consecutive waypoints, with the confirmed sections
+ * that the section search found in that segment's box.
+ * @param {object} sessionData - parsed session.json
+ * @returns {Array<{label, bbox, startPoint, endPoint, sections}>}
+ */
+export function buildGeometrySegments(sessionData) {
+  const confirmedSections = sessionData.confirmedSections || [];
+  const searchBboxes = sessionData.searchBboxes || [];
+  const geocodedPlaces = sessionData.geocodedPlaces || [];
+  const segments = [];
+  for (let i = 0; i < searchBboxes.length; i++) {
+    const placeA = geocodedPlaces[i];
+    const placeB = geocodedPlaces[i + 1];
+    const labelA = placeA ? (placeA.stationName || placeA.place || `Place_${i}`) : `Place_${i}`;
+    const labelB = placeB ? (placeB.stationName || placeB.place || `Place_${i + 1}`) : `Place_${i + 1}`;
+
+    // Find confirmed sections whose segmentIndices include this segment index
+    const relevantSections = confirmedSections.filter(
+      s => Array.isArray(s.segmentIndices) && s.segmentIndices.includes(i)
+    );
+
+    segments.push({
+      label: `${labelA} - ${labelB}`,
+      bbox: searchBboxes[i],
+      startPoint: placeA ? { lat: placeA.lat, lon: placeA.lon } : null,
+      endPoint: placeB ? { lat: placeB.lat, lon: placeB.lon } : null,
+      sections: relevantSections
+    });
+  }
+  return segments;
+}
+
+/**
+ * The geometry job: geometry CSVs (main route + _altN per segment),
+ * Regions.csv, osm_topology.json and corridor data.
+ *
+ * @param {{sessionId: string, sessionPath: string, spacingMetres: number, segments: Array}} data
+ * @param {(progress: number, step: string) => void} updateProgress
+ * @returns {Promise<{sessionId, totalSections, successfulSections, results, regionsWarning}>}
+ */
+export async function runGeometryGeneration(data, updateProgress) {
+  const { sessionId, sessionPath: sessionDirPath, spacingMetres, segments } = data;
+  const results = [];
+  const geometryDir = path.join(sessionDirPath, 'geometry');
+  const sessionPath = path.join(sessionDirPath, 'session.json');
+
+  // Remove the previous run's geometry outputs first. Otherwise a rerun
+  // in the same session (e.g. after re-confirming different places, or
+  // when a segment now has fewer alternative routes) leaves old files
+  // behind, and they would still be zipped for download and read by the
+  // infrastructure step, without matching rows in the new Regions.csv.
+  // Nothing in this folder is a cache: OSM caches live in the session root.
+  try {
+    for (const f of await fs.readdir(geometryDir)) {
+      if (f.endsWith('.csv') || f.endsWith('_topology.json')) {
+        await fs.unlink(path.join(geometryDir, f));
+      }
+    }
+  } catch (clearErr) {
+    if (clearErr.code !== 'ENOENT') {
+      console.warn(`[Geometry API] Could not clear old geometry files: ${clearErr.message}`);
+    }
+  }
+
+  // Pre-fetch relation way IDs once for all unique relations used across segments.
+  // This avoids repeating expensive Overpass family-expansion queries (one per
+  // unique relation, not once per segment × per relation).
+  const allSections = segments.flatMap(seg => seg.sections ?? []);
+  const relationWayIdCache = allSections.length > 0
+    ? await prefetchRelationWayIds(allSections)
+    : null;
+
+  // Process each segment (pair of adjacent places). Segments are generated in
+  // route order, one at a time — priorCenterlines accumulates each completed
+  // segment's own raw chain so later segments' alt-route detection can recognise
+  // "this candidate is just an earlier segment's mainline, walked backward past
+  // our shared waypoint" (see priorCenterlines doc in generator.js).
+  const priorCenterlines = [];
+  for (let i = 0; i < segments.length; i++) {
+    const segment = segments[i];
+
+    const segProgress = Math.floor((i / segments.length) * 100);
+    await updateProgress(
+      segProgress,
+      `Processing segment ${i + 1}/${segments.length}: ${segment.label}`
+    );
+
+    try {
+      const result = await generateGeometryForSegment(
+        segment.label,
+        segment.bbox,
+        geometryDir,
+        spacingMetres,
+        segment.startPoint,
+        segment.endPoint,
+        (progress, step) => {
+          const overallProgress = segProgress + Math.floor((progress / 100) * (100 / segments.length));
+          updateProgress(overallProgress, `${segment.label}: ${step}`);
+        },
+        segment.sections,
+        relationWayIdCache,
+        sessionDirPath,
+        priorCenterlines
+      );
+
+      // rawCoords is only for the next segments' alt-route detection — keep it
+      // out of the client-facing job result (it can be thousands of points).
+      const { rawCoords, ...publicResult } = result;
+      if (rawCoords) priorCenterlines.push(rawCoords);
+
+      results.push({
+        section: segment.label,
+        ...publicResult
+      });
+
+    } catch (error) {
+      console.error(`[Geometry API] Failed to generate geometry for segment '${segment.label}':`, error.message);
+      results.push({
+        section: segment.label,
+        error: error.message
+      });
+    }
+  }
+
+  // Regions.csv needs one row per geometry FILE actually produced, not per
+  // confirmed OSM relation - a segment's main centerline and each of its
+  // alternative routes are each their own file, each with its own region
+  // name in that file's own first column (see generator.js: segmentLabel /
+  // altLabel), and Traxim correlates Regions.csv rows to geometry files by
+  // that exact name. The names are read back from the files on disk, so a
+  // failed segment or a failed alternative route gets no row. Written to
+  // the session ROOT (not geometryDir) so it's naturally excluded from the
+  // geometry-only ZIP and naturally included in the "download all" ZIP.
+  // This is the ONLY writer of Regions.csv (the infrastructure step reads
+  // the same geometry files and must not rewrite it).
+  let regionsWarning = null;
+  let regionNames = [];
+  try {
+    regionNames = orderRegionNames(
+      await readGeometryRegionNames(geometryDir),
+      segments.map(s => s.label)
+    );
+  } catch (namesErr) {
+    console.error(`[Geometry API] Could not read region names from geometry files:`, namesErr);
+  }
+  console.log(`[Geometry API] Regions.csv: ${regionNames.length} region(s) from ${results.length} segment result(s) - ` +
+    regionNames.map(n => `"${n}"`).join(', '));
+  try {
+    const regionsCsv = generateRegionsCsv(regionNames, REGION_COLOURS);
+    const regionsPath = path.join(sessionDirPath, 'Regions.csv');
+    await fs.writeFile(regionsPath, regionsCsv, 'utf-8');
+    regionsWarning = REGIONS_DEFAULTS_WARNING;
+    console.log(`[Geometry API] Wrote Regions.csv to ${regionsPath} (${regionNames.length} region(s), ${regionsCsv.length} bytes)`);
+  } catch (regionsErr) {
+    console.error(`[Geometry API] Failed to write Regions.csv:`, regionsErr);
+  }
+
+  // Merge infrastructure-format topology from all segments and write a
+  // single osm_topology.json so the infrastructure pipeline can skip its
+  // own Overpass query.
+  try {
+    const seenWayIds = new Set();
+    const seenNodeIds = new Set();
+    const allWays = [];
+    const allTaggedNodes = [];
+
+    for (const r of results) {
+      if (!r.infraTopology) continue;
+      for (const w of r.infraTopology.ways) {
+        if (!seenWayIds.has(w.id)) { seenWayIds.add(w.id); allWays.push(w); }
+      }
+      for (const n of r.infraTopology.taggedNodes) {
+        if (!seenNodeIds.has(n.id)) { seenNodeIds.add(n.id); allTaggedNodes.push(n); }
+      }
+    }
+
+    if (allWays.length > 0) {
+      const topoPath = path.join(sessionDirPath, 'osm_topology.json');
+      await fs.writeFile(topoPath, JSON.stringify({ ways: allWays, taggedNodes: allTaggedNodes }), 'utf-8');
+      console.log(`[Geometry API] Wrote osm_topology.json (${allWays.length} ways, ${allTaggedNodes.length} tagged nodes)`);
+    }
+  } catch (topoErr) {
+    console.warn(`[Geometry API] Failed to write osm_topology.json: ${topoErr.message}`);
+  }
+
+  // Strip infraTopology from results before returning (large payload)
+  for (const r of results) delete r.infraTopology;
+
+  // Update session metadata with real corridorBboxes derived from centerline
+  // geometry (replacing the preliminary ones set at /confirm from searchBboxes).
+  // Also write corridor_polygons.json for map visualization.
+  try {
+    const corridorBboxes = [];
+    const corridorPolygons = [];
+    for (const r of results) {
+      if (r.corridorBbox) corridorBboxes.push(r.corridorBbox);
+      if (r.bufferPolygon && r.bufferPolygon.length > 0) corridorPolygons.push(r.bufferPolygon);
+    }
+
+    if (corridorBboxes.length > 0) {
+      const freshData = JSON.parse(await fs.readFile(sessionPath, 'utf-8'));
+      // Assign corridorBbox per confirmedSection based on its segmentIndices
+      if (freshData.confirmedSections) {
+        for (const cs of freshData.confirmedSections) {
+          const relevant = (cs.segmentIndices || [])
+            .filter(idx => idx < corridorBboxes.length)
+            .map(idx => corridorBboxes[idx]);
+          if (relevant.length > 0) {
+            cs.corridorBbox = {
+              minLat: Math.min(...relevant.map(b => b.minLat)),
+              maxLat: Math.max(...relevant.map(b => b.maxLat)),
+              minLon: Math.min(...relevant.map(b => b.minLon)),
+              maxLon: Math.max(...relevant.map(b => b.maxLon))
+            };
+          }
+        }
+      }
+      freshData.corridorBboxes = corridorBboxes;
+      await fs.writeFile(sessionPath, JSON.stringify(freshData, null, 2), 'utf-8');
+      console.log(`[Geometry API] Updated session with ${corridorBboxes.length} real corridorBbox(es)`);
+    }
+
+    if (corridorPolygons.length > 0) {
+      const polyPath = path.join(sessionDirPath, 'corridor_polygons.json');
+      await fs.writeFile(polyPath, JSON.stringify(corridorPolygons), 'utf-8');
+      console.log(`[Geometry API] Wrote corridor_polygons.json (${corridorPolygons.length} polygon(s))`);
+    }
+  } catch (cbErr) {
+    console.warn(`[Geometry API] Failed to update corridorBbox: ${cbErr.message}`);
+  }
+
+  // Strip corridor data from results (already persisted)
+  for (const r of results) {
+    delete r.corridorBbox;
+    delete r.bufferPolygon;
+  }
+
+  await updateProgress(100, 'All segments processed');
+
+  return {
+    sessionId,
+    totalSections: segments.length,
+    successfulSections: results.filter(r => !r.error).length,
+    results,
+    regionsWarning
+  };
+}
+
+/**
+ * Merge all search boxes into one "minLat,minLon,maxLat,maxLon" string for
+ * the infrastructure step's Overpass queries.
+ * @param {Array<object|string>} searchBboxes
+ * @returns {string}
+ */
+export function mergeSearchBboxes(searchBboxes) {
+  let minLat = Infinity, minLon = Infinity, maxLat = -Infinity, maxLon = -Infinity;
+  for (const bbox of searchBboxes) {
+    // bbox may be an object {minLat,minLon,maxLat,maxLon} or a "minLat,minLon,maxLat,maxLon" string
+    if (typeof bbox === 'string') {
+      const parts = bbox.split(',').map(parseFloat);
+      minLat = Math.min(minLat, parts[0]); minLon = Math.min(minLon, parts[1]);
+      maxLat = Math.max(maxLat, parts[2]); maxLon = Math.max(maxLon, parts[3]);
+    } else {
+      minLat = Math.min(minLat, bbox.minLat); minLon = Math.min(minLon, bbox.minLon);
+      maxLat = Math.max(maxLat, bbox.maxLat); maxLon = Math.max(maxLon, bbox.maxLon);
+    }
+  }
+  return `${minLat},${minLon},${maxLat},${maxLon}`;
+}
+
+/**
+ * The infrastructure job: Infrastructure.csv from the geometry files and
+ * the OSM topology. Regions.csv is deliberately NOT written here (see the
+ * comment below).
+ *
+ * @param {{sessionId, sessionPath, confirmedSections, networkName, geometryDir, bbox, maxNodes?}} jobData
+ *   maxNodes: optional node limit (agent jobs only). When the network has
+ *   more nodes, a NodeLimitError is thrown and Infrastructure.csv is not written.
+ * @param {(progress: number, step: string) => void} progressCallback
+ * @param {Function} [generate] - the generator (tests pass a stand-in)
+ */
+export async function runInfrastructureGeneration(jobData, progressCallback, generate = generateInfrastructureForSections) {
+  const { sessionId, confirmedSections, networkName, geometryDir, bbox, sessionPath, maxNodes } = jobData;
+
+  // Generate infrastructure
+  const result = await generate(
+    confirmedSections,
+    networkName,
+    geometryDir,
+    bbox,
+    progressCallback,
+    sessionPath
+  );
+
+  if (maxNodes && result.nodeCount > maxNodes) {
+    throw new NodeLimitError(result.nodeCount, maxNodes);
+  }
+
+  // Write Infrastructure.csv to session directory
+  const outputPath = path.join(sessionPath, 'Infrastructure.csv');
+  fsSync.writeFileSync(outputPath, result.csv, 'utf-8');
+
+  // Regions.csv is deliberately NOT written here. The geometry step writes
+  // it with one row per geometry file (main routes and each `_altN`
+  // alternative), named exactly as in those files, and this step's
+  // Infrastructure.csv uses those same names (it reads them from the same
+  // geometry files). Rewriting it here from the confirmed OSM sections
+  // used to replace those rows with relation names that match neither
+  // the geometry files nor Infrastructure.csv, and dropped the `_altN` rows.
+
+  // Update session metadata
+  await updateSessionMetadata(sessionId, {
+    infrastructureGenerated: true,
+    infrastructureFile: 'Infrastructure.csv',
+    infrastructureTimestamp: new Date().toISOString(),
+    infrastructureNodeCount: result.nodeCount,
+    infrastructureConnectionCount: result.connectionCount,
+    infrastructureWarnings: result.warnings
+  });
+
+  return {
+    filePath: outputPath,
+    fileName: 'Infrastructure.csv',
+    regionsFile: 'Regions.csv',
+    nodeCount: result.nodeCount,
+    connectionCount: result.connectionCount,
+    warnings: result.warnings
+  };
+}
+
+/**
+ * Map overlay data for a session: search boxes, corridor boxes, generated
+ * geometry lines, OSM topology ways and corridor polygons. Used by the
+ * website's GET /sessions/:id/map-overlays and by the agent session view.
+ * @param {string} sessionPath - session folder
+ */
+export async function readMapOverlays(sessionPath) {
+  const result = { searchBboxes: [], corridorBboxes: [], geometryLines: [], topologyWays: [], corridorPolygons: [] };
+
+  // 1. Read session.json for bboxes & confirmed section metadata
+  try {
+    const raw = await fs.readFile(path.join(sessionPath, 'session.json'), 'utf-8');
+    const meta = JSON.parse(raw);
+
+    if (Array.isArray(meta.searchBboxes)) {
+      result.searchBboxes = meta.searchBboxes;
+    }
+
+    // Corridor bboxes from confirmed sections
+    if (Array.isArray(meta.confirmedSections)) {
+      for (const sec of meta.confirmedSections) {
+        if (sec.corridorBbox) {
+          result.corridorBboxes.push({ name: sec.name, bbox: sec.corridorBbox });
+        }
+      }
+    }
+  } catch { /* session.json may not exist yet */ }
+
+  // 2. Read geometry CSVs for centerline + alt polylines
+  const geometryDir = path.join(sessionPath, 'geometry');
+  try {
+    const files = await fs.readdir(geometryDir);
+    const csvFiles = files.filter(f => f.endsWith('.csv') && !f.includes('_wayids'));
+    for (const csvFile of csvFiles) {
+      const content = await fs.readFile(path.join(geometryDir, csvFile), 'utf-8');
+      const coords = [];
+      for (const line of content.split('\n')) {
+        const parts = line.split(',');
+        // CSV columns vary; lat is index 1, lon is index 2 in the standard geometry CSV
+        const lat = parseFloat(parts[1]);
+        const lon = parseFloat(parts[2]);
+        if (isFinite(lat) && isFinite(lon)) coords.push([lat, lon]);
+      }
+      if (coords.length >= 2) {
+        const label = csvFile.replace(/\.csv$/, '').replace(/_/g, ' ');
+        const isAlt = /_alt\d+$/.test(csvFile.replace(/\.csv$/, ''));
+        result.geometryLines.push({ label, isAlt, coords });
+      }
+    }
+  } catch { /* geometry dir may not exist yet */ }
+
+  // 3. Read osm_topology.json for raw OSM way polylines
+  try {
+    const raw = await fs.readFile(path.join(sessionPath, 'osm_topology.json'), 'utf-8');
+    const topo = JSON.parse(raw);
+    if (Array.isArray(topo.ways)) {
+      for (const w of topo.ways) {
+        if (Array.isArray(w.coords) && w.coords.length >= 2) {
+          result.topologyWays.push({
+            id: w.id,
+            coords: w.coords.map(c => [c.lat, c.lon]),
+            tags: w.tags || {}
+          });
+        }
+      }
+    }
+  } catch { /* topology file may not exist yet */ }
+
+  // 4. Read corridor_polygons.json for ~1km buffer around centerline
+  try {
+    const raw = await fs.readFile(path.join(sessionPath, 'corridor_polygons.json'), 'utf-8');
+    const polys = JSON.parse(raw);
+    if (Array.isArray(polys)) {
+      result.corridorPolygons = polys;
+    }
+  } catch { /* corridor polygons may not exist yet */ }
+
+  return result;
+}

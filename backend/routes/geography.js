@@ -9,6 +9,7 @@ import { geocodePlace, reverseGeocodePlace } from '../services/osm/geocoding.js'
 import { queryRailwaySections } from '../services/osm/sections.js';
 import { asyncHandler } from '../utils/errorHandler.js';
 import { getSession, getSessionFilePath, updateSessionMetadata } from '../utils/tempFiles.js';
+import { enrichConfirmedSections } from '../services/generation/pipeline.js';
 
 const router = express.Router();
 
@@ -268,44 +269,9 @@ router.post('/confirm', asyncHandler(async (req, res) => {
   const candidateSections = sessionData.candidateSections || [];
   const searchBboxes = sessionData.searchBboxes || [];
   
-  // Enrich selected sections with data from candidateSections
-  const confirmedSections = selectedSections.map(sel => {
-    // Find matching candidate to get altOsmId, segmentIndices, wayIds, etc.
-    const candidate = candidateSections.find(
-      c => String(c.osmId) === String(sel.osmId) && c.osmType === sel.osmType
-    );
-    
-    const enriched = {
-      osmId: sel.osmId,
-      osmType: sel.osmType,
-      name: sel.name || (candidate ? candidate.name : `Section_${sel.osmId}`),
-      ...(candidate ? {
-        altOsmId: candidate.altOsmId || undefined,
-        type: candidate.type,
-        operator: candidate.operator,
-        ref: candidate.ref,
-        wayIds: candidate.wayIds,
-        segmentIndices: candidate.segmentIndices
-      } : {})
-    };
-    
-    // Compute corridorBbox from searchBboxes + segmentIndices
-    const indices = enriched.segmentIndices || [0];
-    const relevantBboxes = indices
-      .filter(i => i < searchBboxes.length)
-      .map(i => searchBboxes[i]);
-    
-    if (relevantBboxes.length > 0) {
-      enriched.corridorBbox = {
-        minLat: Math.min(...relevantBboxes.map(b => b.minLat)),
-        minLon: Math.min(...relevantBboxes.map(b => b.minLon)),
-        maxLat: Math.max(...relevantBboxes.map(b => b.maxLat)),
-        maxLon: Math.max(...relevantBboxes.map(b => b.maxLon))
-      };
-    }
-    
-    return enriched;
-  });
+  // Enrich selected sections with data from candidateSections (shared with
+  // the agent's confirm step: services/generation/pipeline.js)
+  const confirmedSections = enrichConfirmedSections(selectedSections, candidateSections, searchBboxes);
   
   // Store confirmed sections in session metadata
   await updateSessionMetadata(sessionId, {

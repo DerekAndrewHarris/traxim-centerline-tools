@@ -9,11 +9,11 @@
 import express from 'express';
 import path from 'path';
 import fs from 'fs';
-import { getSession, getSessionFilePath, updateSessionMetadata } from '../utils/tempFiles.js';
+import { getSession, getSessionFilePath } from '../utils/tempFiles.js';
 import { promises as fsAsync } from 'fs';
 import jobQueue from '../utils/jobQueue.js';
 import { asyncHandler, AppError } from '../utils/errorHandler.js';
-import { generateInfrastructureForSections } from '../services/infrastructure/generator.js';
+import { mergeSearchBboxes, runInfrastructureGeneration } from '../services/generation/pipeline.js';
 
 const router = express.Router();
 
@@ -88,21 +88,10 @@ router.post('/generate', asyncHandler(async (req, res) => {
   }
 
   // Merge all bounding boxes into a single bbox for Overpass query
-  let minLat = Infinity, minLon = Infinity, maxLat = -Infinity, maxLon = -Infinity;
-  for (const bbox of searchBboxes) {
-    // bbox may be an object {minLat,minLon,maxLat,maxLon} or a "minLat,minLon,maxLat,maxLon" string
-    if (typeof bbox === 'string') {
-      const parts = bbox.split(',').map(parseFloat);
-      minLat = Math.min(minLat, parts[0]); minLon = Math.min(minLon, parts[1]);
-      maxLat = Math.max(maxLat, parts[2]); maxLon = Math.max(maxLon, parts[3]);
-    } else {
-      minLat = Math.min(minLat, bbox.minLat); minLon = Math.min(minLon, bbox.minLon);
-      maxLat = Math.max(maxLat, bbox.maxLat); maxLon = Math.max(maxLon, bbox.maxLon);
-    }
-  }
-  const mergedBbox = `${minLat},${minLon},${maxLat},${maxLon}`;
+  const mergedBbox = mergeSearchBboxes(searchBboxes);
 
-  // Create background job
+  // Create background job (the work itself is in
+  // services/generation/pipeline.js, shared with the agent's combined job)
   const jobId = jobQueue.createJob(
     'infrastructure-generation',
     {
@@ -113,50 +102,7 @@ router.post('/generate', asyncHandler(async (req, res) => {
       bbox: mergedBbox,
       sessionPath: session.path
     },
-    async (jobData, progressCallback) => {
-      const { confirmedSections, networkName, geometryDir, bbox, sessionPath } = jobData;
-
-      // Generate infrastructure
-      const result = await generateInfrastructureForSections(
-        confirmedSections,
-        networkName,
-        geometryDir,
-        bbox,
-        progressCallback,
-        sessionPath
-      );
-
-      // Write Infrastructure.csv to session directory
-      const outputPath = path.join(sessionPath, 'Infrastructure.csv');
-      fs.writeFileSync(outputPath, result.csv, 'utf-8');
-
-      // Regions.csv is deliberately NOT written here. The geometry step writes
-      // it with one row per geometry file (main routes and each `_altN`
-      // alternative), named exactly as in those files, and this step's
-      // Infrastructure.csv uses those same names (it reads them from the same
-      // geometry files). Rewriting it here from the confirmed OSM sections
-      // used to replace those rows with relation names that match neither
-      // the geometry files nor Infrastructure.csv, and dropped the `_altN` rows.
-
-      // Update session metadata
-      await updateSessionMetadata(sessionId, {
-        infrastructureGenerated: true,
-        infrastructureFile: 'Infrastructure.csv',
-        infrastructureTimestamp: new Date().toISOString(),
-        infrastructureNodeCount: result.nodeCount,
-        infrastructureConnectionCount: result.connectionCount,
-        infrastructureWarnings: result.warnings
-      });
-
-      return {
-        filePath: outputPath,
-        fileName: 'Infrastructure.csv',
-        regionsFile: 'Regions.csv',
-        nodeCount: result.nodeCount,
-        connectionCount: result.connectionCount,
-        warnings: result.warnings
-      };
-    }
+    (jobData, progressCallback) => runInfrastructureGeneration(jobData, progressCallback)
   );
 
   res.json({
