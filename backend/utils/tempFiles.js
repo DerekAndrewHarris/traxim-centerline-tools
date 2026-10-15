@@ -5,6 +5,7 @@
 
 import { randomUUID } from 'crypto';
 import fs from 'fs/promises';
+import fsSync from 'fs';
 import os from 'os';
 import path from 'path';
 import { fileURLToPath } from 'url';
@@ -16,11 +17,37 @@ const __dirname = path.dirname(__filename);
 const TEMP_FILES_DIR = process.env.TEMP_FILES_DIR || path.join(os.tmpdir(), 'traxim-temp-sessions');
 const SESSION_EXPIRY_HOURS = parseInt(process.env.SESSION_EXPIRY_HOURS || '24', 10);
 
+// Session ids are always crypto.randomUUID() values. Anything else (for
+// example '..', which path.join would turn into the parent folder) is
+// treated as "no such session" everywhere, before any path is built from it.
+const SESSION_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+
+/**
+ * True if the value has the shape of a session id (a lower-case UUID).
+ * @param {unknown} sessionId
+ * @returns {boolean}
+ */
+export function isValidSessionId(sessionId) {
+  return typeof sessionId === 'string' && SESSION_ID_PATTERN.test(sessionId);
+}
+
+/**
+ * Absolute folder of a session. Throws for anything that is not a session id.
+ * @param {string} sessionId
+ * @returns {string}
+ */
+function sessionDir(sessionId) {
+  if (!isValidSessionId(sessionId)) {
+    throw new Error('Invalid session id');
+  }
+  return path.join(TEMP_FILES_DIR, sessionId);
+}
+
 /**
  * Create a new temporary session
  * @returns {Promise<{id: string, path: string, createdAt: Date, expiresAt: Date}>}
  */
-export async function createSession() {
+export async function createSession(extraMetadata = null) {
   const sessionId = randomUUID();
   const sessionPath = path.join(TEMP_FILES_DIR, sessionId);
   
@@ -33,11 +60,14 @@ export async function createSession() {
   const expiresAt = new Date(createdAt.getTime() + SESSION_EXPIRY_HOURS * 60 * 60 * 1000);
   
   // Write session metadata
+  // extraMetadata is only used by the agent routes (it holds the 'agent'
+  // block with the owner). Sessions created by the website have none.
   const sessionInfo = {
     id: sessionId,
     createdAt: createdAt.toISOString(),
     expiresAt: expiresAt.toISOString(),
-    files: []
+    files: [],
+    ...(extraMetadata || {})
   };
   
   await fs.writeFile(
@@ -61,8 +91,11 @@ export async function createSession() {
  * @returns {Promise<{id: string, path: string, exists: boolean, createdAt?: Date, expiresAt?: Date, files?: string[]}>}
  */
 export async function getSession(sessionId) {
+  if (!isValidSessionId(sessionId)) {
+    return { id: String(sessionId), path: null, exists: false };
+  }
   const sessionPath = path.join(TEMP_FILES_DIR, sessionId);
-  
+
   try {
     await fs.access(sessionPath);
     
@@ -123,9 +156,15 @@ async function listSessionFiles(sessionPath) {
  * @returns {Promise<boolean>} True if deleted, false if not found
  */
 export async function deleteSession(sessionId) {
+  if (!isValidSessionId(sessionId)) {
+    return false;
+  }
   const sessionPath = path.join(TEMP_FILES_DIR, sessionId);
-  
+
   try {
+    // fs.rm with force:true does not fail on a missing folder, so check first
+    // (otherwise deleting an unknown id reported success).
+    await fs.access(sessionPath);
     await fs.rm(sessionPath, { recursive: true, force: true });
     console.log(`[Session] Deleted: ${sessionId}`);
     return true;
@@ -194,15 +233,66 @@ export async function cleanupOldSessions() {
  * @throws {Error} If path traversal detected
  */
 export function getSessionFilePath(sessionId, filename) {
-  const sessionPath = path.join(TEMP_FILES_DIR, sessionId);
+  const sessionPath = sessionDir(sessionId);
   const filePath = path.join(sessionPath, filename);
-  
-  // Prevent path traversal attacks
-  if (!filePath.startsWith(sessionPath)) {
+
+  // Prevent path traversal attacks (path.relative, so a sibling folder whose
+  // name merely starts with the session id is not treated as inside it)
+  const relative = path.relative(sessionPath, filePath);
+  if (!relative || relative.startsWith('..') || path.isAbsolute(relative)) {
     throw new Error('Invalid file path');
   }
-  
+
   return filePath;
+}
+
+/**
+ * Read a session's session.json synchronously, or null if the session does
+ * not exist (or the id is not a session id).
+ * @param {string} sessionId
+ * @returns {object|null}
+ */
+export function readSessionMetadataSync(sessionId) {
+  if (!isValidSessionId(sessionId)) return null;
+  try {
+    return JSON.parse(fsSync.readFileSync(path.join(TEMP_FILES_DIR, sessionId, 'session.json'), 'utf-8'));
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Change a session's 'agent' block (owner, confirmation, generation state).
+ * Synchronous read-change-write, so no other request can interleave with it.
+ * Only the 'agent' key is rewritten from the fresh file; other keys are kept
+ * exactly as they are on disk.
+ * @param {string} sessionId
+ * @param {(agent: object, meta: object) => void} change - edits 'agent' in place
+ * @returns {object} the updated agent block
+ */
+export function updateAgentMetadataSync(sessionId, change) {
+  const file = path.join(sessionDir(sessionId), 'session.json');
+  const meta = JSON.parse(fsSync.readFileSync(file, 'utf-8'));
+  const agent = meta.agent || {};
+  change(agent, meta);
+  meta.agent = agent;
+  meta.lastUpdated = new Date().toISOString();
+  fsSync.writeFileSync(file, JSON.stringify(meta, null, 2));
+  return agent;
+}
+
+/**
+ * Ids of every session folder currently on disk (valid ids only).
+ * @returns {string[]}
+ */
+export function listSessionIdsSync() {
+  try {
+    return fsSync.readdirSync(TEMP_FILES_DIR, { withFileTypes: true })
+      .filter(e => e.isDirectory() && isValidSessionId(e.name))
+      .map(e => e.name);
+  } catch {
+    return [];
+  }
 }
 
 /**
@@ -212,7 +302,7 @@ export function getSessionFilePath(sessionId, filename) {
  * @returns {Promise<void>}
  */
 export async function updateSessionMetadata(sessionId, updates) {
-  const sessionPath = path.join(TEMP_FILES_DIR, sessionId);
+  const sessionPath = sessionDir(sessionId);
   const sessionInfoPath = path.join(sessionPath, 'session.json');
   
   try {

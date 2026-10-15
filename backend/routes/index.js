@@ -8,10 +8,16 @@ import sessionsRouter from './sessions.js';
 import geographyRouter from './geography.js';
 import geometryRouter from './geometry.js';
 import infrastructureRouter from './infrastructure.js';
+import { publicSessionGuard } from '../utils/publicSessionGuard.js';
 // Import additional route modules as they're created:
 // import centerlineRouter from './centerline.js';
 
 const router = express.Router();
+
+// Sessions and jobs created by an agent are never visible here (they are
+// reached only through the Traxim Controller, which checks the login).
+// Website sessions are unaffected. See utils/publicSessionGuard.js.
+router.use(publicSessionGuard);
 
 // Mount route modules
 router.use('/sessions', sessionsRouter);
