@@ -1593,6 +1593,20 @@ function enablePanel(panelId, collapsePrevious = true) {
 const CONTROLLER_GENERATOR_API = '/api/agent/generator/sessions';
 const SESSION_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
+// What the session's state means, for the person looking at the page.
+const AGENT_VIEW_STATE_TEXT = {
+    searching: 'The agent is still looking up the waypoints and searching for railway sections. Reload this page in a minute.',
+    search_failed: 'The search for railway sections failed. Ask the agent to try again.',
+    awaiting_confirmation: 'Sections found. Tell the agent in the chat which numbered sections to include.',
+    confirmed: 'Your choice of sections is recorded. The agent can now generate the files.',
+    generating: 'The files are being generated. Reload this page later, or ask the agent for progress.',
+    ready: 'The files are ready.',
+    generation_failed: 'Generation failed. Ask the agent what went wrong.',
+    interrupted: 'The File Generator restarted while working on this session. Ask the agent to start again.'
+};
+
+const LINK_STYLE = 'color:#64b5f6;text-decoration:underline;';
+
 function escapeHtml(value) {
     return String(value == null ? '' : value)
         .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
@@ -1652,7 +1666,7 @@ async function openAgentSessionView(sessionId) {
         showAgentViewMessage(
             '<p><strong>Please log in to see this session.</strong></p>' +
             '<p>This session was created by an AI agent for a Traxim account. To view it, ' +
-            '<a href="/login.html" target="_blank" rel="noopener">log in to Traxim</a> (opens in a new tab) ' +
+            `<a href="/login.html" target="_blank" rel="noopener" style="${LINK_STYLE}">log in to Traxim</a> (opens in a new tab) ` +
             'with the same account you use with the agent, then come back here and reload this page.</p>' +
             '<p style="font-size:12px;opacity:0.8;">Logging in is only needed to view sessions created with an agent. ' +
             'The File Generator itself needs no login.</p>'
@@ -1722,7 +1736,7 @@ function renderAgentSessionView(sessionId, view) {
 
     showAgentViewMessage(
         `<p><strong>Agent session${view.label ? ': ' + escapeHtml(view.label) : ''}</strong> (view only)</p>` +
-        `<p>${escapeHtml(view.what_next || '')}</p>` +
+        `<p>${escapeHtml(AGENT_VIEW_STATE_TEXT[view.state] || '')}</p>` +
         '<p style="font-size:12px;">Choose the sections in your chat with the agent. This page only shows them on the map; nothing here changes the session.' +
         (chosen.length ? ' Lines on the map: the sections chosen in the chat.' : ' Lines on the map: every section found (each in its own colour; hover a line to see its name).') +
         '</p>' +
