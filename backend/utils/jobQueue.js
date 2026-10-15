@@ -5,6 +5,7 @@
  */
 
 import { EventEmitter } from 'events';
+import { randomBytes } from 'crypto';
 
 class JobQueue extends EventEmitter {
   constructor() {
@@ -12,7 +13,20 @@ class JobQueue extends EventEmitter {
     this.jobs = new Map(); // jobId -> job object
     this.queue = []; // Array of jobIds waiting to be processed
     this.processing = new Set(); // Set of jobIds currently being processed
-    this.maxConcurrent = 3; // Maximum concurrent jobs
+    // Maximum jobs running at once (the rest wait in the queue). Set
+    // MAX_CONCURRENT_JOBS in the service's environment to change it; it used
+    // to be hard-coded to 3 and the variable was ignored.
+    this.maxConcurrent = JobQueue.readMaxConcurrent(process.env.MAX_CONCURRENT_JOBS);
+  }
+
+  /**
+   * Parse MAX_CONCURRENT_JOBS: a whole number from 1 to 16, otherwise 3.
+   * @param {string|undefined} value
+   * @returns {number}
+   */
+  static readMaxConcurrent(value) {
+    const n = parseInt(value, 10);
+    return Number.isInteger(n) && n >= 1 && n <= 16 ? n : 3;
   }
 
   /**
@@ -23,7 +37,7 @@ class JobQueue extends EventEmitter {
    * @returns {string} jobId
    */
   createJob(type, data, processor) {
-    const jobId = `job-${type}-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+    const jobId = `job-${type}-${Date.now()}-${randomBytes(6).toString('hex')}`;
     
     const job = {
       id: jobId,
@@ -72,6 +86,49 @@ class JobQueue extends EventEmitter {
       startedAt: job.startedAt,
       completedAt: job.completedAt
     };
+  }
+
+  /**
+   * Who a job belongs to. Only jobs started through the agent routes have an
+   * owner; jobs started from the website have none. Used so the public
+   * job-status routes never show an agent's job, and the agent routes only
+   * show the caller's own jobs.
+   * @param {string} jobId
+   * @returns {{ownerId: number|null, sessionId: string|null}|null}
+   */
+  getJobMeta(jobId) {
+    const job = this.jobs.get(jobId);
+    if (!job) return null;
+    return {
+      ownerId: job.data && job.data.ownerId != null ? job.data.ownerId : null,
+      sessionId: job.data && job.data.sessionId ? job.data.sessionId : null
+    };
+  }
+
+  /**
+   * Number of jobs waiting or running for one agent user.
+   * @param {number} ownerId
+   * @returns {number}
+   */
+  countActiveForOwner(ownerId) {
+    let count = 0;
+    for (const job of this.jobs.values()) {
+      if (job.data && job.data.ownerId === ownerId &&
+          (job.status === 'pending' || job.status === 'in_progress')) {
+        count++;
+      }
+    }
+    return count;
+  }
+
+  /**
+   * 1-based position of a waiting job in the queue, or 0 if it is not waiting.
+   * @param {string} jobId
+   * @returns {number}
+   */
+  queuePosition(jobId) {
+    const index = this.queue.indexOf(jobId);
+    return index === -1 ? 0 : index + 1;
   }
 
   /**
@@ -146,7 +203,10 @@ class JobQueue extends EventEmitter {
       job.completedAt = new Date();
 
       console.error(`[JobQueue] Failed job: ${jobId}`, error);
-      this.emit('error', { jobId, error });
+      // Not 'error': an EventEmitter 'error' event with no listener throws,
+      // which turned every failed job into an unhandled promise rejection
+      // that stops the whole service (Node 15+), losing every other job.
+      this.emit('failed', { jobId, error });
     } finally {
       // Remove from processing set
       this.processing.delete(jobId);
