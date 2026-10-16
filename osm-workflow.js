@@ -1933,18 +1933,23 @@ async function openAgentSessionView(sessionId) {
     }
 
     if (response.status === 401) {
+        // The login page brings the user back to this page afterwards
+        // (?return=...; the Controller checks the path is a safe Traxim one).
+        const loginHref = `/login.html?return=${encodeURIComponent(window.location.pathname + window.location.search)}`;
         showAgentViewMessage(
             '<p><strong>Please log in to see this session.</strong></p>' +
             '<p>This session was created by an AI agent for a Traxim account. To view it, ' +
-            `<a href="/login.html" target="_blank" rel="noopener" style="${LINK_STYLE}">log in to Traxim</a> (opens in a new tab) ` +
-            'with the same account you use with the agent, then come back here and reload this page.</p>' +
+            `<a href="${escapeHtml(loginHref)}" style="${LINK_STYLE}">log in to Traxim</a> ` +
+            'with the same account you use with the agent. After logging in you will be brought back to this page.</p>' +
             '<p style="font-size:12px;opacity:0.8;">Logging in is only needed to view sessions created with an agent. ' +
             'The File Generator itself needs no login.</p>'
         );
         return;
     }
     if (response.status === 403) {
-        showAgentViewMessage('<p><strong>Guest accounts cannot use the File Generator with an agent.</strong> Log in with your own Traxim account.</p>');
+        const loginHref = `/login.html?return=${encodeURIComponent(window.location.pathname + window.location.search)}`;
+        showAgentViewMessage('<p><strong>Guest accounts cannot use the File Generator with an agent.</strong> ' +
+            `<a href="${escapeHtml(loginHref)}" style="${LINK_STYLE}">Log in with your own Traxim account</a>; you will be brought back to this page.</p>`);
         return;
     }
     if (response.status === 404) {
