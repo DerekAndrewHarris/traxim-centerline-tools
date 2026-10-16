@@ -919,6 +919,172 @@ function platformsTouch(geomA, geomB) {
 }
 
 /**
+ * Platform nodes closer together than this on one track are merged into one
+ * node (October 2026 sanity check). OpenStreetMap often maps one platform
+ * more than once (La Spezia Centrale: three ways all called "4 - 5";
+ * Viareggio: one way for the island and one for each face), and railways
+ * sometimes give one platform two numbers (1A/1B, 10/11). Rather than
+ * interpreting every naming scheme, any two platform nodes on the same track
+ * closer than this are taken to be the same platform.
+ */
+export const PLATFORM_MIN_SPACING_M = 250;
+
+/**
+ * Merge platform nodes closer than PLATFORM_MIN_SPACING_M along one track
+ * (or whose OSM outlines touch) into one node.
+ *
+ * "One track" = the stretch of track a platform node is on, walking through
+ * other platform nodes and plain through nodes (two connections) but
+ * stopping at any turnout or diamond: platforms on either side of a
+ * crossover are not merged, because trains can use them separately.
+ *
+ * Which node is kept: the one nearest the centre of all the merged
+ * platforms' outlines (measured along the track); where several are within
+ * 10 m of that, the longest platform's. It stays where it is (its final
+ * name comes from the naming pass later, like every platform node). The
+ * removed nodes are taken out of the track (their two neighbours are linked
+ * to each other). Each merge is reported in the warnings, with the OSM
+ * platforms' names and ids and the kept node's position, so the user can
+ * check it.
+ *
+ * @param {Array<object>} nodes - modified in place
+ * @param {string[]} warnings
+ * @returns {number} number of platform nodes removed
+ */
+export function mergeClosePlatformNodes(nodes, warnings = []) {
+  const ARM_FIELDS = ['fNode', 'tNode', 'dNode', 'xNode'];
+  const byName = new Map(nodes.map(n => [n.name, n]));
+  const armsOf = (n) => ARM_FIELDS.filter(f => n[f]);
+  const isPlatform = (n) => n.railwayType === 'platform';
+  const passThrough = (n) => isPlatform(n) ||
+    (armsOf(n).length === 2 && !['junction', 'diamond'].includes(n.railwayType));
+
+  // Walk from `start` out through `firstName`, collecting nodes and their
+  // distance from `start` until a node that is not a simple pass-through.
+  function walk(start, firstName, seen) {
+    const out = [];
+    let prev = start;
+    let cur = byName.get(firstName);
+    let d = 0;
+    for (let hop = 0; cur && hop < 100000; hop++) {
+      if (cur === start || seen.has(cur)) break; // a closed ring of track
+      d += haversineM(prev, cur);
+      out.push({ node: cur, pos: d });
+      seen.add(cur);
+      if (!passThrough(cur)) break;
+      const nextName = armsOf(cur).map(f => cur[f]).find(nm => nm !== prev.name);
+      prev = cur;
+      cur = nextName ? byName.get(nextName) : null;
+    }
+    return out;
+  }
+
+  // Position of a point along a run (polyline of its nodes).
+  function posAlong(run, point) {
+    if (run.length < 2) return 0;
+    const { segIdx, projLat, projLon } = nearestPointOnWay(point, run.map(r => r.node));
+    return run[segIdx].pos + haversineM(run[segIdx].node, { lat: projLat, lon: projLon });
+  }
+
+  const visited = new Set();
+  const toRemove = new Set();
+  let removed = 0;
+
+  for (const p of nodes) {
+    if (!isPlatform(p) || visited.has(p)) continue;
+    const seen = new Set([p]);
+    const [armA, armB] = armsOf(p);
+    const back = armA ? walk(p, p[armA], seen) : [];
+    const fwd = armB ? walk(p, p[armB], seen) : [];
+    const run = [
+      ...back.reverse().map(r => ({ node: r.node, pos: -r.pos })),
+      { node: p, pos: 0 },
+      ...fwd
+    ];
+    const members = run.filter(r => isPlatform(r.node));
+    for (const m of members) visited.add(m.node);
+    if (members.length < 2) continue;
+
+    // Clusters of consecutive platform nodes closer than the minimum spacing.
+    const clusters = [];
+    let current = [members[0]];
+    for (let i = 1; i < members.length; i++) {
+      const prev = members[i - 1], m = members[i];
+      const close = m.pos - prev.pos < PLATFORM_MIN_SPACING_M ||
+        (prev.node._platformGeometry && m.node._platformGeometry &&
+         platformsTouch(prev.node._platformGeometry, m.node._platformGeometry));
+      if (close) current.push(m);
+      else { clusters.push(current); current = [m]; }
+    }
+    clusters.push(current);
+
+    for (const cluster of clusters) {
+      if (cluster.length < 2) continue;
+      // Each platform's extent along the track, from its OSM outline.
+      for (const m of cluster) {
+        const geom = m.node._platformGeometry && m.node._platformGeometry.length > 0 ? m.node._platformGeometry : [m.node];
+        const ps = geom.map(pt => posAlong(run, pt));
+        m.from = Math.min(...ps);
+        m.to = Math.max(...ps);
+      }
+      const centre = (Math.min(...cluster.map(m => m.from)) + Math.max(...cluster.map(m => m.to))) / 2;
+      const off = (m) => Math.abs(m.pos - centre);
+      const best = Math.min(...cluster.map(off));
+      const keep = cluster
+        .filter(m => off(m) <= best + 10)
+        .sort((x, y) => (y.to - y.from) - (x.to - x.from) || (x.node.name < y.node.name ? -1 : 1))[0];
+
+      for (const m of cluster) {
+        if (m === keep) continue;
+        spliceOutNode(m.node, byName);
+        byName.delete(m.node.name);
+        toRemove.add(m.node);
+        removed++;
+      }
+      const label = (m) => `OSM platform "${m.node._platformOsmName ?? m.node.name}" (way ${m.node._platformOsmId ?? '?'})`;
+      const others = cluster.filter(m => m !== keep)
+        .map(m => `${label(m)} ${Math.round(Math.abs(m.pos - keep.pos))} m away`);
+      warnings.push(`PLATFORMS MERGED at ${keep.node.lat.toFixed(5)}, ${keep.node.lon.toFixed(5)}: ${cluster.length} platform nodes ` +
+        `closer than ${PLATFORM_MIN_SPACING_M} m on one track are taken as one platform (OpenStreetMap maps it more than once, ` +
+        `or gives it two numbers). Kept the node for ${label(keep)}; removed the node for ${others.join(', ')}. ` +
+        `Check it in the Network Editor.`);
+    }
+  }
+
+  if (toRemove.size > 0) {
+    for (let i = nodes.length - 1; i >= 0; i--) if (toRemove.has(nodes[i])) nodes.splice(i, 1);
+  }
+  return removed;
+}
+
+/**
+ * Take a two-connection node out of the track: its two neighbours are linked
+ * straight to each other, on the same arms they used to reach it.
+ */
+function spliceOutNode(node, byName) {
+  const ends = ['fNode', 'tNode', 'dNode', 'xNode'].filter(f => node[f]).map(f => {
+    const onBranch = node[f.replace('Node', 'OnBranch')];
+    const nb = byName.get(node[f]);
+    let armOnNb = onBranch ? branchToNodeField(onBranch) : null;
+    if (nb && (!armOnNb || nb[armOnNb] !== node.name)) {
+      const arms = ['fNode', 'tNode', 'dNode', 'xNode'].filter(a => nb[a] === node.name);
+      armOnNb = arms.length === 1 ? arms[0] : null;
+    }
+    return { nb, armOnNb };
+  });
+  if (ends.length !== 2 || ends.some(e => !e.nb || !e.armOnNb)) {
+    // Not a simple pass-through: just drop the links to it.
+    for (const e of ends) if (e.nb && e.armOnNb) { e.nb[e.armOnNb] = ''; e.nb[branchToBranchField(fieldToBranch(e.armOnNb))] = ''; }
+    return;
+  }
+  const [x, y] = ends;
+  x.nb[x.armOnNb] = y.nb.name;
+  x.nb[branchToBranchField(fieldToBranch(x.armOnNb))] = fieldToBranch(y.armOnNb);
+  y.nb[y.armOnNb] = x.nb.name;
+  y.nb[branchToBranchField(fieldToBranch(y.armOnNb))] = fieldToBranch(x.armOnNb);
+}
+
+/**
  * Which tracks a platform's faces are on: at most ONE track on each side of
  * the platform (October 2026).
  *
@@ -1877,9 +2043,8 @@ async function generateInfrastructureForSections(confirmedSections, networkName,
   const PLATFORM_WAY_MATCH_THRESHOLD_M = 3;
   const PLATFORM_WAY_MATCH_FALLBACK_M = 10;
   const PLATFORM_JUNCTION_BUFFER_M = 50;
-  // A second platform node on the same track closer than this to an existing
-  // one is the same platform mapped twice (see the duplicate check below).
-  const PLATFORM_DUPLICATE_DISTANCE_M = 100;
+  // Platform nodes closer than PLATFORM_MIN_SPACING_M on one track are merged
+  // after insertion (mergeClosePlatformNodes).
   const PLATFORM_INSERTION_ENABLED = true;
   updateProgress(75, 'Fetching platform nodes');
   let platforms = [];
@@ -2114,19 +2279,10 @@ async function generateInfrastructureForSections(confirmedSections, networkName,
         const chainCoords = chain.map(n => ({ lat: n.lat, lon: n.lon }));
         const { segIdx, projLat, projLon } = nearestPointOnWay(point, chainCoords);
 
-        // Same platform face already on this track? OpenStreetMap sometimes
-        // has one platform as two objects (an outline and a line, or two
-        // halves that touch). A second platform node there would only sit
-        // right next to the first, so it is left out.
-        const duplicateOf = chain.find(n => n.railwayType === 'platform' && (
-          haversineM({ lat: projLat, lon: projLon }, n) < PLATFORM_DUPLICATE_DISTANCE_M ||
-          (n._platformGeometry && platformsTouch(n._platformGeometry, platformGeometry))
-        ));
-        if (duplicateOf) {
-          warnings.push(`Platform "${platform.name}" (${platform.id}): this face is already covered by platform node ` +
-            `"${duplicateOf.name}" on the same track (OpenStreetMap maps the same platform more than once here) — not inserted twice.`);
-          continue;
-        }
+        // A platform node close to another one on the same track (the same
+        // platform mapped more than once, or one platform with two numbers)
+        // is inserted anyway and merged afterwards, see
+        // mergeClosePlatformNodes, so one rule decides which node is kept.
         const a = chain[segIdx];
         const b = chain[segIdx + 1];
 
@@ -2220,7 +2376,9 @@ async function generateInfrastructureForSections(confirmedSections, networkName,
           fOnBranch: fieldToBranch(armOnA),
           tNode: b.name,
           tOnBranch: fieldToBranch(armOnB),
-          _platformGeometry: platformGeometry, // for the duplicate check above; removed before output
+          _platformGeometry: platformGeometry, // for mergeClosePlatformNodes; removed before output
+          _platformOsmId: platform.id,
+          _platformOsmName: platform.name,
         };
         nodes.push(platformNode);
         nodesByName.set(platName, platformNode);
@@ -2237,6 +2395,10 @@ async function generateInfrastructureForSections(confirmedSections, networkName,
     if (insertedCount > 0) {
       warnings.push(`Platforms: inserted ${insertedCount} platform node(s), unsignalled (Signalled F/T = False).`);
     }
+
+    // Sanity check: platform nodes closer than PLATFORM_MIN_SPACING_M on one
+    // track become one node.
+    mergeClosePlatformNodes(nodes, warnings);
   }
 
   // Second orphan removal pass — connections may have been cleared by
@@ -2745,6 +2907,8 @@ async function generateInfrastructureForSections(confirmedSections, networkName,
     delete node._topoKey;
     delete node._topoConns;
     delete node._platformGeometry;
+    delete node._platformOsmId;
+    delete node._platformOsmName;
   }
 
   // ── Step 15: Branch-conflict and link-mismatch validation ──

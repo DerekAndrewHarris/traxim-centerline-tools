@@ -19,7 +19,7 @@ import assert from 'node:assert/strict';
 import {
   Net, ll, geometryCsv, platform, rect, writeSession, parseInfrastructureCsv, removeSession
 } from './helpers/synthNetwork.js';
-import { generateInfrastructureForSections } from '../backend/services/infrastructure/generator.js';
+import { generateInfrastructureForSections, mergeClosePlatformNodes, PLATFORM_MIN_SPACING_M } from '../backend/services/infrastructure/generator.js';
 
 function loopNet({ sidingUnderPlatform = false } = {}) {
   const net = new Net()
@@ -103,7 +103,7 @@ test('the same platform mapped twice in OSM (two touching halves) gets one node 
     platform(14, 'Side', rect(1000, 1100, -3.6, -0.9), '1')
   ]);
   assert.equal(platformRows(rows).length, 1);
-  assert.ok(warnings.some(w => /already covered by platform node/.test(w)));
+  assert.ok(warnings.some(w => /PLATFORMS MERGED/.test(w)));
 });
 
 test('two separate platforms far apart on the same track both get a node', async () => {
@@ -112,4 +112,116 @@ test('two separate platforms far apart on the same track both get a node', async
     platform(16, 'Side', rect(1200, 1300, -3.6, -0.9), '1')
   ]);
   assert.equal(platformRows(rows).length, 2);
+});
+
+// ── Platform sanity check: nodes closer than 250 m on one track are merged ──
+
+test('the minimum platform spacing is a named constant of 250 m', () => {
+  assert.equal(PLATFORM_MIN_SPACING_M, 250);
+});
+
+test('La Spezia case: three OSM ways all called "4 - 5" give one node on each track', async () => {
+  // The real island plus two unclear outlines with the same name and ref,
+  // roughly on top of it (different lengths, slightly shifted).
+  const { rows, warnings } = await generate(loopNet(), [
+    platform(20, 'Railway Platform 4 - 5', rect(900, 1100, 0.9, 3.6), '4;5'),
+    platform(21, 'Railway Platform 4 - 5', rect(950, 1060, 1.0, 3.5), '4;5'),
+    platform(22, 'Railway Platform 4 - 5', rect(880, 1130, 0.8, 3.7), '4;5')
+  ]);
+  const plats = platformRows(rows);
+  assert.equal(plats.length, 2, 'two platform nodes in all');
+  assert.equal(plats.filter(onMain).length, 1, 'one on the main line');
+  assert.equal(plats.filter(onLoop).length, 1, 'one on the loop');
+  assert.equal(warnings.filter(w => /PLATFORMS MERGED/.test(w)).length, 2, 'one merge reported per track');
+  // Still linked properly: every link is reciprocal.
+  const byName = new Map(rows.map(r => [r.Name, r]));
+  for (const r of rows) {
+    for (const arm of ['F Node', 'T Node', 'D Node', 'X Node']) {
+      if (!r[arm]) continue;
+      const other = byName.get(r[arm]);
+      assert.ok(other, `${r.Name} links to existing node ${r[arm]}`);
+      assert.ok(['F Node', 'T Node', 'D Node', 'X Node'].some(a => other[a] === r.Name), `${r[arm]} links back to ${r.Name}`);
+    }
+  }
+});
+
+test('Viareggio case: one way for the island and one line for each face give one node on each track', async () => {
+  const { rows, warnings } = await generate(loopNet(), [
+    platform(30, 'Viareggio 2 - 3', rect(900, 1100, 0.9, 3.6), '2;3'),
+    platform(31, 'Viareggio 2', [[900, 0.9], [1100, 0.9]], '2'),   // face along the main line
+    platform(32, 'Viareggio 3', [[900, 3.6], [1100, 3.6]], '3')    // face along the loop
+  ]);
+  const plats = platformRows(rows);
+  assert.equal(plats.length, 2);
+  assert.equal(plats.filter(onMain).length, 1);
+  assert.equal(plats.filter(onLoop).length, 1);
+  assert.equal(warnings.filter(w => /PLATFORMS MERGED/.test(w)).length, 2);
+});
+
+test('one platform with two numbers (1A / 1B) on one track becomes one node', async () => {
+  const { rows, warnings } = await generate(loopNet(), [
+    platform(40, 'Testa 1A', rect(860, 990, -3.6, -0.9), '1A'),
+    platform(41, 'Testa 1B', rect(1000, 1130, -3.6, -0.9), '1B')
+  ]);
+  const plats = platformRows(rows);
+  assert.equal(plats.length, 1);
+  const w = warnings.find(x => /PLATFORMS MERGED/.test(x));
+  assert.ok(w && /Testa 1A/.test(w) && /Testa 1B/.test(w), 'the merge names both OSM platforms');
+});
+
+test('platform nodes 300 m apart on one track are both kept', async () => {
+  const { rows, warnings } = await generate(loopNet(), [
+    platform(50, 'North end', rect(700, 800, -3.6, -0.9), '1'),
+    platform(51, 'South end', rect(1000, 1100, -3.6, -0.9), '1')
+  ]);
+  assert.equal(platformRows(rows).length, 2);
+  assert.ok(!warnings.some(x => /PLATFORMS MERGED/.test(x)));
+});
+
+test('the kept node is the one nearest the centre of the merged platforms', () => {
+  // A straight track: E1 - P1 - P2 - P3 - E2 along x (metres), P2 nearest the middle.
+  const at = (x) => ll(x, 0);
+  const n = (name, x, extra = {}) => ({ name, ...at(x), ...extra });
+  const plat = (name, x, from, to, id) => n(name, x, {
+    railwayType: 'platform', _platformGeometry: [at(from), at(to)], _platformOsmId: String(id)
+  });
+  const nodes = [
+    n('E1', 0, { tNode: 'P1', tOnBranch: 'F' }),
+    plat('P1 B', 100, 50, 150, 1),
+    plat('P1 A', 180, 120, 240, 2),
+    plat('P1', 260, 200, 300, 3),
+    n('E2', 1000, { fNode: 'P1', fOnBranch: 'T' })
+  ];
+  // Chain links: E1 -> "P1 B" -> "P1 A" -> "P1" -> E2
+  nodes[0].tNode = 'P1 B';
+  Object.assign(nodes[1], { fNode: 'E1', fOnBranch: 'T', tNode: 'P1 A', tOnBranch: 'F' });
+  Object.assign(nodes[2], { fNode: 'P1 B', fOnBranch: 'T', tNode: 'P1', tOnBranch: 'F' });
+  Object.assign(nodes[3], { fNode: 'P1 A', fOnBranch: 'T', tNode: 'E2', tOnBranch: 'F' });
+  const warnings = [];
+  const removed = mergeClosePlatformNodes(nodes, warnings);
+  assert.equal(removed, 2);
+  // The middle one (at 180 m; the platforms span 50-300 m, centre 175 m) is kept.
+  assert.deepEqual(nodes.map(x => x.name), ['E1', 'P1 A', 'E2']);
+  const kept = nodes[1];
+  assert.equal(nodes[0].tNode, 'P1 A');
+  assert.equal(nodes[0].tOnBranch, 'F');
+  assert.equal(kept.fNode, 'E1');
+  assert.equal(kept.tNode, 'E2');
+  assert.equal(nodes[2].fNode, 'P1 A');
+  assert.equal(nodes[2].fOnBranch, 'T');
+  assert.equal(warnings.length, 1);
+});
+
+test('platforms either side of a turnout are not merged', () => {
+  const at = (x) => ll(x, 0);
+  const nodes = [
+    { name: 'P1', ...at(100), railwayType: 'platform', fNode: 'E1', fOnBranch: 'T', tNode: 'J', tOnBranch: 'F' },
+    { name: 'J', ...at(150), railwayType: 'junction', fNode: 'P1', fOnBranch: 'T', tNode: 'P2', tOnBranch: 'F', dNode: 'S', dOnBranch: 'F' },
+    { name: 'P2', ...at(200), railwayType: 'platform', fNode: 'J', fOnBranch: 'T', tNode: 'E2', tOnBranch: 'F' },
+    { name: 'E1', ...at(0), tNode: 'P1', tOnBranch: 'F' },
+    { name: 'E2', ...at(400), fNode: 'P2', fOnBranch: 'T' },
+    { name: 'S', ...ll(300, -10), fNode: 'J', fOnBranch: 'D' }
+  ];
+  assert.equal(mergeClosePlatformNodes(nodes, []), 0);
+  assert.equal(nodes.length, 6);
 });
