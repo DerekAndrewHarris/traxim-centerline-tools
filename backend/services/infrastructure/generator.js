@@ -781,6 +781,28 @@ function geometryEnds(points) {
 }
 
 /**
+ * A node's kilometrage on a geometry, kept inside the geometry's own km range.
+ * projectOntoGeometry() carries on past the ends of the line, so a turnout or
+ * diamond a few metres before the start of a route got a km such as -0.009
+ * and a name such as "... km -0.0" (October 2026 test run, Sestri Levante).
+ * End nodes were already moved to the end of the geometry
+ * (clampEndNodesToGeometry); turnouts and diamonds stay where they are, but
+ * their km (and so their name) is the geometry's first or last km.
+ */
+export function kmWithinGeometry(point, points) {
+  const km = nearestKm(point, points);
+  if (!points || points.length < 2) return km;
+  const { minKm, maxKm } = geometryEnds(points);
+  return Math.min(maxKm, Math.max(minKm, km));
+}
+
+/** A km for a node name, one decimal; never "-0.0". */
+export function kmLabel(km) {
+  const s = (Math.round(km * 10) / 10).toFixed(1);
+  return s === '-0.0' ? '0.0' : s;
+}
+
+/**
  * End nodes (October 2026). Where the generated geometry stops (usually at
  * the first or last waypoint) the OSM track carries on, so the track's end
  * node is made where the OSM data happens to stop: at the edge of the area
@@ -1521,7 +1543,7 @@ async function generateInfrastructureForSections(confirmedSections, networkName,
       // sections from duplicating mainline junction nodes.
       const existingAtKey = processedCoordKeys.get(coordKey);
       if (existingAtKey) {
-        const km = nearestKm({ lat, lon }, points);
+        const km = kmWithinGeometry({ lat, lon }, points);
         const existingNodes = Array.isArray(existingAtKey) ? existingAtKey : [existingAtKey];
 
         // Add region2/region3 to existing nodes
@@ -1560,7 +1582,7 @@ async function generateInfrastructureForSections(confirmedSections, networkName,
         continue;
       }
 
-      const km = nearestKm({ lat, lon }, points);
+      const km = kmWithinGeometry({ lat, lon }, points);
 
       // Name from nearby tagged node
       const nearbyTagged = splitTopo.taggedNodes?.find(
@@ -1568,7 +1590,7 @@ async function generateInfrastructureForSections(confirmedSections, networkName,
       );
       const baseName = nearbyTagged?.tags?.name
         ? sanitiseName(nearbyTagged.tags.name)
-        : `${sectionName} km ${km.toFixed(1)}`;
+        : `${sectionName} km ${kmLabel(km)}`;
 
       // Ensure unique name (for degree-4 junctions, also check " A"/" B" suffixes)
       let nodeName = baseName;

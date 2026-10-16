@@ -70,3 +70,38 @@ test('clampAllKmToGeometry keeps alias kilometrages in range too', () => {
   assert.equal(n.km, 0);
   assert.equal(n.km2, 3);
 });
+
+// ── Turnouts and diamonds just before the start of a route (October 2026) ──
+// Test run 16 Oct 2026: the diamond "Sestri Levante - Levanto km -0.0" lay
+// 9 m before the start of its route, at km -0.009.
+
+test('kmLabel never gives "-0.0"', async () => {
+  const { kmLabel } = await import('../backend/services/infrastructure/generator.js');
+  assert.equal(kmLabel(-0.009), '0.0');
+  assert.equal(kmLabel(-0.04), '0.0');
+  assert.equal(kmLabel(0), '0.0');
+  assert.equal(kmLabel(12.34), '12.3');
+});
+
+test('a turnout a few metres before the start of the geometry is named and placed at km 0.0, not -0.0', async () => {
+  // Turnout J0 at x = -9 m (geometry starts at x = 0), siding to the south.
+  const net = new Net().point('W', -600, 0).point('J0', -9, 0).point('J2', 1900, 0).point('E', 2600, 0)
+    .point('S1', 40, -4).point('S2', 300, -4).point('T1', 1850, -4).point('T2', 1600, -4);
+  net.way(1, ['W', 'J0']).way(2, ['J0', 'J2']).way(3, ['J2', 'E']).way(4, ['J0', 'S1', 'S2']).way(5, ['J2', 'T1', 'T2']);
+  const s = await writeSession({ geometry: { 'A.csv': geometryCsv('A', [[0, 0], [2000, 0]]) }, net });
+  let rows;
+  try {
+    const r = await generateInfrastructureForSections([], 'Test', s.geometryDir, s.bbox, null, s.sessionPath);
+    rows = parseInfrastructureCsv(r.csv);
+  } finally {
+    await removeSession(s.sessionPath);
+  }
+  for (const row of rows) {
+    assert.ok(!/km -/.test(row.Name), `name ${row.Name}`);
+    assert.ok(Number(row.Km1) >= 0, `${row.Name} km ${row.Km1}`);
+  }
+  const turnout = rows.find(r => r['D Node'] && Math.abs(xOf(r) + 9) < 2);
+  assert.ok(turnout, 'the turnout stays where it is (9 m before the start)');
+  assert.ok(Number(turnout.Km1) >= 0 && Number(turnout.Km1) < 0.05, `km ${turnout.Km1}`);
+  assert.equal(turnout.Name, 'A km 0.0');
+});
