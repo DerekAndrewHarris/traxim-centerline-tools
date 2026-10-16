@@ -66,10 +66,18 @@ import { promises as fs } from 'fs';
  *   segment's confirmed line looks like unless it's passed in explicitly — without this, a candidate
  *   that's actually just the previous segment's own mainline (walked backward past the shared waypoint)
  *   reads as "far from my own centerline" and gets accepted as a bogus alt route.
- * @returns {Promise<{filePath: string, pointCount: number, lengthKm: number, alternativeCount: number, alternativeFiles: string[], warnings: string[], rawCoords: {lat: number, lon: number}[]}>}
+ * @param {{maxGradient?: number}} [options] - maxGradient: maximum gradient for elevation smoothing,
+ *   as a fraction (0.04 = 4%, the default DEFAULT_RULING_GRADIENT)
+ * @returns {Promise<{filePath: string, pointCount: number, lengthKm: number, alternativeCount: number, alternativeFiles: string[], warnings: string[], rawCoords: {lat: number, lon: number}[], elevation: {ok: boolean, reason: string|null}, alternativeElevation: Array<{route: string, ok: boolean, reason: string|null}>, smoothing: {adjustedCount: number, maxAdjustmentM: number}}>}
  */
-export async function generateGeometryForSegment(segmentLabel, segmentBbox, outputDir, spacingMetres = 25, startPoint = null, endPoint = null, progressCallback = null, sections = null, relationWayIdCache = null, sessionPath = null, priorCenterlines = []) {
+export async function generateGeometryForSegment(segmentLabel, segmentBbox, outputDir, spacingMetres = 25, startPoint = null, endPoint = null, progressCallback = null, sections = null, relationWayIdCache = null, sessionPath = null, priorCenterlines = [], options = {}) {
   const warnings = [];
+  // Maximum gradient for elevation smoothing, as a fraction (0.04 = 4%).
+  const rulingGradient = Number.isFinite(options.maxGradient) && options.maxGradient > 0
+    ? options.maxGradient
+    : DEFAULT_RULING_GRADIENT;
+  // Whether real elevation data was obtained for the main route ({ok, reason}).
+  let elevation = { ok: true, reason: null };
   const safeName = segmentLabel.replace(/[^a-zA-Z0-9_\-]/g, '_');
 
   console.log(`\n[Geometry Generator] Starting segment generation: ${segmentLabel}`);
@@ -371,6 +379,10 @@ export async function generateGeometryForSegment(segmentLabel, segmentBbox, outp
       // explicitly rather than silently shipping a CSV that's quietly all 0s.
       if (elevResults.degraded) {
         warnings.push(`Elevation service unavailable (${elevResults.degradedReason}). Altitudes set to 0.`);
+        elevation = { ok: false, reason: elevResults.degradedReason };
+      } else if (elevResults.length > 0 && elevResults.every(r => r.elevation === 0)) {
+        // Backstop: a whole route at exactly 0 m is not real data.
+        elevation = { ok: false, reason: 'the elevation service returned 0 m for every point' };
       }
 
       // Ground-surface DEM data is wrong inside tunnels/on bridges — override
@@ -389,6 +401,7 @@ export async function generateGeometryForSegment(segmentLabel, segmentBbox, outp
       console.warn(`[Geometry Generator] Elevation failed: ${elevError.message}`);
       warnings.push(`Elevation unavailable: ${elevError.message}. Altitudes set to 0.`);
       for (const pt of finalPoints) pt.altitude = 0;
+      elevation = { ok: false, reason: elevError.message };
     }
 
     // ── 8. Chainage + write main CSV (70-80%) ────────────────────────────────
@@ -410,18 +423,20 @@ export async function generateGeometryForSegment(segmentLabel, segmentBbox, outp
     // see project history for the concrete case this was built for. Keeps
     // the pre-smoothing value alongside the smoothed one so it's inspectable
     // rather than silently overwritten.
+    let smoothing = { adjustedCount: 0, maxAdjustmentM: 0 };
     {
       const rawAltitudes = finalPoints.map(pt => pt.altitude);
       const chainageMetres = finalPoints.map(pt => pt.chainage * 1000);
       const { smoothed, adjustedCount, maxAdjustmentM } =
-        applyGradientEnvelopeSmoothing(rawAltitudes, chainageMetres);
+        applyGradientEnvelopeSmoothing(rawAltitudes, chainageMetres, rulingGradient);
+      smoothing = { adjustedCount, maxAdjustmentM };
       for (let i = 0; i < finalPoints.length; i++) {
         finalPoints[i].rawAltitude = rawAltitudes[i];
         finalPoints[i].altitude = smoothed[i];
       }
       if (adjustedCount > 0) {
         warnings.push(
-          `Elevation smoothing adjusted ${adjustedCount} point(s) to stay within a ${(DEFAULT_RULING_GRADIENT * 100).toFixed(0)}% ` +
+          `Elevation smoothing adjusted ${adjustedCount} point(s) to stay within a ${formatGradientPercent(rulingGradient)}% ` +
           `ruling gradient (largest adjustment ${maxAdjustmentM.toFixed(1)}m). Raw values are kept in the CSV's ` +
           `6th column for reference` +
           (maxAdjustmentM > 5
@@ -453,15 +468,17 @@ export async function generateGeometryForSegment(segmentLabel, segmentBbox, outp
 
     // ── 9. Generate alternative route CSVs (80-90%) ──────────────────────────
     const alternativeFiles = [];
+    const alternativeElevation = [];
     for (let altIdx = 0; altIdx < alternativeRoutes.length; altIdx++) {
       const alt = alternativeRoutes[altIdx];
       if (progressCallback) progressCallback(80 + Math.round((altIdx / Math.max(1, alternativeRoutes.length)) * 5), `Generating alt route ${altIdx + 1}...`);
 
       try {
-        const altFilePath = await generateAlternativeGeometry(
-          segmentLabel, alt, altIdx + 1, outputDir, spacingMetres, warnings
+        const altResult = await generateAlternativeGeometry(
+          segmentLabel, alt, altIdx + 1, outputDir, spacingMetres, warnings, rulingGradient
         );
-        alternativeFiles.push(altFilePath);
+        alternativeFiles.push(altResult.filePath);
+        alternativeElevation.push({ route: altResult.label, ok: altResult.elevation.ok, reason: altResult.elevation.reason });
       } catch (altErr) {
         warnings.push(`Alternative ${altIdx + 1} failed: ${altErr.message}`);
       }
@@ -619,6 +636,9 @@ export async function generateGeometryForSegment(segmentLabel, segmentBbox, outp
       alternativeCount: alternativeRoutes.length,
       alternativeFiles,
       warnings,
+      elevation,
+      alternativeElevation,
+      smoothing,
       infraTopology,
       corridorBbox,
       bufferPolygon,
@@ -637,7 +657,7 @@ export async function generateGeometryForSegment(segmentLabel, segmentBbox, outp
 /**
  * Generate a geometry CSV for one alternative route.
  */
-async function generateAlternativeGeometry(segmentLabel, alternative, altNumber, outputDir, spacingMetres, warnings) {
+async function generateAlternativeGeometry(segmentLabel, alternative, altNumber, outputDir, spacingMetres, warnings, rulingGradient = DEFAULT_RULING_GRADIENT) {
   const safeName = segmentLabel.replace(/[^a-zA-Z0-9_\-]/g, '_');
   const altLabel = `${segmentLabel}_alt${altNumber}`;
   const altSafeName = `${safeName}_alt${altNumber}`;
@@ -652,17 +672,22 @@ async function generateAlternativeGeometry(segmentLabel, alternative, altNumber,
   const processedPoints = processTrackPoints(rawPoints, spacingMetres);
 
   // Elevation
+  let elevation = { ok: true, reason: null };
   try {
     const elevPts = processedPoints.map(pt => ({ lat: pt.latitude, lon: pt.longitude }));
     const elevResults = await fetchElevations(elevPts);
     if (elevResults.degraded) {
       warnings.push(`${altLabel}: elevation service unavailable (${elevResults.degradedReason}). Altitudes set to 0.`);
+      elevation = { ok: false, reason: elevResults.degradedReason };
+    } else if (elevResults.length > 0 && elevResults.every(r => r.elevation === 0)) {
+      elevation = { ok: false, reason: 'the elevation service returned 0 m for every point' };
     }
     for (let i = 0; i < processedPoints.length; i++) {
       processedPoints[i].altitude = elevResults[i].elevation;
     }
-  } catch (_) {
+  } catch (elevError) {
     for (const pt of processedPoints) pt.altitude = 0;
+    elevation = { ok: false, reason: elevError.message };
   }
 
   // Chainage
@@ -681,7 +706,7 @@ async function generateAlternativeGeometry(segmentLabel, alternative, altNumber,
     const rawAltitudes = processedPoints.map(pt => pt.altitude);
     const chainageMetres = processedPoints.map(pt => pt.chainage * 1000);
     const { smoothed, adjustedCount, maxAdjustmentM } =
-      applyGradientEnvelopeSmoothing(rawAltitudes, chainageMetres);
+      applyGradientEnvelopeSmoothing(rawAltitudes, chainageMetres, rulingGradient);
     for (let i = 0; i < processedPoints.length; i++) {
       processedPoints[i].rawAltitude = rawAltitudes[i];
       processedPoints[i].altitude = smoothed[i];
@@ -712,5 +737,10 @@ async function generateAlternativeGeometry(segmentLabel, alternative, altNumber,
   );
 
   console.log(`[Geometry Generator] Wrote alt route ${altNumber}: ${filePath} (${totalKm.toFixed(2)} km)`);
-  return filePath;
+  return { filePath, label: altLabel, elevation };
+}
+
+/** 0.04 -> "4", 0.033 -> "3.3" (for messages). */
+function formatGradientPercent(fraction) {
+  return String(Math.round(fraction * 1000) / 10);
 }

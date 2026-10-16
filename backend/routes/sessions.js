@@ -18,6 +18,8 @@ import { generateSessionZip } from '../utils/zipGenerator.js';
 import { generateLinesKML, readGeometryCSV } from '../utils/kmlGenerator.js';
 import { asyncHandler, AppError } from '../utils/errorHandler.js';
 import { readMapOverlays } from '../services/generation/pipeline.js';
+import { readSessionMetadataSync } from '../utils/tempFiles.js';
+import { stampedName, isValidOutputStamp } from '../utils/outputNames.js';
 
 const router = express.Router();
 
@@ -178,8 +180,12 @@ router.get('/:id/download-geometry', asyncHandler(async (req, res) => {
     output.on('error', reject);
   });
   
-  // Send ZIP file
-  res.download(zipPath, `traxim-geometry-${id}.zip`, async (err) => {
+  // Send ZIP file: "Geometry_<stamp>.zip" with the run's date stamp
+  // (utils/outputNames.js); the old name for a session without one.
+  let stamp = null;
+  try { stamp = (readSessionMetadataSync(id) || {}).outputStamp; } catch { /* no stamp */ }
+  const zipName = isValidOutputStamp(stamp) ? stampedName('Geometry.zip', stamp) : `traxim-geometry-${id}.zip`;
+  res.download(zipPath, zipName, async (err) => {
     if (err) {
       console.error('[Download] Error sending geometry ZIP:', err);
     }

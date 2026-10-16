@@ -14,7 +14,92 @@ import { generateGeometryForSegment } from '../geometry/generator.js';
 import { prefetchRelationWayIds } from '../osm/osmGeometry.js';
 import { generateRegionsCsv, readGeometryRegionNames, orderRegionNames, DEFAULTS_WARNING as REGIONS_DEFAULTS_WARNING } from '../regions/generator.js';
 import { REGION_COLOURS, generateInfrastructureForSections } from '../infrastructure/generator.js';
-import { updateSessionMetadata } from '../../utils/tempFiles.js';
+import { DEFAULT_RULING_GRADIENT } from '../geometry/processor.js';
+import { readSessionMetadataSync, updateSessionMetadata } from '../../utils/tempFiles.js';
+import { buildGeometryKml } from '../../utils/kmlGenerator.js';
+import { isValidOutputStamp, makeOutputStamp } from '../../utils/outputNames.js';
+
+// ── Maximum gradient for elevation smoothing (user setting, October 2026) ──
+// The smoothing pulls the elevation profile so that no stretch is steeper
+// than this; the default is the value the generator has always used
+// (DEFAULT_RULING_GRADIENT, 4% = 1 in 25). Tunnels and bridges are
+// interpolated between their portals before this, unchanged.
+export const MAX_GRADIENT_DEFAULT_PERCENT = Math.round(DEFAULT_RULING_GRADIENT * 1000) / 10;
+export const MAX_GRADIENT_MIN_PERCENT = 1;
+export const MAX_GRADIENT_MAX_PERCENT = 6;
+
+/**
+ * The maximum gradient (percent) from a request, or the default when it is
+ * not given. Throws a RangeError with a readable message when it is not a
+ * number between MAX_GRADIENT_MIN_PERCENT and MAX_GRADIENT_MAX_PERCENT.
+ * @param {*} value
+ * @returns {number} percent, at most 2 decimal places
+ */
+export function parseMaxGradientPercent(value) {
+  if (value === undefined || value === null || value === '') return MAX_GRADIENT_DEFAULT_PERCENT;
+  const percent = typeof value === 'string' ? Number(value.trim()) : Number(value);
+  if (typeof value === 'boolean' || !Number.isFinite(percent) ||
+      percent < MAX_GRADIENT_MIN_PERCENT || percent > MAX_GRADIENT_MAX_PERCENT) {
+    throw new RangeError(
+      `The maximum gradient must be a number of percent between ${MAX_GRADIENT_MIN_PERCENT} and ${MAX_GRADIENT_MAX_PERCENT} ` +
+      `(default ${MAX_GRADIENT_DEFAULT_PERCENT}, i.e. 1 in ${Math.round(100 / MAX_GRADIENT_DEFAULT_PERCENT)}).`
+    );
+  }
+  return Math.round(percent * 100) / 100;
+}
+
+/**
+ * Problems serious enough that the files cannot be used as they are, from a
+ * geometry job's per-leg results. Shown first and never shortened (the
+ * agent's job status and the website), unlike ordinary warnings.
+ *   - legs whose geometry could not be generated at all;
+ *   - routes with no elevation data (every altitude 0), e.g. when the public
+ *     elevation service refused the requests (HTTP 429).
+ * @param {Array<object>} results - runGeometryGeneration's results
+ * @returns {string[]}
+ */
+export function describeSeriousProblems(results) {
+  const problems = [];
+  const list = Array.isArray(results) ? results : [];
+  const succeeded = list.filter(r => !r.error);
+  const failed = list.filter(r => r.error);
+  if (failed.length > 0 && succeeded.length > 0) {
+    problems.push(
+      `Geometry could not be generated for ${failed.length} of ${list.length} legs: ` +
+      failed.map(r => `${r.section} (${r.error})`).join('; ') +
+      '. Those legs have no geometry file, no region and no infrastructure, so the network has gaps.'
+    );
+  }
+
+  const routes = [];
+  for (const r of succeeded) {
+    if (r.elevation) routes.push({ route: r.section, ok: r.elevation.ok !== false, reason: r.elevation.reason });
+    for (const alt of r.alternativeElevation || []) {
+      routes.push({ route: alt.route, ok: alt.ok !== false, reason: alt.reason });
+    }
+  }
+  const missing = routes.filter(r => !r.ok);
+  if (missing.length > 0) {
+    const reason = missing.find(r => r.reason)?.reason;
+    const rateLimited = missing.some(r => /\b429\b|too many requests|rate limit|circuit open/i.test(r.reason || ''));
+    const why = (reason ? ` Reason: ${reason}.` : '') +
+      (rateLimited
+        ? ' The public elevation service refused the requests because it was busy. Wait 15-30 minutes and generate the files again.'
+        : ' Try generating the files again later.');
+    if (missing.length === routes.length) {
+      problems.unshift(
+        `No elevation data: all altitudes are 0, so this geometry cannot be used as it is ` +
+        `(gradients, and therefore running times, would be wrong).${why}`
+      );
+    } else {
+      problems.unshift(
+        `No elevation data for ${missing.length} of ${routes.length} routes (${missing.map(r => r.route).join(', ')}): ` +
+        `their altitudes are all 0, so those geometry files cannot be used as they are.${why}`
+      );
+    }
+  }
+  return problems;
+}
 
 /**
  * Error thrown when a generated network has more nodes than allowed.
@@ -117,15 +202,42 @@ export function buildGeometrySegments(sessionData) {
 }
 
 /**
+ * Geometry.kml in the session folder (beside Regions.csv): every route in
+ * geometry/ as a line, for checking in Google Earth. The same KML as the
+ * website's "Generate & Download KMZ" button. Removed when there is no
+ * geometry. Never fails the job.
+ * @param {string} sessionDirPath
+ */
+export async function writeGeometryKml(sessionDirPath) {
+  const kmlPath = path.join(sessionDirPath, 'Geometry.kml');
+  try {
+    const built = await buildGeometryKml(path.join(sessionDirPath, 'geometry'));
+    if (built) {
+      await fs.writeFile(kmlPath, built.kml, 'utf-8');
+    } else {
+      await fs.rm(kmlPath, { force: true });
+    }
+  } catch (kmlErr) {
+    console.warn(`[Geometry API] Could not write Geometry.kml: ${kmlErr.message}`);
+  }
+}
+
+/**
  * The geometry job: geometry CSVs (main route + _altN per segment),
- * Regions.csv, osm_topology.json and corridor data.
+ * Regions.csv, Geometry.kml, osm_topology.json and corridor data.
  *
- * @param {{sessionId: string, sessionPath: string, spacingMetres: number, segments: Array}} data
+ * @param {{sessionId: string, sessionPath: string, spacingMetres: number, segments: Array,
+ *          maxGradientPercent?: number, outputStamp?: string}} data
+ *   maxGradientPercent: elevation smoothing limit (default MAX_GRADIENT_DEFAULT_PERCENT)
+ *   outputStamp: date stamp for the download names (default: now, see utils/outputNames.js)
  * @param {(progress: number, step: string) => void} updateProgress
- * @returns {Promise<{sessionId, totalSections, successfulSections, results, regionsWarning}>}
+ * @returns {Promise<{sessionId, totalSections, successfulSections, results, regionsWarning,
+ *          seriousProblems: string[], maxGradientPercent: number, outputStamp: string}>}
  */
 export async function runGeometryGeneration(data, updateProgress) {
   const { sessionId, sessionPath: sessionDirPath, spacingMetres, segments } = data;
+  const maxGradientPercent = parseMaxGradientPercent(data.maxGradientPercent);
+  const outputStamp = isValidOutputStamp(data.outputStamp) ? data.outputStamp : makeOutputStamp();
   const results = [];
   const geometryDir = path.join(sessionDirPath, 'geometry');
   const sessionPath = path.join(sessionDirPath, 'session.json');
@@ -186,7 +298,8 @@ export async function runGeometryGeneration(data, updateProgress) {
         segment.sections,
         relationWayIdCache,
         sessionDirPath,
-        priorCenterlines
+        priorCenterlines,
+        { maxGradient: maxGradientPercent / 100 }
       );
 
       // rawCoords is only for the next segments' alt-route detection — keep it
@@ -272,6 +385,8 @@ export async function runGeometryGeneration(data, updateProgress) {
   // Strip infraTopology from results before returning (large payload)
   for (const r of results) delete r.infraTopology;
 
+  await writeGeometryKml(sessionDirPath);
+
   // Update session metadata with real corridorBboxes derived from centerline
   // geometry (replacing the preliminary ones set at /confirm from searchBboxes).
   // Also write corridor_polygons.json for map visualization.
@@ -321,6 +436,19 @@ export async function runGeometryGeneration(data, updateProgress) {
     delete r.bufferPolygon;
   }
 
+  const seriousProblems = describeSeriousProblems(results);
+  // The stamp, gradient and problems of this run, for the download names and
+  // for the infrastructure step (which belongs to the same set of files).
+  try {
+    await updateSessionMetadata(sessionId, {
+      outputStamp,
+      geometryMaxGradientPercent: maxGradientPercent,
+      geometrySeriousProblems: seriousProblems
+    });
+  } catch (metaErr) {
+    console.warn(`[Geometry API] Could not record the output stamp: ${metaErr.message}`);
+  }
+
   await updateProgress(100, 'All segments processed');
 
   return {
@@ -328,7 +456,10 @@ export async function runGeometryGeneration(data, updateProgress) {
     totalSections: segments.length,
     successfulSections: results.filter(r => !r.error).length,
     results,
-    regionsWarning
+    regionsWarning,
+    seriousProblems,
+    maxGradientPercent,
+    outputStamp
   };
 }
 
@@ -404,10 +535,14 @@ export async function runInfrastructureGeneration(jobData, progressCallback, gen
     infrastructureWarnings: result.warnings
   });
 
+  let stamp = null;
+  try { stamp = (readSessionMetadataSync(sessionId) || {}).outputStamp || null; } catch { /* no stamp */ }
+
   return {
     filePath: outputPath,
     fileName: 'Infrastructure.csv',
     regionsFile: 'Regions.csv',
+    outputStamp: stamp,
     nodeCount: result.nodeCount,
     connectionCount: result.connectionCount,
     warnings: result.warnings

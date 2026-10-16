@@ -102,11 +102,21 @@ export function shortenWarnings(warnings, { maxItems = 20, maxChars = 400 } = {}
 export function summariseGeometry(geometryResult) {
   return (geometryResult.results || []).map(r => {
     if (r.error) return { route: r.section, error: r.error };
-    return {
+    const summary = {
       route: r.section,
       length_km: typeof r.lengthKm === 'number' ? Math.round(r.lengthKm * 10) / 10 : undefined,
       points: r.pointCount,
       alternative_routes: r.alternativeCount || 0
     };
+    if (r.elevation) summary.elevation_data = r.elevation.ok !== false;
+    const altsWithout = (r.alternativeElevation || []).filter(a => a.ok === false).length;
+    if (altsWithout > 0) summary.alternative_routes_without_elevation = altsWithout;
+    // How much the maximum-gradient smoothing changed this route's profile
+    // (compare runs with different max_gradient_percent).
+    if (r.smoothing) {
+      summary.smoothing_points_adjusted = r.smoothing.adjustedCount;
+      summary.smoothing_largest_change_m = Math.round((r.smoothing.maxAdjustmentM || 0) * 10) / 10;
+    }
+    return summary;
   });
 }

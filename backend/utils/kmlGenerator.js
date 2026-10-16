@@ -1,7 +1,14 @@
 /**
  * KML/KMZ Generator
- * Port of the working lib/io.js generateLinesKML method to backend
+ * Port of the working lib/io.js generateLinesKML method to backend.
+ * buildGeometryKml() makes the same KML as the website's "Generate &
+ * Download KMZ" button (whose doc.kml it is) from a session's geometry
+ * folder; the agent's download ZIP includes it for checking the routes in
+ * Google Earth.
  */
+
+import path from 'path';
+import { promises as fs } from 'fs';
 
 /**
  * KML color palette (ABGR format) - matching frontend lib/io.js
@@ -86,7 +93,7 @@ export function generateLinesKML(geometryDict, params = {}) {
   kml += '<kml xmlns="http://www.opengis.net/kml/2.2">\n';
   kml += '<Document>\n';
   kml += '  <name>Traxim Centerlines</name>\n';
-  kml += '  <description>Generated from geometry CSV files</description>\n';
+  kml += '  <description>Generated from CSV files</description>\n';
   
   // Add styles
   kml += generateKMLStyles();
@@ -123,6 +130,39 @@ export function generateLinesKML(geometryDict, params = {}) {
   }
   
   kml += '  </Folder>\n';
+
+  // Posts folder (kilometrage markers), hidden by default - as lib/io.js
+  kml += '  <Folder>\n';
+  kml += '    <name>Posts</name>\n';
+  kml += '    <visibility>0</visibility>\n';
+
+  for (const [sectionName, points] of Object.entries(geometryDict)) {
+    if (points.length === 0) continue;
+
+    kml += '    <Folder>\n';
+    kml += `      <name>${escapeXml(sectionName)}</name>\n`;
+
+    for (const point of points) {
+      if (point.chainage !== null && point.chainage !== undefined && !isNaN(point.chainage)) {
+        const km = point.chainage.toFixed(3);
+        kml += '      <Placemark>\n';
+        kml += `        <name>km ${km}</name>\n`;
+        kml += '        <visibility>0</visibility>\n';
+        kml += '        <styleUrl>#post_style</styleUrl>\n';
+        kml += '        <Point>\n';
+        kml += `          <altitudeMode>${altMode}</altitudeMode>\n`;
+        const alt = altMode === 'absolute' ? (point.altitude + offset) * exaggeration : 0;
+        kml += `          <coordinates>${point.longitude.toFixed(8)},${point.latitude.toFixed(8)},${alt.toFixed(3)}</coordinates>\n`;
+        kml += '        </Point>\n';
+        kml += '      </Placemark>\n';
+      }
+    }
+
+    kml += '    </Folder>\n';
+  }
+
+  kml += '  </Folder>\n';
+
   kml += '</Document>\n';
   kml += '</kml>';
   
@@ -132,10 +172,15 @@ export function generateLinesKML(geometryDict, params = {}) {
 }
 
 /**
- * Read backend geometry CSV format (lat,lon,ele per line)
+ * Read a geometry CSV. Two layouts:
+ *  - Traxim geometry (what the File Generator writes):
+ *      region name, latitude, longitude, elevation, kilometerage[, raw_elevation]
+ *    (read like lib/io.js readCsvLatLongCharlotte, as the website does);
+ *  - plain lat, lon[, elevation] per line.
+ * Lines starting with # are skipped.
  * @param {string} csvContent - CSV file content
  * @param {string} sectionName - Section name from filename
- * @returns {Array} Array of point objects
+ * @returns {Array<{latitude, longitude, altitude, chainage?}>}
  */
 export function readGeometryCSV(csvContent, sectionName) {
   const lines = csvContent.split(/\r?\n/);
@@ -145,17 +190,23 @@ export function readGeometryCSV(csvContent, sectionName) {
     const line = lines[i].trim();
     if (line === '' || line.startsWith('#')) continue;
     
-    const parts = line.split(',');
-    if (parts.length >= 2) {
-      const lat = parseFloat(parts[0]);
-      const lon = parseFloat(parts[1]);
-      const alt = parts.length >= 3 ? parseFloat(parts[2]) : 0;
+    const delimiter = line.includes('\t') ? '\t' : ',';
+    const parts = line.split(delimiter).map(p => p.trim());
+    // A non-numeric first column is the region name (Traxim geometry layout).
+    const named = parts.length >= 3 && !Number.isFinite(Number(parts[0]));
+    const values = named ? parts.slice(1) : parts;
+    if (values.length >= 2) {
+      const lat = parseFloat(values[0]);
+      const lon = parseFloat(values[1]);
+      const alt = values.length >= 3 ? parseFloat(values[2]) : 0;
+      const chainage = named && values.length >= 4 ? parseFloat(values[3]) : NaN;
       
       if (!isNaN(lat) && !isNaN(lon)) {
         points.push({
           latitude: lat,
           longitude: lon,
-          altitude: isNaN(alt) ? 0 : alt
+          altitude: isNaN(alt) ? 0 : alt,
+          ...(isNaN(chainage) ? {} : { chainage })
         });
       }
     }
@@ -163,4 +214,38 @@ export function readGeometryCSV(csvContent, sectionName) {
   
   console.log(`[KML Generator] Read ${points.length} points from ${sectionName}`);
   return points;
+}
+
+/** Geometry CSVs in a folder that are routes (not *_wayids.csv diagnostics). */
+function isRouteCsv(fileName) {
+  return fileName.endsWith('.csv') && !fileName.includes('wayids');
+}
+
+/**
+ * The KML of every geometry file in a folder: one line per route (named
+ * like the website does: file name, underscores as spaces) plus a hidden
+ * Posts folder of kilometre markers. Same settings as the website's KMZ
+ * button (lines clamped to the ground).
+ * @param {string} geometryDir
+ * @returns {Promise<{kml: string, routeCount: number}|null>} null if there are no geometry files
+ */
+export async function buildGeometryKml(geometryDir) {
+  let files;
+  try {
+    files = (await fs.readdir(geometryDir)).filter(isRouteCsv).sort();
+  } catch {
+    return null;
+  }
+  const geometryDict = {};
+  for (const file of files) {
+    const sectionName = file.replace('.csv', '').replace(/_/g, ' ');
+    const points = readGeometryCSV(await fs.readFile(path.join(geometryDir, file), 'utf-8'), sectionName);
+    if (points.length > 0) geometryDict[sectionName] = points;
+  }
+  const routeCount = Object.keys(geometryDict).length;
+  if (routeCount === 0) return null;
+  return {
+    kml: generateLinesKML(geometryDict, { altitudeMode: 'clampToGround', exaggeration: 1, offset: 0 }),
+    routeCount
+  };
 }

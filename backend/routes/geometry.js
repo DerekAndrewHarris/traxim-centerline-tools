@@ -4,7 +4,7 @@
  */
 
 import express from 'express';
-import { buildGeometrySegments, runGeometryGeneration } from '../services/generation/pipeline.js';
+import { buildGeometrySegments, parseMaxGradientPercent, runGeometryGeneration } from '../services/generation/pipeline.js';
 import jobQueue from '../utils/jobQueue.js';
 import { asyncHandler } from '../utils/errorHandler.js';
 import { getSession, getSessionFilePath } from '../utils/tempFiles.js';
@@ -18,7 +18,8 @@ const router = express.Router();
  * 
  * Body: {
  *   sessionId: string,
- *   spacingMetres?: number (default: 25)
+ *   spacingMetres?: number (default: 25),
+ *   maxGradientPercent?: number (1-6, default 4: elevation smoothing limit)
  * }
  * 
  * Response: {
@@ -31,6 +32,13 @@ router.post('/generate', asyncHandler(async (req, res) => {
   
   if (!sessionId) {
     return res.status(400).json({ error: 'sessionId is required' });
+  }
+
+  let maxGradientPercent;
+  try {
+    maxGradientPercent = parseMaxGradientPercent(req.body.maxGradientPercent);
+  } catch (rangeError) {
+    return res.status(400).json({ error: rangeError.message });
   }
   
   // Validate session exists
@@ -70,7 +78,8 @@ router.post('/generate', asyncHandler(async (req, res) => {
       sessionId,
       sessionPath: session.path,
       spacingMetres,
-      segments
+      segments,
+      maxGradientPercent
     },
     (data, updateProgress) => runGeometryGeneration(data, updateProgress)
   );
