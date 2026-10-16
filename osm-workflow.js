@@ -97,10 +97,101 @@ const mapLayers = {
 };
 
 /**
+ * Mouse-wheel zoom: one wheel click = one moderate zoom step (half a zoom
+ * level, i.e. the map scale changes by about 1.4x), however the mouse,
+ * driver and browser report the click. Same approach as the 3D-Viewer's
+ * fix (TrainGraphViewer.html, commit b57f2fd), for the same reason:
+ *  - most mice send one event of about 100 px per click;
+ *  - some (e.g. Logitech M240 with some drivers) send a burst of several
+ *    ~100 px events per click. Leaflet's own handler adds the burst up,
+ *    and splits it into several zooms when it lasts longer than 40 ms, so
+ *    one click zoomed 2-4 whole levels (4-16x). Here whole-click events
+ *    closer together than WHEEL_BURST_MS count once;
+ *  - smooth scrolling and trackpads send many small events: each counts as
+ *    a fraction of a step;
+ *  - one oversized event (Windows "scroll lines" setting) is capped at one step.
+ * Add ?wheeldebug=1 to the page address to log what the wheel sends (F12 console).
+ */
+const WHEEL_ZOOM_STEP = 0.5;      // zoom levels per wheel click (1 = double/halve the scale)
+const WHEEL_PX_PER_STEP = 100;    // pixels that count as one click
+const WHEEL_FULL_EVENT_PX = 50;   // events at least this big are whole clicks
+const WHEEL_BURST_MS = 60;        // whole-click events closer together than this are one click
+const WHEEL_APPLY_DELAY_MS = 30;  // gather small (trackpad) events briefly before zooming
+const WHEEL_RESIDUAL_MS = 300;    // a rounding left-over older than this is dropped
+
+function installStepWheelZoom(map) {
+    const container = map.getContainer();
+    const debug = new URLSearchParams(window.location.search).has('wheeldebug');
+    let lastStepTime = -Infinity;
+    let lastEventTime = -Infinity;
+    let pendingSteps = 0;
+    let pendingPoint = null;
+    let timer = null;
+
+    const apply = () => {
+        timer = null;
+        if (pendingSteps === 0) return;
+        // Leaflet ignores a new zoom while a zoom animation is running, so
+        // quick clicks would be lost: wait for it to finish, then zoom on.
+        if (map._animatingZoom) {
+            map.once('zoomend', () => { if (!timer) timer = setTimeout(apply, 0); });
+            return;
+        }
+        const steps = pendingSteps;
+        const from = map.getZoom();
+        const snap = map.options.zoomSnap || 0.25;
+        const wanted = from - steps * WHEEL_ZOOM_STEP;   // wheel down (positive) zooms out
+        const target = Math.max(map.getMinZoom(), Math.min(map.getMaxZoom(), Math.round(wanted / snap) * snap));
+        // Keep what rounding left over, so small trackpad movements add up
+        // (forgotten after a pause, see below); not what the zoom limits cut off.
+        const atLimit = target === map.getMinZoom() || target === map.getMaxZoom();
+        pendingSteps = atLimit ? 0 : steps - (from - target) / WHEEL_ZOOM_STEP;
+        if (debug) console.log(`wheel: ${steps.toFixed(2)} step(s): zoom ${from} -> ${target}`);
+        if (target !== from) map.setZoomAround(pendingPoint, target);
+    };
+
+    container.addEventListener('wheel', (e) => {
+        e.preventDefault();
+        // Normalise to pixels (deltaMode 1 = lines, 2 = pages)
+        const pixels = e.deltaY * (e.deltaMode === 1 ? 40 : e.deltaMode === 2 ? 800 : 1);
+        if (pixels === 0) return;
+
+        let steps;
+        if (Math.abs(pixels) >= WHEEL_FULL_EVENT_PX) {
+            if (e.timeStamp - lastStepTime < WHEEL_BURST_MS) {
+                if (debug) console.log(`wheel: ${pixels.toFixed(1)} px ignored (same click)`);
+                return;
+            }
+            lastStepTime = e.timeStamp;
+            steps = Math.sign(pixels);               // one whole step, capped
+        } else {
+            steps = pixels / WHEEL_PX_PER_STEP;      // fraction of a step
+        }
+        if (debug) console.log(`wheel: ${pixels.toFixed(1)} px -> ${steps.toFixed(2)} step(s)`);
+
+        // A left-over fraction from an earlier, finished movement is dropped,
+        // so a click after a pause is always exactly one step.
+        if (!timer && e.timeStamp - lastEventTime > WHEEL_RESIDUAL_MS) pendingSteps = 0;
+        lastEventTime = e.timeStamp;
+        pendingSteps += steps;
+        pendingPoint = map.mouseEventToContainerPoint(e);
+        if (!timer) timer = setTimeout(apply, WHEEL_APPLY_DELAY_MS);
+    }, { passive: false });
+}
+
+/**
  * Initialize Leaflet Map
  */
 function initMap() {
-    osmMap = L.map('map').setView([45.5, 9.0], 7); // Center on northern Italy
+    osmMap = L.map('map', {
+        // Leaflet's own wheel zoom is replaced by installStepWheelZoom() below.
+        scrollWheelZoom: false,
+        // Allow quarter zoom levels, so a wheel click can be half a level.
+        // The +/- buttons still change a whole level (zoomDelta 1).
+        zoomSnap: 0.25,
+        zoomDelta: 1
+    }).setView([45.5, 9.0], 7); // Center on northern Italy
+    installStepWheelZoom(osmMap);
 
     L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
         attribution: '© OpenStreetMap contributors',
