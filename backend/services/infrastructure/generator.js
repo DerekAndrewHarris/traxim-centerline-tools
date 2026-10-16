@@ -727,7 +727,8 @@ export function markSlipDiamonds(nodes, taggedNodes, warnings = []) {
 export const DRAW_MIN_SPACING_M = 500;
 
 /**
- * Set node.draw (the Draw column; Timing Point follows it) for every node:
+ * Set node.draw (the Draw column) for every node. (Timing Point no longer
+ * follows Draw: it is always False, see buildInfrastructureCsv.) Rules:
  *   - platform nodes: always drawn;
  *   - end nodes (exactly one connection): always drawn, so every line's
  *     start and end shows on the Train Graph;
@@ -3058,7 +3059,7 @@ function buildInfrastructureCsv(nodes, networkName, nodeCount, connectionCount) 
         node.rotation ?? 0,
         node.flip ? 'True' : 'False',
         node.draw === false ? 'False' : 'True', // Draw (assignDrawFlags; nodes without the flag are drawn, as before)
-        node.draw === false ? 'False' : 'True', // Timing Point — mirrors Draw, preserving pre-v7 behaviour where the two were coupled
+        'False', // Timing Point — always False (October 2026): the resolver writes a timetable entry wherever a train stops, so Timing Points are only needed where a user wants passing times; set them in the Network Editor
         'False', // Capacity Point
         node.signalledF === false ? 'False' : 'True',
         node.signalledT === false ? 'False' : 'True',

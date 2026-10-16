@@ -1,7 +1,8 @@
 /**
  * Draw column (October 2026): all platform nodes and end nodes are drawn;
  * every other node only if it is at least DRAW_MIN_SPACING_M (500 m) along
- * the line from the previous drawn node. Timing Point follows Draw.
+ * the line from the previous drawn node. Timing Point is False on every
+ * node (it no longer follows Draw).
  */
 
 import { test } from 'node:test';
@@ -56,10 +57,10 @@ test('a node drawn for one region counts as drawn on its other region', () => {
   assert.equal(nodes[1].draw, true);
 });
 
-test('the CSV writes Draw and Timing Point from the flag', () => {
+test('the CSV writes Draw from the flag and Timing Point False on every node', () => {
   const nodes = line([0, 0.2, 1]);
   assignDrawFlags(nodes);
   const rows = parseInfrastructureCsv(buildInfrastructureCsv(nodes, 'T', nodes.length, nodes.length));
   assert.deepEqual(rows.map(r => r.Draw), ['True', 'False', 'True']);
-  assert.deepEqual(rows.map(r => r['Timing Point']), ['True', 'False', 'True']);
+  assert.deepEqual(rows.map(r => r['Timing Point']), ['False', 'False', 'False']);
 });
