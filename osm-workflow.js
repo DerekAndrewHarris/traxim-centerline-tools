@@ -1795,8 +1795,10 @@ const SESSION_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-
 const AGENT_VIEW_STATE_TEXT = {
     searching: 'The agent is still looking up the waypoints and searching for railway sections. Reload this page in a minute.',
     search_failed: 'The search for railway sections failed. Ask the agent to try again.',
-    awaiting_confirmation: 'Sections found. Choose the sections to include: either here (tick them, then press "Use these sections"), or by telling the agent in the chat which numbered sections you want.',
-    confirmed: 'The sections are chosen (see below). Go back to the chat and tell the agent: it will read your choice back to you before it generates the files.',
+    awaiting_confirmation: 'Sections found. Choose the sections to include: either here (tick them, then press "Use these sections"), or by telling the agent in the chat which numbered sections you want. If you choose here, go back to your chat afterwards and tell the agent you have chosen: the agent is not told automatically.',
+    // The agent cannot be notified from this page (MCP cannot push into the
+    // chat): it only sees the choice when the user next writes to it.
+    confirmed: "Your choice is recorded. Now go back to your chat and tell the agent you've chosen (for example 'I've chosen the sections on the map'). The agent is not told automatically: it only sees your choice when you next write to it. It will then read your choice back to you before it generates the files.",
     generating: 'The files are being generated. Reload this page later, or ask the agent for progress.',
     ready: 'The files are ready.',
     generation_failed: 'Generation failed. Ask the agent what went wrong.',
@@ -1960,7 +1962,9 @@ function renderAgentSessionView(sessionId, view) {
         howTo = '<p style="font-size:12px;"><strong>Tick or untick sections to compare them on the map</strong> ' +
             '(a ticked section is drawn on top; hover a line to see its name). ' +
             '<strong>Ticking alone does not choose anything:</strong> press <em>Use these sections</em> to record your choice, ' +
-            'or tell the agent your choice in the chat instead.</p>';
+            'or tell the agent your choice in the chat instead. ' +
+            '<strong>After pressing the button, go back to your chat and tell the agent you have chosen</strong> ' +
+            '(the agent is not told automatically).</p>';
     } else if (chosen.length) {
         howTo = `<p style="font-size:12px;"><strong>${escapeHtml(describeAgentChoice(confirmation))}</strong> ` +
             'Lines on the map: the chosen sections. To change the choice, tell the agent in the chat.</p>';
@@ -1975,7 +1979,9 @@ function renderAgentSessionView(sessionId, view) {
 
     showAgentViewMessage(
         `<p><strong>Agent session${view.label ? ': ' + escapeHtml(view.label) : ''}</strong></p>` +
-        `<p>${escapeHtml(AGENT_VIEW_STATE_TEXT[view.state] || '')}</p>` +
+        (view.state === 'confirmed'
+            ? `<p class="warning"><strong>${escapeHtml(AGENT_VIEW_STATE_TEXT.confirmed)}</strong></p>`
+            : `<p>${escapeHtml(AGENT_VIEW_STATE_TEXT[view.state] || '')}</p>`) +
         howTo +
         download +
         (sectionRows ? `<ol style="list-style:none;padding-left:0;margin-top:10px;">${sectionRows}</ol>` : '') +
@@ -2028,7 +2034,7 @@ function wireAgentSectionChoice(sessionId, sections) {
             const s = sections.find(x => x.number === n);
             return `${n}. ${s ? s.name : ''}`;
         }).join('\n');
-        if (!window.confirm(`Use these ${numbers.length} section(s) for the files?\n\n${names}\n\nThe agent will read your choice back to you in the chat before it generates the files.`)) {
+        if (!window.confirm(`Use these ${numbers.length} section(s) for the files?\n\n${names}\n\nAfterwards, go back to your chat and tell the agent you've chosen: it is not told automatically. It will read your choice back to you before it generates the files.`)) {
             return;
         }
         button.disabled = true;
