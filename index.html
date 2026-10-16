@@ -20,7 +20,6 @@
                 <div class="header-text">
                     <h1>Traxim File Generator</h1>
                     <p class="subtitle">Generate Traxim input files from OpenStreetMap  •  Convert between KML and CSV formats</p>
-                    <p class="subtitle" style="font-size: 0.8em; opacity: 0.6;">v2024.02.24 + OSM</p>
                     <p class="subtitle" style="font-size: 0.8em; opacity: 0.6;">No login needed. A Traxim login is only needed to use the File Generator with an AI agent.</p>
                 </div>
             </div>
@@ -428,11 +427,10 @@
     <script src="app.js?v=__BUILD_ID__" onerror="console.error('Failed to load app.js'); alert('Error: Failed to load app.js');"></script>
     
     <script>
-        // Version tracking
-        const APP_VERSION = 'v2024.02.24-OSM';
+        // Which deployed version this is: the deploy replaces the build id below
+        // with the git commit (the same id as the ?v= on the script files).
         console.log('%c=== Traxim File Generator ===', 'font-weight: bold; color: #0066cc;');
-        console.log('%cVersion: ' + APP_VERSION, 'color: #0066cc;');
-        console.log('%cUpdated: 2024-02-24 + OSM', 'color: #0066cc;');
+        console.log('%cBuild: __BUILD_ID__', 'color: #0066cc;');
         console.log('%c============================', 'font-weight: bold; color: #0066cc;');
         
         // Verify all required classes are loaded
