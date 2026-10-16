@@ -665,6 +665,61 @@ function resolveKmConstraints(nodes, geometryBySection) {
 }
 
 /**
+ * Slip crossings (October 2026). In OpenStreetMap (OpenRailwayMap tagging) a
+ * slip is the node where the two tracks cross, tagged railway=switch with
+ * railway:switch=double_slip or single_slip; a plain diamond is
+ * railway=railway_crossing (or untagged). The generator makes every crossing
+ * of two tracks a diamond node; a diamond whose OSM node is tagged as a slip
+ * gets node.slip = 'DoubleSlip' or 'SingleSlip', written to column AP
+ * ("Slip") of the Infrastructure file for the Network Editor. The diamond
+ * itself is unchanged (the resolver has no slips; the Network Editor turns a
+ * double slip into back-to-back turnouts when it saves).
+ * The marker uses the Network Editor's own DiamondType names (TraximCommon
+ * DiamondType.DoubleSlip); OSM has no tag for which side a single slip's
+ * slip road is on.
+ */
+export const SLIP_MARKERS = { double_slip: 'DoubleSlip', single_slip: 'SingleSlip' };
+
+/**
+ * Mark diamond nodes whose OSM node is tagged as a slip (see SLIP_MARKERS).
+ * Needs node._topoKey (the diamond's own coordinate key), so runs before the
+ * internal annotations are removed.
+ * @returns {{double: number, single: number}}
+ */
+export function markSlipDiamonds(nodes, taggedNodes, warnings = []) {
+  const slipAt = new Map();
+  for (const tn of taggedNodes) {
+    const kind = tn.tags && tn.tags.railway === 'switch' ? SLIP_MARKERS[tn.tags['railway:switch']] : null;
+    if (kind) slipAt.set(makeCoordKey(tn.lat, tn.lon), { kind, tn });
+  }
+  const counts = { double: 0, single: 0 };
+  if (slipAt.size === 0) return counts;
+  const used = new Set();
+  for (const node of nodes) {
+    if (node.railwayType !== 'diamond' || !node._topoKey) continue;
+    const hit = slipAt.get(node._topoKey);
+    if (!hit) continue;
+    node.slip = hit.kind;
+    used.add(node._topoKey);
+    if (hit.kind === 'DoubleSlip') counts.double++; else counts.single++;
+  }
+  if (counts.double + counts.single > 0) {
+    warnings.push(`Slips: ${counts.double} double slip(s) and ${counts.single} single slip(s) found in OpenStreetMap; ` +
+      `they are diamonds in the file, marked in column AP ("Slip") for the Network Editor.`);
+  }
+  // A slip tag on a node the topology did not make a crossing: say so
+  // rather than drop it silently. Only those near a generated node matter.
+  const unmatched = [...slipAt.entries()].filter(([key, { tn }]) => !used.has(key) &&
+    nodes.some(n => n._topoKey === key || haversineM(n, tn) < 50));
+  if (unmatched.length > 0) {
+    warnings.push(`Slips: ${unmatched.length} OpenStreetMap node(s) tagged as a slip are not a crossing of two tracks in the ` +
+      `generated network (left as they are; check in the Network Editor): ` +
+      unmatched.map(([, { tn }]) => `${tn.tags['railway:switch']} at ${tn.lat.toFixed(5)},${tn.lon.toFixed(5)}`).join(', '));
+  }
+  return counts;
+}
+
+/**
  * Minimum spacing along a line between drawn nodes that are not platforms or
  * end nodes (Draw column, October 2026). Drawing every node made the Train
  * Graph unreadable.
@@ -1774,6 +1829,9 @@ async function generateInfrastructureForSections(confirmedSections, networkName,
 
   // ── Step 8f: End nodes at the end of the geometry (October 2026) ──
   clampEndNodesToGeometry(nodes, geometryBySection, warnings);
+
+  // ── Step 8g: Single and double slips (October 2026) ──
+  markSlipDiamonds(nodes, splitTopo.taggedNodes || [], warnings);
 
   updateProgress(70, 'Applying spatial separation');
 
@@ -2966,7 +3024,7 @@ function buildInfrastructureCsv(nodes, networkName, nodeCount, connectionCount) 
   const lines = [
     `#7,Traxim v7 ${formatTimestamp(new Date())} nodes ${nodeCount} connections ${connectionCount}`,
     networkName,
-    `#Name,F Enabled,T Enabled,D Enabled,X Enabled,F Node,F on branch,T Node,T on branch,D Node,D on branch,X Node,X on branch,Region1,Km1,Region2,Km2,Region3,Km3,Region4,Km4,Default branch,Length,Width,Rotation,Flip,Draw,Timing Point,Capacity Point,Signalled F,Signalled T,SimEntry Permitted,SimArrival Timeout,PosX,PosY,OffsetX,OffsetY,Latitude,Longitude`,
+    `#Name,F Enabled,T Enabled,D Enabled,X Enabled,F Node,F on branch,T Node,T on branch,D Node,D on branch,X Node,X on branch,Region1,Km1,Region2,Km2,Region3,Km3,Region4,Km4,Default branch,Length,Width,Rotation,Flip,Draw,Timing Point,Capacity Point,Signalled F,Signalled T,SimEntry Permitted,SimArrival Timeout,PosX,PosY,OffsetX,OffsetY,Latitude,Longitude,Notes,Angled Legs,Slip`,
   ];
 
   for (const node of nodes) {
@@ -3012,6 +3070,9 @@ function buildInfrastructureCsv(nodes, networkName, nodeCount, connectionCount) 
         node.offsetY ?? '0',
         node.lat.toFixed(8),
         node.lon.toFixed(8),
+        '', // Notes (AN) — Network Editor only
+        '', // Angled Legs (AO) — Network Editor only; empty = its default
+        node.slip || '', // Slip (AP) — Network Editor only: DoubleSlip / SingleSlip on a slip diamond (markSlipDiamonds)
       ].join(',')
     );
   }
