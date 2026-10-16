@@ -210,3 +210,33 @@ test('normal DEM noise (corrections under 50 m) gives no elevation check warning
   const { smoothed } = applyGradientEnvelopeSmoothing(raw, chainage, DEFAULT_RULING_GRADIENT);
   assert.deepEqual(largeSmoothingCorrectionWarnings('A', raw, smoothed, chainage), []);
 });
+
+// ── Alternative routes: marked tunnels/bridges now get the portal-to-portal line ──
+// Before, only the main route did. On the Cinque Terre alternatives (almost
+// all in tunnels marked in OSM) smoothing then had to move points by ~250 m.
+
+test('alternative routes: each coordinate is given its OSM way, so marked tunnels are found', async () => {
+  const { coordWayIdsFromWays, extractTaggedIntervals, buildCumulativeDistances } = await import('../backend/services/geometry/processor.js');
+  const p = (x) => ({ lat: 44.1, lon: 9.8 + x / 80000 });
+  // Way 1 (open) 0-1000 m, way 2 (tunnel) 1000-3000 m, way 3 (open) 3000-4000 m.
+  const geom = new Map([
+    ['1', [p(0), p(500), p(1000)]],
+    ['2', [p(1000), p(2000), p(3000)]],
+    ['3', [p(3000), p(3500), p(4000)]]
+  ]);
+  const coords = [p(0), p(500), p(1000), p(2000), p(3000), p(3500), p(4000)];
+  const ids = coordWayIdsFromWays(coords, ['1', '2', '3'], geom);
+  assert.deepEqual(ids, ['1', '1', '1', '2', '2', '3', '3']);
+  const tags = new Map([['1', {}], ['2', { tunnel: 'yes' }], ['3', {}]]);
+  const intervals = extractTaggedIntervals(ids, buildCumulativeDistances(coords), tags, 'tunnel');
+  assert.equal(intervals.length, 1);
+  const len = buildCumulativeDistances(coords);
+  assert.ok(Math.abs(intervals[0].startM - len[2]) < 1 && Math.abs(intervals[0].endM - len[4]) < 1, 'tunnel from way 2 start to end');
+});
+
+test('alternative routes: a point made by trimming (on no way) keeps the way before it', async () => {
+  const { coordWayIdsFromWays } = await import('../backend/services/geometry/processor.js');
+  const p = (x) => ({ lat: 44.1, lon: 9.8 + x / 80000 });
+  const geom = new Map([['7', [p(0), p(500), p(1000)]]]);
+  assert.deepEqual(coordWayIdsFromWays([p(0), p(500), p(777)], ['7'], geom), ['7', '7', '7']);
+});

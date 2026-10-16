@@ -2038,3 +2038,50 @@ export function largeSmoothingCorrectionWarnings(routeLabel, raw, smoothed, chai
     'This is probably a bridge or viaduct not marked in OpenStreetMap (the elevation data then gives the height ' +
     'of the valley floor or water below it)'));
 }
+
+/**
+ * The source way id of each coordinate of an alternative route (the segment
+ * between coords[i-1] and coords[i] belongs to the returned id at i), worked
+ * out from the route's own ways, for extractTaggedIntervals.
+ *
+ * The main route's chain records this as it is built (chainWaysViaGraph);
+ * alternative routes only keep the list of their ways, so until October 2026
+ * they got NO tunnel/bridge elevation correction at all: on the Cinque Terre
+ * (La Spezia - Levanto alternatives, almost all in tunnels marked in OSM) the
+ * raw elevation data gave the hillside, up to ~500 m above the track, and
+ * smoothing moved points by up to 250-290 m.
+ *
+ * A coordinate that lies on no way (e.g. a point made by trimming) takes the
+ * id of the coordinate before it.
+ *
+ * @param {Array<{lat:number, lon:number}>} coords
+ * @param {Array<string>} wayIds - the route's ways
+ * @param {Map<string, Array<{lat:number, lon:number}>>} wayGeometry
+ * @returns {Array<string|null>}
+ */
+export function coordWayIdsFromWays(coords, wayIds, wayGeometry) {
+  const key = (p) => `${Number(p.lat).toFixed(7)},${Number(p.lon).toFixed(7)}`;
+  const waysAt = new Map();
+  for (const wid of wayIds || []) {
+    const pts = wayGeometry?.get(wid) || wayGeometry?.get(String(wid));
+    if (!pts) continue;
+    for (const p of pts) {
+      const k = key(p);
+      if (!waysAt.has(k)) waysAt.set(k, []);
+      const list = waysAt.get(k);
+      if (!list.includes(String(wid))) list.push(String(wid));
+    }
+  }
+  const out = new Array(coords.length).fill(null);
+  let last = null;
+  for (let i = 0; i < coords.length; i++) {
+    const here = waysAt.get(key(coords[i])) || [];
+    const before = i > 0 ? (waysAt.get(key(coords[i - 1])) || []) : [];
+    const shared = here.filter(w => before.includes(w));
+    const id = shared[0] ?? here.find(w => w === last) ?? here[0] ?? last;
+    out[i] = id ?? null;
+    if (id) last = id;
+  }
+  if (out.length > 1 && out[0] === null) out[0] = out[1];
+  return out;
+}

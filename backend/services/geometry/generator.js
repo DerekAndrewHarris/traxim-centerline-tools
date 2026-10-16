@@ -38,6 +38,7 @@ import {
   applyPortalElevationInterpolation,
   applyGradientEnvelopeSmoothing,
   largeSmoothingCorrectionWarnings,
+  coordWayIdsFromWays,
   DEFAULT_RULING_GRADIENT
 } from './processor.js';
 import { fetchElevations } from '../elevation.js';
@@ -479,7 +480,8 @@ export async function generateGeometryForSegment(segmentLabel, segmentBbox, outp
 
       try {
         const altResult = await generateAlternativeGeometry(
-          segmentLabel, alt, altIdx + 1, outputDir, spacingMetres, warnings, rulingGradient
+          segmentLabel, alt, altIdx + 1, outputDir, spacingMetres, warnings, rulingGradient,
+          splitWayGeometry, splitWayTags
         );
         alternativeFiles.push(altResult.filePath);
         alternativeElevation.push({ route: altResult.label, ok: altResult.elevation.ok, reason: altResult.elevation.reason });
@@ -661,7 +663,8 @@ export async function generateGeometryForSegment(segmentLabel, segmentBbox, outp
 /**
  * Generate a geometry CSV for one alternative route.
  */
-async function generateAlternativeGeometry(segmentLabel, alternative, altNumber, outputDir, spacingMetres, warnings, rulingGradient = DEFAULT_RULING_GRADIENT) {
+async function generateAlternativeGeometry(segmentLabel, alternative, altNumber, outputDir, spacingMetres, warnings, rulingGradient = DEFAULT_RULING_GRADIENT,
+  wayGeometry = null, wayTags = null) {
   const safeName = segmentLabel.replace(/[^a-zA-Z0-9_\-]/g, '_');
   const altLabel = `${segmentLabel}_alt${altNumber}`;
   const altSafeName = `${safeName}_alt${altNumber}`;
@@ -675,6 +678,17 @@ async function generateAlternativeGeometry(segmentLabel, alternative, altNumber,
 
   const processedPoints = processTrackPoints(rawPoints, spacingMetres);
 
+  // Tunnel/bridge sections, as on the main route (October 2026: alternative
+  // routes used to skip this, so inside a marked tunnel they got the height
+  // of the hillside above it). Same functions, same rules as the main route.
+  let tunnelIntervals = [], bridgeIntervals = [], altRawChainageM = null;
+  if (wayGeometry && wayTags && alternative.wayIds && alternative.coords.length >= 2) {
+    const coordWayIds = coordWayIdsFromWays(alternative.coords, alternative.wayIds, wayGeometry);
+    altRawChainageM = buildCumulativeDistances(alternative.coords);
+    tunnelIntervals = extractTaggedIntervals(coordWayIds, altRawChainageM, wayTags, 'tunnel');
+    bridgeIntervals = extractTaggedIntervals(coordWayIds, altRawChainageM, wayTags, 'bridge');
+  }
+
   // Elevation
   let elevation = { ok: true, reason: null };
   try {
@@ -685,6 +699,11 @@ async function generateAlternativeGeometry(segmentLabel, alternative, altNumber,
       elevation = { ok: false, reason: elevResults.degradedReason };
     } else if (elevResults.length > 0 && elevResults.every(r => r.elevation === 0)) {
       elevation = { ok: false, reason: 'the elevation data gave 0 m for every point (all sea, or no data)' };
+    }
+    if (tunnelIntervals.length > 0 || bridgeIntervals.length > 0) {
+      const finalChainageM = mapPointsToChainage(elevPts, alternative.coords, altRawChainageM);
+      applyPortalElevationInterpolation(elevResults, finalChainageM, tunnelIntervals);
+      applyPortalElevationInterpolation(elevResults, finalChainageM, bridgeIntervals);
     }
     for (let i = 0; i < processedPoints.length; i++) {
       processedPoints[i].altitude = elevResults[i].elevation;
