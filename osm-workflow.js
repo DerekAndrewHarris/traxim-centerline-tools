@@ -58,8 +58,33 @@ const state = {
     sectionsCache: new Map(), // Cache for sections queries
     pins: {},           // waypointId -> {lat, lon} for map-clicked waypoints
     pinMarkers: {},      // waypointId -> Leaflet marker for map-clicked waypoints
-    pickingWaypointId: null // waypointId currently armed for a map click, or null
+    pickingWaypointId: null, // waypointId currently armed for a map click, or null
+    outputStamp: null,   // date stamp of the last geometry run, for download names
+    seriousProblems: []  // problems that make the files unusable as they are
 };
+
+/**
+ * Download name with the run's date stamp, as the Network Editor names its
+ * files: "Regions.csv" -> "Regions_2026-10-16_093012.csv". The stamp comes
+ * from the server (one per geometry run, also used for Infrastructure).
+ */
+function stampedFileName(name) {
+    const stamp = state.outputStamp;
+    if (!stamp || !/^\d{4}-\d{2}-\d{2}_\d{6}$/.test(stamp)) return name;
+    const dot = name.lastIndexOf('.');
+    return dot > 0 ? `${name.slice(0, dot)}_${stamp}${name.slice(dot)}` : `${name}_${stamp}`;
+}
+
+/** Red box listing problems that make the files unusable as they are (or '' if none). */
+function seriousProblemsHtml(problems) {
+    if (!problems || problems.length === 0) return '';
+    const items = problems.map(p => `<li style="margin-bottom:6px;">${escapeHtml(p)}</li>`).join('');
+    return '<div class="serious-problems" style="border:2px solid #e53935;background:rgba(229,57,53,0.12);' +
+        'border-radius:6px;padding:10px 12px;margin-bottom:12px;">' +
+        '<p style="margin:0 0 6px;color:#ff8a80;"><strong>&#9888; Serious problem' + (problems.length > 1 ? 's' : '') +
+        ': these files cannot be used as they are</strong></p>' +
+        `<ul style="margin:0;padding-left:18px;color:#ffcdd2;">${items}</ul></div>`;
+}
 
 // Map Reference
 let osmMap = null;
@@ -118,6 +143,8 @@ function resetWorkflowUI() {
     state.pins = {};
     state.pinMarkers = {};
     state.pickingWaypointId = null;
+    state.outputStamp = null;
+    state.seriousProblems = [];
 
     // Waypoints list back to two empty rows
     document.getElementById('waypointsList').innerHTML = '';
@@ -150,6 +177,7 @@ function resetWorkflowUI() {
     btnGenGeom.disabled = true;
     btnGenGeom.classList.remove('btn-loading', 'confirmed');
     btnGenGeom.textContent = 'Confirm routes and generate geometry (this may take a few minutes)';
+    document.getElementById('maxGradientGroup').style.display = 'none';
 
     // Geometry download panel
     document.getElementById('progressGeometry').style.display = 'none';
@@ -668,6 +696,7 @@ async function querySections() {
 
         clearButtonBusy(btn, 'Query OSM Sections (this may take a few minutes)');
         document.getElementById('btnGenerateGeometry').style.display = 'block';
+        document.getElementById('maxGradientGroup').style.display = 'block';
 
     } catch (error) {
         console.error('Section query error:', error);
@@ -923,6 +952,12 @@ async function generateGeometry() {
         return;
     }
 
+    const maxGradientPercent = parseFloat(document.getElementById('inputMaxGradient').value);
+    if (!Number.isFinite(maxGradientPercent) || maxGradientPercent < 1 || maxGradientPercent > 6) {
+        alert('The maximum gradient must be between 1% and 6% (default 4%).');
+        return;
+    }
+
     const btn = document.getElementById('btnGenerateGeometry');
     setButtonBusy(btn, 'Confirming sections…');
 
@@ -942,9 +977,13 @@ async function generateGeometry() {
         const response = await fetch(`${API_BASE}/geometry/generate`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ sessionId: state.sessionId, spacingMetres: spacing })
+            body: JSON.stringify({ sessionId: state.sessionId, spacingMetres: spacing, maxGradientPercent })
         });
-        if (!response.ok) throw new Error(`Geometry generation failed: ${response.status}`);
+        if (!response.ok) {
+            let message = `Geometry generation failed: ${response.status}`;
+            try { const body = await response.json(); if (body && body.error) message = body.error; } catch (e) { /* not JSON */ }
+            throw new Error(message);
+        }
 
         const data = await response.json();
         state.geometryJobId = data.jobId;
@@ -1057,6 +1096,10 @@ function displayGeometryResults(result) {
     const resultsDiv = document.getElementById('geometryResults');
     resultsDiv.style.display = 'block';
 
+    // Kept for the download names and for repeating the problems at Step 5.
+    state.outputStamp = result.outputStamp || null;
+    state.seriousProblems = result.seriousProblems || [];
+
     const succeeded = (result.results || []).filter(r => !r.error);
     const failed    = (result.results || []).filter(r =>  r.error);
 
@@ -1074,7 +1117,8 @@ function displayGeometryResults(result) {
         }
     }
 
-    let html = '';
+    // Serious problems first, in full (e.g. no elevation data at all).
+    let html = seriousProblemsHtml(state.seriousProblems);
 
     // ── Succeeded ──────────────────────────────────────────────────────────
     if (succeeded.length > 0) {
@@ -1158,7 +1202,7 @@ async function downloadRegionsCsv() {
         const url = window.URL.createObjectURL(blob);
         const a = document.createElement('a');
         a.href = url;
-        a.download = 'Regions.csv';
+        a.download = stampedFileName('Regions.csv');
         document.body.appendChild(a);
         a.click();
         window.URL.revokeObjectURL(url);
@@ -1236,7 +1280,7 @@ async function downloadGeometryKml() {
         const url = URL.createObjectURL(kmzBlob);
         const a = document.createElement('a');
         a.href = url;
-        a.download = `traxim-geometry-${state.sessionId}.kmz`;
+        a.download = state.outputStamp ? stampedFileName('Geometry.kmz') : `traxim-geometry-${state.sessionId}.kmz`;
         document.body.appendChild(a);
         a.click();
         document.body.removeChild(a);
@@ -1321,7 +1365,7 @@ async function downloadGeometryBoth() {
         const zipUrl = URL.createObjectURL(zipBlob);
         const zipLink = document.createElement('a');
         zipLink.href = zipUrl;
-        zipLink.download = `traxim-geometry-${state.sessionId}.zip`;
+        zipLink.download = state.outputStamp ? stampedFileName('Geometry.zip') : `traxim-geometry-${state.sessionId}.zip`;
         document.body.appendChild(zipLink);
         zipLink.click();
         document.body.removeChild(zipLink);
@@ -1333,7 +1377,7 @@ async function downloadGeometryBoth() {
             const regionsUrl = URL.createObjectURL(regionsBlob);
             const regionsLink = document.createElement('a');
             regionsLink.href = regionsUrl;
-            regionsLink.download = 'Regions.csv';
+            regionsLink.download = stampedFileName('Regions.csv');
             document.body.appendChild(regionsLink);
             regionsLink.click();
             document.body.removeChild(regionsLink);
@@ -1344,7 +1388,7 @@ async function downloadGeometryBoth() {
             const kmzUrl = URL.createObjectURL(kmzBlob);
             const kmzLink = document.createElement('a');
             kmzLink.href = kmzUrl;
-            kmzLink.download = `traxim-geometry-${state.sessionId}.kmz`;
+            kmzLink.download = state.outputStamp ? stampedFileName('Geometry.kmz') : `traxim-geometry-${state.sessionId}.kmz`;
             document.body.appendChild(kmzLink);
             kmzLink.click();
             document.body.removeChild(kmzLink);
@@ -1431,6 +1475,7 @@ async function pollInfrastructureJob() {
         if (job.status === 'completed') {
             // Job complete
             document.getElementById('progressInfrastructure').style.display = 'none';
+            if (job.result && job.result.outputStamp) state.outputStamp = job.result.outputStamp;
             displayInfrastructureResults(job.result);
             
             // Enable download
@@ -1501,9 +1546,10 @@ function updateDownloadSummary() {
     const summaryDiv = document.getElementById('downloadSummary');
     summaryDiv.style.display = 'block';
     
-    summaryDiv.innerHTML = `
+    // The geometry's serious problems apply to the whole set of files.
+    summaryDiv.innerHTML = seriousProblemsHtml(state.seriousProblems) + `
         <p class="success"><strong>Infrastructure file generated successfully.</strong></p>
-        <p>Click below to download.</p>
+        <p>Click below to download${state.outputStamp ? ` (${escapeHtml(stampedFileName('Infrastructure.csv'))}; the date and time in the name match the geometry files of this run)` : ''}.</p>
     `;
 }
 
@@ -1529,7 +1575,7 @@ async function downloadAllFiles() {
         const url = window.URL.createObjectURL(blob);
         const a = document.createElement('a');
         a.href = url;
-        a.download = 'Infrastructure.csv';
+        a.download = stampedFileName('Infrastructure.csv');
         document.body.appendChild(a);
         a.click();
         window.URL.revokeObjectURL(url);
@@ -1583,11 +1629,15 @@ function enablePanel(panelId, collapsePrevious = true) {
 // Agent session view (?session=<id>)
 //
 // Sessions created by an AI agent (through the Traxim Controller connector)
-// can be looked at here, read-only, on the map. The agent and the user
-// choose the sections in the chat; this view is optional and changes
-// nothing. The data comes from the Traxim Controller (/api/agent/generator/
-// ...), which checks the normal Traxim login cookie and that the session
-// belongs to the logged-in user. Normal use of this page needs no login.
+// can be opened here by their owner. While the agent is waiting for the
+// user's choice, the sections can be ticked and unticked to compare them on
+// the map (like the normal workflow), and the "Use these sections" button
+// records the choice (source "map"; the other way is to tell the agent in
+// the chat). Ticking alone records nothing. Once sections are chosen, either
+// way, the page only shows the choice. Everything goes through the Traxim
+// Controller (/api/agent/generator/...), which checks the normal Traxim login
+// cookie and that the session belongs to the logged-in user. Normal use of
+// this page needs no login.
 // ═══════════════════════════════════════════════════════════════════════════
 
 const CONTROLLER_GENERATOR_API = '/api/agent/generator/sessions';
@@ -1597,8 +1647,8 @@ const SESSION_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-
 const AGENT_VIEW_STATE_TEXT = {
     searching: 'The agent is still looking up the waypoints and searching for railway sections. Reload this page in a minute.',
     search_failed: 'The search for railway sections failed. Ask the agent to try again.',
-    awaiting_confirmation: 'Sections found. Tell the agent in the chat which numbered sections to include.',
-    confirmed: 'Your choice of sections is recorded. The agent can now generate the files.',
+    awaiting_confirmation: 'Sections found. Choose the sections to include: either here (tick them, then press "Use these sections"), or by telling the agent in the chat which numbered sections you want.',
+    confirmed: 'The sections are chosen (see below). Go back to the chat and tell the agent: it will read your choice back to you before it generates the files.',
     generating: 'The files are being generated. Reload this page later, or ask the agent for progress.',
     ready: 'The files are ready.',
     generation_failed: 'Generation failed. Ask the agent what went wrong.',
@@ -1640,13 +1690,13 @@ function showAgentViewMessage(html) {
 }
 
 async function openAgentSessionView(sessionId) {
-    // Nothing on this page can change an agent session: lock the workflow.
+    // The normal workflow panels are not used for an agent session.
     ['panel-route', 'panel-sections', 'panel-download-geometry', 'panel-infrastructure', 'panel-download'].forEach(id => {
         const panel = document.getElementById(id);
         panel.classList.add('disabled');
         panel.classList.add('collapsed');
     });
-    showSessionStatus('Agent session (view only)', 'active');
+    showSessionStatus('Agent session', 'active');
 
     if (!SESSION_ID_PATTERN.test(sessionId)) {
         showAgentViewMessage('<p><strong>This link is not valid.</strong> Check it was copied in full.</p>');
@@ -1693,9 +1743,23 @@ async function openAgentSessionView(sessionId) {
     renderAgentSessionView(sessionId, view);
 }
 
+/** "Chosen on the map by alice@example.com on 16/10/2026, 09:30" or "Chosen in the chat ...". */
+function describeAgentChoice(confirmation) {
+    if (!confirmation) return '';
+    const when = confirmation.confirmed_at ? ` on ${new Date(confirmation.confirmed_at).toLocaleString()}` : '';
+    if (confirmation.source === 'map') {
+        return `Chosen on this map page${confirmation.confirmed_by ? ' by ' + confirmation.confirmed_by : ''}${when}.`;
+    }
+    return `Chosen in the chat with the agent${when}.`;
+}
+
 function renderAgentSessionView(sessionId, view) {
     const map = view.map || {};
-    const chosen = (view.confirmation && view.confirmation.section_numbers) || [];
+    const confirmation = view.confirmation || null;
+    const chosen = (confirmation && confirmation.section_numbers) || [];
+    const sections = view.sections || [];
+    // Choosing on the map is only possible while the agent waits for a choice.
+    const canChoose = view.state === 'awaiting_confirmation' && sections.length > 0;
 
     // Waypoints
     // Escaped here because drawGeocodedLocations puts them into popup HTML.
@@ -1704,9 +1768,11 @@ function renderAgentSessionView(sessionId, view) {
     }));
     if (state.geocodedLocations.length > 0) drawGeocodedLocations(state.geocodedLocations);
 
-    // Search boxes and candidate sections (chosen ones only, once the user has chosen)
+    // Search boxes and candidate sections. Before a choice: all ticked and
+    // drawn, as in the normal workflow; after: the chosen ones only.
+    // Names escaped: drawSections puts them into the hover tooltips (HTML).
     state.searchBboxes = map.search_bboxes || [];
-    state.availableSections = map.sections || [];
+    state.availableSections = (map.sections || []).map(s => ({ ...s, name: escapeHtml(s.name) }));
     state.selectedSections = chosen.length > 0
         ? chosen.map(n => n - 1)
         : state.availableSections.map((_, i) => i);
@@ -1721,34 +1787,136 @@ function renderAgentSessionView(sessionId, view) {
         }).bindPopup(`<strong>${escapeHtml(line.label)}</strong>`).addTo(mapLayers.geometry);
     });
 
-    const sectionRows = (view.sections || []).map(s => {
+    const sectionRows = sections.map((s, i) => {
         const isChosen = chosen.includes(s.number);
+        const colour = SECTION_PREVIEW_COLORS[i % SECTION_PREVIEW_COLORS.length];
+        const swatch = `<span style="display:inline-block;width:14px;height:4px;background:${colour};vertical-align:middle;margin:0 6px 0 2px;"></span>`;
         const details = [s.ref && `ref ${s.ref}`, s.from && s.to && `${s.from} to ${s.to}`, s.operator,
             s.length_km != null && `${s.length_km} km of track mapped`].filter(Boolean).map(escapeHtml).join(' | ');
+        const title = `<strong>${s.number}. ${escapeHtml(s.name)}</strong>`;
+        const detailHtml = details ? `<br><span style="font-size:11px;">${details}</span>` : '';
+        if (canChoose) {
+            return '<li class="section-item selected" style="margin-bottom:6px;"><label style="cursor:pointer;">' +
+                `<input type="checkbox" class="agent-section-checkbox" data-index="${s.number - 1}" checked> ` +
+                `${swatch}${title}</label>${detailHtml}</li>`;
+        }
         return `<li style="margin-bottom:6px;${chosen.length && !isChosen ? 'opacity:0.55;' : ''}">` +
-            `<strong>${s.number}. ${escapeHtml(s.name)}</strong>${isChosen ? ' &#10003; chosen' : ''}` +
-            (details ? `<br><span style="font-size:11px;">${details}</span>` : '') + '</li>';
+            `${title}${isChosen ? ' &#10003; chosen' : ''}${detailHtml}</li>`;
     }).join('');
 
     const download = view.state === 'ready'
         ? `<p><a class="btn-primary" style="display:inline-block;padding:8px 14px;text-decoration:none;" href="${CONTROLLER_GENERATOR_API}/${sessionId}/download">Download the files (ZIP)</a></p>`
         : '';
 
+    let howTo;
+    if (canChoose) {
+        howTo = '<p style="font-size:12px;"><strong>Tick or untick sections to compare them on the map</strong> ' +
+            '(a ticked section is drawn on top; hover a line to see its name). ' +
+            '<strong>Ticking alone does not choose anything:</strong> press <em>Use these sections</em> to record your choice, ' +
+            'or tell the agent your choice in the chat instead.</p>';
+    } else if (chosen.length) {
+        howTo = `<p style="font-size:12px;"><strong>${escapeHtml(describeAgentChoice(confirmation))}</strong> ` +
+            'Lines on the map: the chosen sections. To change the choice, tell the agent in the chat.</p>';
+    } else {
+        howTo = '<p style="font-size:12px;">Lines on the map: every section found (each in its own colour; hover a line to see its name).</p>';
+    }
+
+    const chooseControls = canChoose
+        ? '<p style="margin-top:8px;"><button id="btnUseAgentSections" class="btn-primary">Use these sections</button></p>' +
+          '<p id="agentChoiceStatus" style="font-size:12px;"></p>'
+        : '';
+
     showAgentViewMessage(
-        `<p><strong>Agent session${view.label ? ': ' + escapeHtml(view.label) : ''}</strong> (view only)</p>` +
+        `<p><strong>Agent session${view.label ? ': ' + escapeHtml(view.label) : ''}</strong></p>` +
         `<p>${escapeHtml(AGENT_VIEW_STATE_TEXT[view.state] || '')}</p>` +
-        '<p style="font-size:12px;">Choose the sections in your chat with the agent. This page only shows them on the map; nothing here changes the session.' +
-        (chosen.length ? ' Lines on the map: the sections chosen in the chat.' : ' Lines on the map: every section found (each in its own colour; hover a line to see its name).') +
-        '</p>' +
+        howTo +
         download +
         (sectionRows ? `<ol style="list-style:none;padding-left:0;margin-top:10px;">${sectionRows}</ol>` : '') +
+        chooseControls +
         `<p style="font-size:11px;opacity:0.7;">Session expires ${escapeHtml(new Date(view.expires_at).toLocaleString())}.</p>`
     );
+
+    if (canChoose) wireAgentSectionChoice(sessionId, sections);
 
     const geometryCoords = (map.geometry_lines || []).flatMap(l => l.coords);
     if (geometryCoords.length > 0) {
         osmMap.fitBounds(geometryCoords, { padding: [30, 30] });
     }
+}
+
+/** Checkboxes drive the map (as in the normal workflow); the button records the choice. */
+function wireAgentSectionChoice(sessionId, sections) {
+    const button = document.getElementById('btnUseAgentSections');
+    const status = document.getElementById('agentChoiceStatus');
+    const updateButton = () => {
+        const n = state.selectedSections.length;
+        button.disabled = n === 0;
+        button.textContent = n === 0 ? 'Use these sections (tick at least one)' : `Use these ${n} section${n === 1 ? '' : 's'}`;
+    };
+
+    document.querySelectorAll('.agent-section-checkbox').forEach(checkbox => {
+        checkbox.addEventListener('change', function () {
+            const index = parseInt(this.getAttribute('data-index'), 10);
+            if (this.checked) {
+                if (!state.selectedSections.includes(index)) state.selectedSections.push(index);
+            } else {
+                state.selectedSections = state.selectedSections.filter(i => i !== index);
+            }
+            this.closest('li').classList.toggle('selected', this.checked);
+            // Same as the normal workflow: a ticked section is added last, so it is drawn on top.
+            const layer = state.sectionLayers && state.sectionLayers[index];
+            if (layer) {
+                if (this.checked) mapLayers.sections.addLayer(layer);
+                else mapLayers.sections.removeLayer(layer);
+            }
+            updateButton();
+        });
+    });
+    updateButton();
+
+    button.addEventListener('click', async () => {
+        const numbers = state.selectedSections.map(i => i + 1).sort((a, b) => a - b);
+        if (numbers.length === 0) return;
+        const names = numbers.map(n => {
+            const s = sections.find(x => x.number === n);
+            return `${n}. ${s ? s.name : ''}`;
+        }).join('\n');
+        if (!window.confirm(`Use these ${numbers.length} section(s) for the files?\n\n${names}\n\nThe agent will read your choice back to you in the chat before it generates the files.`)) {
+            return;
+        }
+        button.disabled = true;
+        status.textContent = 'Recording your choice...';
+        let response;
+        try {
+            response = await fetch(`${CONTROLLER_GENERATOR_API}/${sessionId}/choose`, {
+                method: 'POST',
+                credentials: 'same-origin',
+                headers: { 'Content-Type': 'application/json', 'X-Traxim-Map-Choice': '1' },
+                body: JSON.stringify({ section_numbers: numbers })
+            });
+        } catch (error) {
+            status.textContent = `Could not reach Traxim: ${error.message}. Your choice was not recorded; please try again.`;
+            updateButton();
+            return;
+        }
+        let data = null;
+        try { data = await response.json(); } catch (e) { /* not JSON */ }
+        if (response.ok) {
+            // Show the recorded choice (the page reloads the session).
+            await openAgentSessionView(sessionId);
+            return;
+        }
+        if (response.status === 401) {
+            status.textContent = 'You are no longer logged in. Log in to Traxim in another tab, then reload this page. Your choice was not recorded.';
+        } else if (response.status === 409) {
+            alert((data && data.error) || 'The sections can no longer be chosen here.');
+            await openAgentSessionView(sessionId);
+            return;
+        } else {
+            status.textContent = `${(data && data.error) || `Error ${response.status}`}. Your choice was not recorded.`;
+        }
+        updateButton();
+    });
 }
 
 /**
