@@ -733,6 +733,95 @@ function findNearbyTrackWays(platformGeometry, ways, thresholdM) {
 }
 
 /**
+ * True when two platform outlines touch or overlap (any vertex of one within
+ * 5 m of the other's outline) - i.e. they are the same physical platform.
+ */
+function platformsTouch(geomA, geomB) {
+  const TOUCH_M = 5;
+  if (!geomA || !geomB || geomA.length === 0 || geomB.length === 0) return false;
+  const near = (pts, outline) => outline.length === 1
+    ? pts.some(p => haversineM(p, outline[0]) <= TOUCH_M)
+    : pts.some(p => nearestPointOnWay(p, outline).distM <= TOUCH_M);
+  return near(geomA, geomB) || near(geomB, geomA);
+}
+
+/**
+ * Which tracks a platform's faces are on: at most ONE track on each side of
+ * the platform (October 2026).
+ *
+ * A platform edge serves the track running along it. An island platform has
+ * a track along each long side; a side platform has one. So the candidate
+ * track ways near the platform are sorted by which side of the platform
+ * they run on, and the nearest way on each side is that side's face.
+ *
+ * This replaces "the N nearest distinct links, N from the ref tag", which
+ * went wrong in two ways:
+ *  - two ways of the SAME track (split at a junction under the platform)
+ *    counted as two faces, so both platform nodes went on one track, side
+ *    by side, and the other track got none;
+ *  - at a passing loop both tracks run between the same two turnouts, so
+ *    the second face was thrown away as a "duplicate" link and an island
+ *    platform got only one node.
+ *
+ * Side test: for each way, take its nearest point to the platform's centre
+ * and the way's direction there, turned to point the same way along the
+ * platform as the platform's own long axis; the centre is then either to
+ * the left or to the right of the track.
+ *
+ * @param {Array<{lat:number, lon:number}>} platformGeometry
+ * @param {{lat:number, lon:number}} centre
+ * @param {Array<{wayId:string, dist:number}>} candidates - from findNearbyTrackWays (nearest first)
+ * @param {Map<string, {coords:Array}>} waysById
+ * @returns {Array<{side: number, ways: Array<{wayId:string, dist:number}>}>}
+ *   one entry per side that has a track (side -1 / +1, or 0 for a track
+ *   running through the platform's centre), each with its candidate ways
+ *   nearest first; entries sorted by their nearest way's distance
+ */
+function platformFacesBySide(platformGeometry, centre, candidates, waysById) {
+  const cosLat = Math.cos(centre.lat * Math.PI / 180);
+  const toXY = (p) => ({ x: (p.lon - centre.lon) * 111320 * cosLat, y: (p.lat - centre.lat) * 111320 });
+
+  // The platform's long axis (principal direction of its outline).
+  const pts = platformGeometry.map(toXY);
+  let sxx = 0, syy = 0, sxy = 0;
+  const mx = pts.reduce((s, p) => s + p.x, 0) / pts.length;
+  const my = pts.reduce((s, p) => s + p.y, 0) / pts.length;
+  for (const p of pts) { sxx += (p.x - mx) ** 2; syy += (p.y - my) ** 2; sxy += (p.x - mx) * (p.y - my); }
+  const hasAxis = pts.length >= 2 && (sxx + syy) > 1e-6;
+  const theta = 0.5 * Math.atan2(2 * sxy, sxx - syy);
+  const axis = hasAxis ? { x: Math.cos(theta), y: Math.sin(theta) } : null;
+
+  const bySide = new Map();
+  for (const cand of candidates) {
+    const way = waysById.get(cand.wayId);
+    if (!way || !way.coords || way.coords.length < 2) continue;
+    const near = nearestPointOnWay(centre, way.coords);
+    const a = toXY(way.coords[near.segIdx]);
+    const b = toXY(way.coords[near.segIdx + 1]);
+    let dx = b.x - a.x, dy = b.y - a.y;
+    const len = Math.hypot(dx, dy);
+    if (len < 1e-9) continue;
+    dx /= len; dy /= len;
+    // Turn the way's direction to agree with the platform's axis, so that
+    // "left" means the same thing for every track (OSM ways can be drawn
+    // either way round). A platform with no usable outline uses the first
+    // track's direction as its axis.
+    const ref = axis || bySide.get('axis') || { x: dx, y: dy };
+    if (!axis && !bySide.has('axis')) bySide.set('axis', ref);
+    if (dx * ref.x + dy * ref.y < 0) { dx = -dx; dy = -dy; }
+    const q = toXY({ lat: near.projLat, lon: near.projLon });
+    const lateral = dx * (0 - q.y) - dy * (0 - q.x); // centre relative to the track: + left, - right
+    const side = Math.abs(lateral) < 0.3 ? 0 : Math.sign(lateral);
+    if (!bySide.has(side)) bySide.set(side, []);
+    bySide.get(side).push(cand);
+  }
+  bySide.delete('axis');
+  return [...bySide.entries()]
+    .map(([side, ways]) => ({ side, ways: ways.sort((p, q) => p.dist - q.dist) }))
+    .sort((p, q) => p.ways[0].dist - q.ways[0].dist);
+}
+
+/**
  * Resolve the two already-established nodes (by their _topoKey) bounding
  * the given way - i.e. the real graph link this way is physically part of.
  * Walks outward from each of the way's own endpoints via followChainToNode,
@@ -1609,6 +1698,9 @@ async function generateInfrastructureForSections(confirmedSections, networkName,
   const PLATFORM_WAY_MATCH_THRESHOLD_M = 3;
   const PLATFORM_WAY_MATCH_FALLBACK_M = 10;
   const PLATFORM_JUNCTION_BUFFER_M = 50;
+  // A second platform node on the same track closer than this to an existing
+  // one is the same platform mapped twice (see the duplicate check below).
+  const PLATFORM_DUPLICATE_DISTANCE_M = 100;
   const PLATFORM_INSERTION_ENABLED = true;
   updateProgress(75, 'Fetching platform nodes');
   let platforms = [];
@@ -1756,11 +1848,11 @@ async function generateInfrastructureForSections(confirmedSections, networkName,
       const debugTarget = process.env.DEBUG_PLATFORM_MATCH ? process.env.DEBUG_PLATFORM_MATCH.split(',').map(Number) : null;
       const isDebugTarget = debugTarget && haversineM(point, { lat: debugTarget[0], lon: debugTarget[1] }) < 500;
 
-      // An island platform serves multiple track faces from one OSM object -
-      // ref="1;2" (or comma-separated) is the tag for that. Resolve up to
-      // that many DISTINCT adjacent tracks; an ordinary wayside platform
-      // just needs the one nearest.
-      const faceCount = Math.max(1, (platform.ref || '').split(/[;,]/).map(s => s.trim()).filter(Boolean).length);
+      // An island platform serves two track faces from one OSM object, often
+      // tagged ref="1;2". The faces are found from the geometry (one track per
+      // side, see platformFacesBySide); the ref only adds a warning when it
+      // promises more faces than there are tracks beside the platform.
+      const refFaceCount = (platform.ref || '').split(/[;,]/).map(s => s.trim()).filter(Boolean).length;
 
       let nearbyWays = findNearbyTrackWays(platformGeometry, splitTopo.ways, PLATFORM_WAY_MATCH_THRESHOLD_M);
       let usedFallback = false;
@@ -1770,7 +1862,7 @@ async function generateInfrastructureForSections(confirmedSections, networkName,
       }
 
       if (isDebugTarget) {
-        console.error(`\n=== platform ${platform.id} "${platform.name}" ref=${platform.ref} @ (${point.lat},${point.lon}) - faceCount=${faceCount}, ${nearbyWays.length} nearby way(s)${usedFallback ? ' (fallback radius)' : ''} ===`);
+        console.error(`\n=== platform ${platform.id} "${platform.name}" ref=${platform.ref} @ (${point.lat},${point.lon}) - ${nearbyWays.length} nearby way(s)${usedFallback ? ' (fallback radius)' : ''} ===`);
         for (const w of nearbyWays.slice(0, 8)) console.error(`  way ${w.wayId}: dist=${w.dist.toFixed(2)}m`);
       }
 
@@ -1779,19 +1871,21 @@ async function generateInfrastructureForSections(confirmedSections, networkName,
         continue;
       }
 
-      // Resolve up to faceCount DISTINCT tracks (dedup by resolved node
-      // pair, not raw way ID - a platform can sit right at a junction-split
-      // boundary where two way IDs are really the same physical track).
-      const seenPairs = new Set();
+      // One face per side of the platform: the nearest track on that side
+      // whose way resolves to an established link (see platformFacesBySide).
+      const faces = platformFacesBySide(platformGeometry, point, nearbyWays, waysById);
       const resolvedLinks = [];
-      for (const cand of nearbyWays) {
-        const bounds = resolveWayBounds(cand.wayId, waysById, adj, sectionNodeKeys);
-        if (!bounds) continue;
-        const pairKey = [bounds.aKey, bounds.bKey].sort().join('|');
-        if (seenPairs.has(pairKey)) continue;
-        seenPairs.add(pairKey);
-        resolvedLinks.push({ wayId: cand.wayId, dist: cand.dist, ...bounds });
-        if (resolvedLinks.length >= faceCount) break;
+      for (const face of faces) {
+        for (const cand of face.ways) {
+          const bounds = resolveWayBounds(cand.wayId, waysById, adj, sectionNodeKeys);
+          if (!bounds) continue;
+          resolvedLinks.push({ wayId: cand.wayId, dist: cand.dist, side: face.side, ...bounds });
+          break;
+        }
+      }
+
+      if (isDebugTarget) {
+        for (const f of faces) console.error(`  side ${f.side}: ${f.ways.map(w => `${w.wayId}@${w.dist.toFixed(1)}m`).join(', ')}`);
       }
 
       if (resolvedLinks.length === 0) {
@@ -1799,11 +1893,15 @@ async function generateInfrastructureForSections(confirmedSections, networkName,
           `established link — skipped (needs manual review).`);
         continue;
       }
-      if (resolvedLinks.length < faceCount) {
-        warnings.push(`Platform "${platform.name}" (${platform.id}): ref suggests ${faceCount} track faces but only ` +
-          `${resolvedLinks.length} distinct nearby track(s) resolved — inserting what was found.`);
+      if (refFaceCount > resolvedLinks.length) {
+        warnings.push(`Platform "${platform.name}" (${platform.id}): ref "${platform.ref}" suggests ${refFaceCount} track faces but ` +
+          `only ${resolvedLinks.length} side(s) of the platform ha${resolvedLinks.length === 1 ? 's' : 've'} a track beside it — inserting what was found.`);
+      }
+      if (resolvedLinks.length > 1) {
+        warnings.push(`Platform "${platform.name}" (${platform.id}): island platform — one platform node on the track along each side.`);
       }
 
+      const usedArms = new Set(); // the same link must never get two faces of one platform
       for (const link of resolvedLinks) {
         const nodeA = nodeByTopoKey.get(link.aKey);
         const nodeB = nodeByTopoKey.get(link.bKey);
@@ -1826,8 +1924,30 @@ async function generateInfrastructureForSections(confirmedSections, networkName,
         }
         const { chain, startNode, startArm } = picked;
 
+        const armKey = `${startNode.name}|${startArm}`;
+        if (usedArms.has(armKey)) {
+          warnings.push(`Platform "${platform.name}" (${platform.id}): two faces resolved to the same track ` +
+            `("${nodeA.name}" / "${nodeB.name}") — only one platform node inserted there.`);
+          continue;
+        }
+        usedArms.add(armKey);
+
         const chainCoords = chain.map(n => ({ lat: n.lat, lon: n.lon }));
         const { segIdx, projLat, projLon } = nearestPointOnWay(point, chainCoords);
+
+        // Same platform face already on this track? OpenStreetMap sometimes
+        // has one platform as two objects (an outline and a line, or two
+        // halves that touch). A second platform node there would only sit
+        // right next to the first, so it is left out.
+        const duplicateOf = chain.find(n => n.railwayType === 'platform' && (
+          haversineM({ lat: projLat, lon: projLon }, n) < PLATFORM_DUPLICATE_DISTANCE_M ||
+          (n._platformGeometry && platformsTouch(n._platformGeometry, platformGeometry))
+        ));
+        if (duplicateOf) {
+          warnings.push(`Platform "${platform.name}" (${platform.id}): this face is already covered by platform node ` +
+            `"${duplicateOf.name}" on the same track (OpenStreetMap maps the same platform more than once here) — not inserted twice.`);
+          continue;
+        }
         const a = chain[segIdx];
         const b = chain[segIdx + 1];
 
@@ -1902,9 +2022,17 @@ async function generateInfrastructureForSections(confirmedSections, networkName,
           platName = `${platform.name} ${String.fromCharCode(65 + pIdx++)}`;
         }
 
+        // Position: on the matched track itself, beside the platform (not on
+        // the straight line between the two neighbouring nodes, where both
+        // faces of an island platform would land on the same spot).
+        const matchedWay = waysById.get(link.wayId);
+        const onTrack = matchedWay && matchedWay.coords && matchedWay.coords.length >= 2
+          ? nearestPointOnWay(point, matchedWay.coords)
+          : { projLat, projLon };
+
         const platformNode = {
           name: platName,
-          lat: projLat, lon: projLon, km,
+          lat: onTrack.projLat, lon: onTrack.projLon, km,
           region,
           railwayType: 'platform',
           signalledF: false,
@@ -1913,6 +2041,7 @@ async function generateInfrastructureForSections(confirmedSections, networkName,
           fOnBranch: fieldToBranch(armOnA),
           tNode: b.name,
           tOnBranch: fieldToBranch(armOnB),
+          _platformGeometry: platformGeometry, // for the duplicate check above; removed before output
         };
         nodes.push(platformNode);
         nodesByName.set(platName, platformNode);
@@ -2436,6 +2565,7 @@ async function generateInfrastructureForSections(confirmedSections, networkName,
   for (const node of nodes) {
     delete node._topoKey;
     delete node._topoConns;
+    delete node._platformGeometry;
   }
 
   // ── Step 15: Branch-conflict and link-mismatch validation ──
