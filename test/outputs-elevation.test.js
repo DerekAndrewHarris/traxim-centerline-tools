@@ -172,3 +172,41 @@ test('maximum gradient: smoothing uses the given limit; the default behaviour is
   const gentle = applyGradientEnvelopeSmoothing([0, 0.5, 1, 1.5], [0, 25, 50, 75], 0.03);
   assert.equal(gentle.adjustedCount, 0);
 });
+
+// ── Huge smoothing corrections: probably a tunnel OSM does not mark ─────────
+// Test run 16 Oct 2026: smoothing moved one point on Levanto - La Spezia alt2
+// by 286.6 m. Smoothing already limits the gradient, but the user was not
+// told that the raw data there was nonsense.
+
+test('a smoothing correction far above the normal DEM error gives a needs-review warning with route, km range and size', async () => {
+  const { largeSmoothingCorrectionWarnings, ELEVATION_REVIEW_THRESHOLD_M } = await import('../backend/services/geometry/processor.js');
+  const { warningKind } = await import('../backend/utils/warningKinds.js');
+  assert.equal(ELEVATION_REVIEW_THRESHOLD_M, 50);
+  // 10 km at 25 m spacing, flat at 20 m, with the hillside above an unmarked
+  // tunnel (up to 320 m) from km 4.0 to km 5.0.
+  const chainage = [], raw = [];
+  for (let m = 0; m <= 10000; m += 25) {
+    chainage.push(m);
+    raw.push(m >= 4000 && m <= 5000 ? 20 + 300 * Math.sin(Math.PI * (m - 4000) / 1000) : 20);
+  }
+  const { smoothed, maxAdjustmentM } = applyGradientEnvelopeSmoothing(raw, chainage, DEFAULT_RULING_GRADIENT);
+  assert.ok(maxAdjustmentM > 100);
+  const w = largeSmoothingCorrectionWarnings('Levanto - La Spezia_alt2', raw, smoothed, chainage);
+  assert.equal(w.length, 1, 'one warning for the one stretch');
+  assert.match(w[0], /Levanto - La Spezia_alt2/);
+  assert.match(w[0], /km 4\.\d to 4\.\d|km 4\.\d to 5\.0/);
+  assert.match(w[0], /up to \d{3}\.\d m/);
+  assert.match(w[0], /probably a tunnel not marked in OpenStreetMap/);
+  assert.equal(warningKind(w[0]), 'review');
+});
+
+test('normal DEM noise (corrections under 50 m) gives no elevation check warning', async () => {
+  const { largeSmoothingCorrectionWarnings } = await import('../backend/services/geometry/processor.js');
+  const chainage = [], raw = [];
+  for (let m = 0; m <= 5000; m += 25) {
+    chainage.push(m);
+    raw.push(m === 2500 ? 60 : 20); // one 40 m spike
+  }
+  const { smoothed } = applyGradientEnvelopeSmoothing(raw, chainage, DEFAULT_RULING_GRADIENT);
+  assert.deepEqual(largeSmoothingCorrectionWarnings('A', raw, smoothed, chainage), []);
+});

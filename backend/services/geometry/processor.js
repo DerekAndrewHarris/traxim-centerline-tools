@@ -1956,3 +1956,85 @@ export function applyGradientEnvelopeSmoothing(rawElevations, chainageM, default
 
   return { smoothed, adjustedCount, maxAdjustmentM };
 }
+
+/**
+ * Elevation smoothing corrections larger than this (metres) are reported for
+ * the user to check (October 2026). The elevation data (Copernicus DEM, 30 m
+ * cells) is normally within 20-30 m on a railway in hilly country, so
+ * smoothing moves points by about that much at most. A much bigger correction
+ * (286.6 m on Levanto - La Spezia in the 16 Oct 2026 test run) means the raw
+ * data is not the railway's height at all - usually the hillside above a
+ * tunnel that OpenStreetMap does not mark as a tunnel (marked tunnels are
+ * already given a straight line between their portals).
+ */
+export const ELEVATION_REVIEW_THRESHOLD_M = 50;
+
+/**
+ * Stretches of a route where the raw elevation is more than `thresholdM`
+ * above (sign +1) or below (sign -1) the smoothed line (sign 0: either).
+ * Points closer together than `joinM` along the route are one stretch.
+ *
+ * @param {number[]} raw - elevations before smoothing
+ * @param {number[]} smoothed - elevations after smoothing
+ * @param {number[]} chainageM - distance along the route per point (metres)
+ * @param {number} [sign]
+ * @param {number} [thresholdM]
+ * @param {number} [joinM]
+ * @returns {Array<{startKm:number, endKm:number, maxM:number, atKm:number}>}
+ */
+export function findLargeSmoothingCorrections(raw, smoothed, chainageM, sign = 0, thresholdM = ELEVATION_REVIEW_THRESHOLD_M, joinM = 500) {
+  const out = [];
+  let cur = null;
+  for (let i = 0; i < raw.length; i++) {
+    const diff = (raw[i] ?? 0) - (smoothed[i] ?? 0);
+    const d = sign === 0 ? Math.abs(diff) : sign * diff;
+    if (!(d > thresholdM)) continue;
+    const m = chainageM[i];
+    if (cur && m - cur.lastM <= joinM) {
+      cur.lastM = m;
+      if (d > cur.maxM) { cur.maxM = d; cur.atM = m; }
+    } else {
+      if (cur) out.push(cur);
+      cur = { firstM: m, lastM: m, maxM: d, atM: m };
+    }
+  }
+  if (cur) out.push(cur);
+  return out.map(s => ({ startKm: s.firstM / 1000, endKm: s.lastM / 1000, maxM: s.maxM, atKm: s.atM / 1000 }));
+}
+
+/**
+ * The needs-review warnings for large smoothing corrections on one route.
+ *
+ * Where the problem is: smoothing spreads one bad stretch over many
+ * kilometres (it keeps the whole line within the maximum gradient), so the
+ * points it moved most are not necessarily where the data is wrong. The
+ * warning therefore names the stretch where the RAW elevation is far ABOVE
+ * the smoothed line - the hillside above an unmarked tunnel. Only if there is
+ * no such stretch does it name where the raw elevation is far BELOW the line
+ * (e.g. an unmarked bridge or viaduct over a valley or water). Each warning
+ * also says over which km range smoothing moved the line by more than the
+ * limit, and by how much at most.
+ *
+ * @param {string} routeLabel - e.g. "La Spezia - Sestri Levante_alt2"
+ * @returns {string[]}
+ */
+export function largeSmoothingCorrectionWarnings(routeLabel, raw, smoothed, chainageM, thresholdM = ELEVATION_REVIEW_THRESHOLD_M) {
+  const any = findLargeSmoothingCorrections(raw, smoothed, chainageM, 0, thresholdM, Infinity);
+  if (any.length === 0) return [];
+  const overall = any[0];
+  const affected = `Smoothing moved the line by more than ${thresholdM} m over km ${overall.startKm.toFixed(1)} to ` +
+    `${overall.endKm.toFixed(1)} (largest change ${overall.maxM.toFixed(1)} m, at km ${overall.atKm.toFixed(2)}); ` +
+    `raw values are in the geometry CSV's 6th column.`;
+  const text = (s, where, cause) =>
+    `ELEVATION CHECK: ${routeLabel}, km ${s.startKm.toFixed(1)} to ${s.endKm.toFixed(1)}: the raw elevation is up to ` +
+    `${s.maxM.toFixed(1)} m ${where} the smoothed line, far more than the normal 20-30 m error of the elevation data ` +
+    `(limit for this check: ${thresholdM} m). ${cause}; check the elevation profile here. ${affected}`;
+  const above = findLargeSmoothingCorrections(raw, smoothed, chainageM, +1, thresholdM);
+  if (above.length > 0) {
+    return above.map(s => text(s, 'above', 'This is probably a tunnel not marked in OpenStreetMap ' +
+      '(the elevation data then gives the height of the hillside above it)'));
+  }
+  return findLargeSmoothingCorrections(raw, smoothed, chainageM, -1, thresholdM).map(s => text(s, 'below',
+    'This is probably a bridge or viaduct not marked in OpenStreetMap (the elevation data then gives the height ' +
+    'of the valley floor or water below it)'));
+}

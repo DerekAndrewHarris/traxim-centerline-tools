@@ -37,6 +37,7 @@ import {
   mapPointsToChainage,
   applyPortalElevationInterpolation,
   applyGradientEnvelopeSmoothing,
+  largeSmoothingCorrectionWarnings,
   DEFAULT_RULING_GRADIENT
 } from './processor.js';
 import { fetchElevations } from '../elevation.js';
@@ -445,6 +446,9 @@ export async function generateGeometryForSegment(segmentLabel, segmentBbox, outp
             : '.')
         );
       }
+      // A correction far beyond the data's normal error: probably a tunnel
+      // OSM does not mark - the user must check it (needs-review warning).
+      if (elevation.ok) warnings.push(...largeSmoothingCorrectionWarnings(segmentLabel, rawAltitudes, smoothed, chainageMetres));
     }
 
     console.log(`[Geometry Generator] Total length: ${totalKm.toFixed(2)} km`);
@@ -717,6 +721,7 @@ async function generateAlternativeGeometry(segmentLabel, alternative, altNumber,
         `(largest adjustment ${maxAdjustmentM.toFixed(1)}m). Raw values kept in the CSV's 6th column.`
       );
     }
+    if (elevation.ok) warnings.push(...largeSmoothingCorrectionWarnings(altLabel, rawAltitudes, smoothed, chainageMetres));
   }
 
   // Write CSV (6th column, raw_elevation, is a trailing addition — see main geometry path)
