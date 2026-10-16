@@ -132,7 +132,11 @@ test('La Spezia case: three OSM ways all called "4 - 5" give one node on each tr
   assert.equal(plats.length, 2, 'two platform nodes in all');
   assert.equal(plats.filter(onMain).length, 1, 'one on the main line');
   assert.equal(plats.filter(onLoop).length, 1, 'one on the loop');
-  assert.equal(warnings.filter(w => /PLATFORMS MERGED/.test(w)).length, 2, 'one merge reported per track');
+  // The same merge is done on both tracks but reported ONCE (it used to be
+  // one warning per track, which looked like the merge reported twice).
+  const merged = warnings.filter(w => /PLATFORMS MERGED/.test(w));
+  assert.equal(merged.length, 1, 'one warning for the merge');
+  assert.match(merged[0], /Done on 2 tracks/);
   // Still linked properly: every link is reciprocal.
   const byName = new Map(rows.map(r => [r.Name, r]));
   for (const r of rows) {
@@ -226,7 +230,35 @@ test('platforms either side of a turnout are not merged', () => {
   assert.equal(nodes.length, 6);
 });
 
-// ── La Spezia test run, 16 October 2026 ──
+// ── La Spezia / Bonassola test run, 16 October 2026 ──
+
+test('250 m rule: a chain A - B - C (each step under 250 m, A to C over 250 m) does not merge A and C', () => {
+  // Three separate platforms on one straight track at 0, 200 and 400 m (from
+  // E1 at -500 m): A-B and B-C are 200 m apart, A-C 400 m. The old rule
+  // ("close to the previous node") merged all three into one.
+  const at = (x) => ll(x, 0);
+  const plat = (name, x, id) => ({
+    name, ...at(x), railwayType: 'platform',
+    _platformGeometry: [at(x - 40), at(x + 40)], _platformOsmId: String(id), _platformOsmName: name,
+    _platformFace: { osmId: String(id), ref: null, numbers: [] }
+  });
+  const nodes = [
+    { name: 'E1', ...at(-500), tNode: 'A', tOnBranch: 'F' },
+    { ...plat('A', 0, 1), fNode: 'E1', fOnBranch: 'T', tNode: 'B', tOnBranch: 'F' },
+    { ...plat('B', 200, 2), fNode: 'A', fOnBranch: 'T', tNode: 'C', tOnBranch: 'F' },
+    { ...plat('C', 400, 3), fNode: 'B', fOnBranch: 'T', tNode: 'E2', tOnBranch: 'F' },
+    { name: 'E2', ...at(1000), fNode: 'C', fOnBranch: 'T' }
+  ];
+  const warnings = [];
+  mergeClosePlatformNodes(nodes, warnings);
+  const left = nodes.filter(n => n.railwayType === 'platform');
+  assert.equal(left.length, 2, 'two platform nodes left (A+B merged, C kept)');
+  // Every removed node was within 250 m of the node kept in its place.
+  for (const w of warnings) {
+    for (const m of w.matchAll(/(\d+) m away/g)) assert.ok(Number(m[1]) < PLATFORM_MIN_SPACING_M, w);
+  }
+  assert.ok(left.some(n => n.name === 'C'), 'C (400 m from A) is kept');
+});
 
 test('platform node goes beside the middle of a long platform, not at its end, when OSM splits the track there', async () => {
   // La Spezia Centrale "2 - 3" (OSM way 617064909): the track beside the
@@ -246,4 +278,47 @@ test('platform node goes beside the middle of a long platform, not at its end, w
   assert.equal(plats.length, 1);
   const x = (Number(plats[0].Longitude) - ll(0, 0).lon) * 111320 * Math.cos(ll(0, 0).lat * Math.PI / 180);
   assert.ok(Math.abs(x - 900) < 60, `node at ${x.toFixed(0)} m, expected beside the platform middle (900 m)`);
+});
+
+test('Bonassola case: a platform merged away on one track does not come back under its own name on the other', async () => {
+  // One island platform mapped twice: way 60 reaches both tracks, way 61
+  // (longer, so it is kept) only the main line. On the main line 60 is merged
+  // into 61; 60's node on the loop is the only platform node there, so it
+  // stays - but as part of platform 61, not as "way 60" again.
+  const { rows, warnings } = await generate(loopNet(), [
+    platform(60, 'Platform', rect(900, 1100, 0.9, 3.6), null),
+    platform(61, 'Platform', rect(880, 1120, 0.9, 1.2), null)
+  ]);
+  const plats = platformRows(rows);
+  assert.equal(plats.length, 2, 'one node on each track');
+  const merge = warnings.find(w => /PLATFORMS MERGED/.test(w));
+  assert.ok(merge && /way 60/.test(merge) && /Kept the node for .*way 61/.test(merge), merge);
+  const later = warnings.filter(w => w !== merge && /way 60\b/.test(w));
+  assert.deepEqual(later, [], 'no later warning names the merged-away way 60');
+});
+
+test('different platforms that share a track keep their own nodes on other tracks', () => {
+  // "1" (side platform) and "2;3" (island) beside the same track T1, 50 m
+  // apart, are merged on T1; the island's node on T2 is still platform "2;3".
+  const at = (x, y = 0) => ll(x, y);
+  const plat = (name, x, y, id, numbers) => ({
+    name, ...at(x, y), railwayType: 'platform',
+    _platformGeometry: [at(x - 40, y), at(x + 40, y)], _platformOsmId: String(id), _platformOsmName: 'Platform',
+    _platformOsmRef: numbers.join(';'), _platformFace: { osmId: String(id), ref: numbers.join(';'), numbers }
+  });
+  const nodes = [
+    { name: 'E1', ...at(-500), tNode: 'P1', tOnBranch: 'F' },
+    { ...plat('P1', 0, -10, 1, ['1']), fNode: 'E1', fOnBranch: 'T', tNode: 'P2', tOnBranch: 'F' },
+    { ...plat('P2', 50, 10, 2, ['2', '3']), fNode: 'P1', fOnBranch: 'T', tNode: 'E2', tOnBranch: 'F' },
+    { name: 'E2', ...at(1000), fNode: 'P2', fOnBranch: 'T' },
+    // second track
+    { name: 'F1', ...at(-500, 20), tNode: 'P3', tOnBranch: 'F' },
+    { ...plat('P3', 50, 20, 2, ['2', '3']), fNode: 'F1', fOnBranch: 'T', tNode: 'F2', tOnBranch: 'F' },
+    { name: 'F2', ...at(1000, 20), fNode: 'P3', fOnBranch: 'T' }
+  ];
+  const warnings = [];
+  mergeClosePlatformNodes(nodes, warnings);
+  const p3 = nodes.find(n => n.name === 'P3');
+  assert.equal(p3._platformOsmId, '2');
+  assert.deepEqual(p3._platformFace.numbers, ['2', '3']);
 });

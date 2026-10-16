@@ -978,21 +978,41 @@ export const PLATFORM_MIN_SPACING_M = 250;
 
 /**
  * Merge platform nodes closer than PLATFORM_MIN_SPACING_M along one track
- * (or whose OSM outlines touch) into one node.
+ * (or whose OSM outlines touch or overlap) into one node.
  *
  * "One track" = the stretch of track a platform node is on, walking through
  * other platform nodes and plain through nodes (two connections) but
  * stopping at any turnout or diamond: platforms on either side of a
  * crossover are not merged, because trains can use them separately.
  *
+ * Which nodes are merged (October 2026, after the La Spezia test): a node
+ * joins a group only if it is closer than PLATFORM_MIN_SPACING_M to EVERY
+ * node already in the group, or its OSM outline touches/overlaps the outline
+ * of one of them (the same platform mapped more than once). It used to be
+ * enough to be close to the previous node, so a chain A - B - C with A-B and
+ * B-C each under 250 m merged A and C even when they were more than 250 m
+ * apart.
+ *
  * Which node is kept: the one nearest the centre of all the merged
  * platforms' outlines (measured along the track); where several are within
  * 10 m of that, the longest platform's. It stays where it is (its final
  * name comes from the naming pass later, like every platform node). The
  * removed nodes are taken out of the track (their two neighbours are linked
- * to each other). Each merge is reported in the warnings, with the OSM
- * platforms' names and ids and the kept node's position, so the user can
- * check it.
+ * to each other).
+ *
+ * Reporting: an island platform has a node on the track along each side, so
+ * the same OSM platforms are usually merged on two tracks. That is one
+ * warning, saying on how many tracks it was done (it used to be one warning
+ * per track, which looked like the same merge reported twice).
+ *
+ * A platform merged into another on one track may still have a node on a
+ * track where nothing was merged (Bonassola: two outlines of one island
+ * platform, only one of them found the track on its far side). When the two
+ * OSM platforms have the same numbers (or neither has one), that node is
+ * handed over to the kept platform, so a merged-away OSM platform never
+ * appears again in later names or warnings. When their numbers differ they
+ * are different platforms that share a track, and the node keeps its own
+ * platform (the warning says so).
  *
  * @param {Array<object>} nodes - modified in place
  * @param {string[]} warnings
@@ -1005,6 +1025,8 @@ export function mergeClosePlatformNodes(nodes, warnings = []) {
   const isPlatform = (n) => n.railwayType === 'platform';
   const passThrough = (n) => isPlatform(n) ||
     (armsOf(n).length === 2 && !['junction', 'diamond'].includes(n.railwayType));
+  const touch = (x, y) => !!(x.node._platformGeometry && y.node._platformGeometry &&
+    platformsTouch(x.node._platformGeometry, y.node._platformGeometry));
 
   // Walk from `start` out through `firstName`, collecting nodes and their
   // distance from `start` until a node that is not a simple pass-through.
@@ -1035,6 +1057,7 @@ export function mergeClosePlatformNodes(nodes, warnings = []) {
 
   const visited = new Set();
   const toRemove = new Set();
+  const merges = []; // one per track: { keep, removed: [{ m, distM, touches }] }
   let removed = 0;
 
   for (const p of nodes) {
@@ -1052,14 +1075,15 @@ export function mergeClosePlatformNodes(nodes, warnings = []) {
     for (const m of members) visited.add(m.node);
     if (members.length < 2) continue;
 
-    // Clusters of consecutive platform nodes closer than the minimum spacing.
+    // Groups of platform nodes in order along the track: a node joins the
+    // current group when it is closer than the minimum spacing to every
+    // node in it (members are in order, so to the group's first node), or
+    // its outline touches one of theirs.
     const clusters = [];
     let current = [members[0]];
     for (let i = 1; i < members.length; i++) {
-      const prev = members[i - 1], m = members[i];
-      const close = m.pos - prev.pos < PLATFORM_MIN_SPACING_M ||
-        (prev.node._platformGeometry && m.node._platformGeometry &&
-         platformsTouch(prev.node._platformGeometry, m.node._platformGeometry));
+      const m = members[i];
+      const close = m.pos - current[0].pos < PLATFORM_MIN_SPACING_M || current.some(c => touch(c, m));
       if (close) current.push(m);
       else { clusters.push(current); current = [m]; }
     }
@@ -1086,26 +1110,106 @@ export function mergeClosePlatformNodes(nodes, warnings = []) {
         .filter(m => off(m) <= best + 10)
         .sort((x, y) => (y.to - y.from) - (x.to - x.from) || (x.node.name < y.node.name ? -1 : 1))[0];
 
+      const gone = [];
       for (const m of cluster) {
         if (m === keep) continue;
         spliceOutNode(m.node, byName);
         byName.delete(m.node.name);
         toRemove.add(m.node);
         removed++;
+        gone.push({ m, distM: Math.abs(m.pos - keep.pos), touches: touch(m, keep) || cluster.some(c => c !== m && touch(c, m)) });
       }
-      const label = (m) => `OSM platform "${m.node._platformOsmName ?? m.node.name}"` +
-        `${m.node._platformOsmRef ? ` ref "${m.node._platformOsmRef}"` : ''} (way ${m.node._platformOsmId ?? '?'})`;
-      const others = cluster.filter(m => m !== keep)
-        .map(m => `${label(m)} ${Math.round(Math.abs(m.pos - keep.pos))} m away`);
-      warnings.push(`PLATFORMS MERGED at ${keep.node.lat.toFixed(5)}, ${keep.node.lon.toFixed(5)}: ${cluster.length} platform nodes ` +
-        `closer than ${PLATFORM_MIN_SPACING_M} m on one track are taken as one platform (OpenStreetMap maps it more than once, ` +
-        `or gives it two numbers). Kept the node for ${label(keep)}; removed the node for ${others.join(', ')}. ` +
-        `Check it in the Network Editor.`);
+      merges.push({ keep, removed: gone });
     }
   }
 
   if (toRemove.size > 0) {
     for (let i = nodes.length - 1; i >= 0; i--) if (toRemove.has(nodes[i])) nodes.splice(i, 1);
+  }
+
+  // ── Hand over the surviving nodes of merged-away OSM platforms ──
+  const osmIdOf = (n) => (n._platformOsmId === undefined || n._platformOsmId === null ? null : String(n._platformOsmId));
+  // Same platform = same numbers; for unnumbered platforms, the same OSM
+  // name too (Monterosso: "1° banchina" and "2° banchina" share a track but
+  // are different platforms).
+  const numbersKey = (n) => {
+    const nums = n._platformFace && n._platformFace.numbers ? [...n._platformFace.numbers].sort().join(';') : '';
+    return nums ? `#${nums}` : `name:${n._platformOsmName ?? ''}`;
+  };
+  const mergedInto = new Map(); // removed OSM id -> the kept node it was merged into (first merge)
+  for (const mg of merges) {
+    const keptId = osmIdOf(mg.keep.node);
+    for (const r of mg.removed) {
+      const id = osmIdOf(r.m.node);
+      if (id === null || id === keptId || mergedInto.has(id)) continue;
+      mergedInto.set(id, mg.keep.node);
+    }
+  }
+  const handedOver = new Map(); // removed OSM id -> number of nodes handed over
+  const keptElsewhere = new Map(); // removed OSM id -> number of its nodes kept as its own (numbers differ)
+  for (const n of nodes) {
+    if (!isPlatform(n)) continue;
+    const id = osmIdOf(n);
+    if (id === null) continue;
+    // Follow the chain (A merged into B, B merged into C on another track).
+    let target = mergedInto.get(id);
+    const guard = new Set([id]);
+    while (target && mergedInto.has(osmIdOf(target)) && !guard.has(osmIdOf(target))) {
+      guard.add(osmIdOf(target));
+      target = mergedInto.get(osmIdOf(target));
+    }
+    if (!target || osmIdOf(target) === id) continue;
+    if (numbersKey(n) !== numbersKey(target)) {
+      keptElsewhere.set(id, (keptElsewhere.get(id) || 0) + 1);
+      continue;
+    }
+    n._platformOsmId = target._platformOsmId;
+    n._platformOsmName = target._platformOsmName;
+    n._platformOsmRef = target._platformOsmRef;
+    if (n._platformFace && target._platformFace) {
+      n._platformFace = { ...n._platformFace, osmId: target._platformFace.osmId, ref: target._platformFace.ref };
+    }
+    handedOver.set(id, (handedOver.get(id) || 0) + 1);
+  }
+
+  // ── One warning per merge, however many tracks it was done on ──
+  const label = (n) => `OSM platform "${n._platformOsmName ?? n.name}"` +
+    `${n._platformOsmRef ? ` ref "${n._platformOsmRef}"` : ''} (way ${n._platformOsmId ?? '?'})`;
+  // The kept node's identity may just have been handed over; the merge is
+  // reported under the platform that was kept on that track.
+  const groups = new Map();
+  for (const mg of merges) {
+    const keptId = osmIdOf(mg.keep.node) ?? mg.keep.node.name;
+    const key = keptId + '|' + mg.removed.map(r => osmIdOf(r.m.node) ?? r.m.node.name).sort().join(',');
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(mg);
+  }
+  for (const list of groups.values()) {
+    const first = list[0];
+    const tracks = list.length;
+    const byRemoved = new Map();
+    for (const mg of list) {
+      for (const r of mg.removed) {
+        const id = osmIdOf(r.m.node) ?? r.m.node.name;
+        if (!byRemoved.has(id)) byRemoved.set(id, { node: r.m.node, items: [] });
+        byRemoved.get(id).items.push(r);
+      }
+    }
+    const parts = [...byRemoved.entries()].map(([id, { node, items }]) => {
+      const dists = [...new Set(items.map(r => `${Math.round(r.distM)} m`))];
+      const where = tracks > 1 ? (items.length === tracks ? ` on each track` : ` on ${items.length} of the ${tracks} tracks`) : '';
+      const touches = items.some(r => r.touches && r.distM >= PLATFORM_MIN_SPACING_M);
+      let s = `${label(node)} ${dists.join(' and ')} away${where}` +
+        (touches ? ` (merged because its OSM outline touches or overlaps the kept platform's, i.e. the same platform)` : '');
+      if (handedOver.get(id)) s += `; its node on another track now belongs to the kept platform`;
+      if (keptElsewhere.get(id)) s += `; its node on another track is kept as its own platform, because its number or name differs`;
+      return s;
+    });
+    const done = tracks > 1 ? ` Done on ${tracks} tracks (the tracks along each side of the platform).` : '';
+    warnings.push(`PLATFORMS MERGED at ${first.keep.node.lat.toFixed(5)}, ${first.keep.node.lon.toFixed(5)}: ` +
+      `platform nodes on one track closer than ${PLATFORM_MIN_SPACING_M} m to each other, or whose OSM outlines touch, are taken as one platform ` +
+      `(OpenStreetMap maps it more than once, or gives it two numbers). Kept the node for ${label(first.keep.node)}; ` +
+      `removed the node for ${parts.join(', ')}.${done} Check it in the Network Editor.`);
   }
   return removed;
 }
