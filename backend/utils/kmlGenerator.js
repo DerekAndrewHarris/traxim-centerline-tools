@@ -78,14 +78,30 @@ function generateKMLStyles() {
 }
 
 /**
+ * True when a route has real elevation data (not every altitude 0 or missing).
+ * @param {Array<{altitude:number}>} points
+ */
+export function routeHasElevation(points) {
+  return Array.isArray(points) && points.some(p => Number.isFinite(p.altitude) && p.altitude !== 0);
+}
+
+/**
  * Generate Lines KML - exact port from lib/io.js
  * @param {Object} geometryDict - Object with section names as keys, arrays of points as values
- * @param {Object} params - { altitudeMode: 'clampToGround' | 'absolute', exaggeration: number, offset: number }
+ * @param {Object} params - { altitudeMode: 'clampToGround' | 'absolute' | 'auto', exaggeration: number, offset: number }
  * @returns {string} KML content
  */
 export function generateLinesKML(geometryDict, params = {}) {
   const { exaggeration = 1, offset = 0, altitudeMode = 'clampToGround' } = params;
-  const altMode = altitudeMode === 'absolute' ? 'absolute' : 'clampToGround';
+  // 'auto' (October 2026, the generated geometry's KMZ): each route at its
+  // own (smoothed) heights, altitudeMode absolute, so Google Earth shows the
+  // calculated line and its elevation profile is ours (tunnels run
+  // underground, embankments may float a little); a route with no elevation
+  // data (every altitude 0) is clamped to the ground instead of being drawn
+  // at sea level. Coordinates are lon,lat,alt as KML requires.
+  const modeFor = (points) => altitudeMode === 'auto'
+    ? (routeHasElevation(points) ? 'absolute' : 'clampToGround')
+    : (altitudeMode === 'absolute' ? 'absolute' : 'clampToGround');
   
   console.log(`[KML Generator] Generating Lines KML with ${Object.keys(geometryDict).length} sections`);
   
@@ -108,6 +124,7 @@ export function generateLinesKML(geometryDict, params = {}) {
     if (points.length === 0) continue;
     
     colorIndex++;
+    const altMode = modeFor(points);
     
     kml += '    <Placemark>\n';
     kml += `      <name>${escapeXml(sectionName)}</name>\n`;
@@ -141,6 +158,7 @@ export function generateLinesKML(geometryDict, params = {}) {
 
     kml += '    <Folder>\n';
     kml += `      <name>${escapeXml(sectionName)}</name>\n`;
+    const altMode = modeFor(points);
 
     for (const point of points) {
       if (point.chainage !== null && point.chainage !== undefined && !isNaN(point.chainage)) {
@@ -225,9 +243,11 @@ function isRouteCsv(fileName) {
  * The KML of every geometry file in a folder: one line per route (named
  * like the website does: file name, underscores as spaces) plus a hidden
  * Posts folder of kilometre markers. Same settings as the website's KMZ
- * button (lines clamped to the ground).
+ * button: every route at its smoothed heights (altitudeMode absolute), except
+ * a route with no elevation data, which is clamped to the ground
+ * (groundClampedRoutes).
  * @param {string} geometryDir
- * @returns {Promise<{kml: string, routeCount: number}|null>} null if there are no geometry files
+ * @returns {Promise<{kml: string, routeCount: number, groundClampedRoutes: string[]}|null>} null if there are no geometry files
  */
 export async function buildGeometryKml(geometryDir) {
   let files;
@@ -245,7 +265,8 @@ export async function buildGeometryKml(geometryDir) {
   const routeCount = Object.keys(geometryDict).length;
   if (routeCount === 0) return null;
   return {
-    kml: generateLinesKML(geometryDict, { altitudeMode: 'clampToGround', exaggeration: 1, offset: 0 }),
-    routeCount
+    kml: generateLinesKML(geometryDict, { altitudeMode: 'auto', exaggeration: 1, offset: 0 }),
+    routeCount,
+    groundClampedRoutes: Object.entries(geometryDict).filter(([, pts]) => !routeHasElevation(pts)).map(([name]) => name)
   };
 }

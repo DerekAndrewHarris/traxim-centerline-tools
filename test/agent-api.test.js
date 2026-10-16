@@ -482,7 +482,8 @@ test('combined job: geometry then infrastructure; outputs-only ZIP; owner-only d
   assert.deepEqual(zipEntryNames(kmz), ['doc.kml']);
   const kml = zipEntryText(kmz, 'doc.kml');
   assert.match(kml, /<name>Genova Centrale - Town 44\.10<\/name>/, 'one line per geometry file, named like the website does');
-  assert.match(kml, /8\.91000000,44\.41000000,0\.000/, 'lon,lat order, clamped to the ground');
+  assert.match(kml, /8\.91000000,44\.41000000,11\.000/, 'lon,lat,alt order, at the smoothed elevation');
+  assert.match(kml, /<altitudeMode>absolute<\/altitudeMode>/);
   assert.equal((await call('GET', `/internal/agent/sessions/${id}/download`, { userId: BOB })).status, 404);
 
   // Map data for the session view page.
@@ -672,7 +673,7 @@ test('no elevation data: completed_with_problems, the problem first and in full,
   assert.equal(Object.keys(status).filter(k => k !== 'success')[0], 'serious_problems', 'serious problems are the first thing in the answer (the Controller drops success)');
   assert.equal(status.serious_problems.length, 1);
   assert.match(status.serious_problems[0], /^Geometry: no elevation data, all altitudes are 0, so the geometry files cannot be used as they are/);
-  assert.match(status.serious_problems[0], /Infrastructure, Regions, Speedboards and the KMZ do not use elevation and are not affected/);
+  assert.match(status.serious_problems[0], /Infrastructure, Regions and Speedboards do not use elevation and are not affected; in the KMZ \(Google Earth\) these routes are drawn on the ground/);
   assert.match(status.serious_problems[0], /N44 E009/);
   assert.match(status.serious_problems[0], /Try generating the files again in a few minutes/);
   assert.match(status.serious_problems_note, /Tell the user about each of these first/);

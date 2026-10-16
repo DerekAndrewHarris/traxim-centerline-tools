@@ -78,8 +78,16 @@ test('KML from a geometry folder: one line per route file, kilometre posts, no d
     assert.match(kml, /^<\?xml version="1.0" encoding="UTF-8"\?>/);
     assert.match(kml, /<name>Genova - Pisa<\/name>/);
     assert.match(kml, /<name>Genova - Pisa alt1<\/name>/, 'named like the website does (underscores as spaces)');
-    assert.match(kml, /8\.90000000,44\.40000000,0\.000/);
-    assert.match(kml, /<altitudeMode>clampToGround<\/altitudeMode>/);
+    // October 2026: a route with elevation data is drawn at its (smoothed)
+    // heights, altitudeMode absolute, coordinates lon,lat,alt; a route with
+    // no elevation data (all 0) is clamped to the ground, not drawn at sea level.
+    assert.match(kml, /8\.90000000,44\.40000000,10\.000/);
+    assert.match(kml, /8\.91000000,44\.41000000,11\.500/);
+    const lineOf = (name) => kml.split('<Placemark>').find(p => p.includes(`<name>${name}</name>`) && p.includes('<LineString>'));
+    assert.match(lineOf('Genova - Pisa'), /<altitudeMode>absolute<\/altitudeMode>/);
+    assert.match(lineOf('Genova - Pisa'), /<extrude>0<\/extrude>/);
+    assert.match(lineOf('Genova - Pisa alt1'), /<altitudeMode>clampToGround<\/altitudeMode>/);
+    assert.deepEqual(built.groundClampedRoutes, ['Genova - Pisa alt1']);
     assert.match(kml, /<name>Posts<\/name>/);
     assert.match(kml, /<name>km 0\.135<\/name>/);
     assert.ok(!/123/.test(kml.replace(/<coordinates>[^<]*<\/coordinates>/g, '')), 'the wayids file is not a route');
@@ -116,7 +124,7 @@ test('serious problems: no elevation data anywhere -> one clear message, with th
   ]);
   assert.equal(problems.length, 1);
   assert.match(problems[0], /^Geometry: no elevation data, all altitudes are 0, so the geometry files cannot be used as they are/);
-  assert.match(problems[0], /Infrastructure, Regions, Speedboards and the KMZ do not use elevation and are not affected/);
+  assert.match(problems[0], /Infrastructure, Regions and Speedboards do not use elevation and are not affected; in the KMZ \(Google Earth\) these routes are drawn on the ground/);
   assert.match(problems[0], /N44 E009/);
   assert.match(problems[0], /Copernicus DEM tiles/);
   assert.match(problems[0], /tell the Traxim administrator/);
@@ -239,4 +247,22 @@ test('alternative routes: a point made by trimming (on no way) keeps the way bef
   const p = (x) => ({ lat: 44.1, lon: 9.8 + x / 80000 });
   const geom = new Map([['7', [p(0), p(500), p(1000)]]]);
   assert.deepEqual(coordWayIdsFromWays([p(0), p(500), p(777)], ['7'], geom), ['7', '7', '7']);
+});
+
+test("website KMZ (lib/io.js, built in the browser): 'auto' draws routes at their heights, a route with no data on the ground", async () => {
+  const vm = await import('vm');
+  const context = vm.createContext({ console: { log() {}, warn() {}, error() {} }, window: {} });
+  vm.runInContext(fs.readFileSync(new URL('../lib/geopoint.js', import.meta.url), 'utf-8') + '\nthis.GeoPoint = GeoPoint;', context);
+  vm.runInContext(fs.readFileSync(new URL('../lib/io.js', import.meta.url), 'utf-8') + '\nthis.IOFunctions = IOFunctions;', context);
+  const { IOFunctions } = context;
+  const withData = IOFunctions.readCsvLatLongCharlotte('#h\nA,44.4,8.9,10,0,10\nA,44.41,8.91,11.5,0.135,12\n');
+  const noData = IOFunctions.readCsvLatLongCharlotte('#h\nB,44.5,8.95,0,0,0\nB,44.51,8.96,0,0.2,0\n');
+  const kml = IOFunctions.generateLinesKML({ A: withData, B: noData }, { exaggeration: 1, offset: 0, altitudeMode: 'auto' });
+  const lineOf = (name) => kml.split('<Placemark>').find(p => p.includes(`<name>${name}</name>`) && p.includes('<LineString>'));
+  assert.match(lineOf('A'), /<altitudeMode>absolute<\/altitudeMode>/);
+  assert.match(lineOf('A'), /8\.91000000,44\.41000000,11\.500/);
+  assert.match(lineOf('B'), /<altitudeMode>clampToGround<\/altitudeMode>/);
+  // The website's own KMZ buttons ask for 'auto'.
+  const page = fs.readFileSync(new URL('../osm-workflow.js', import.meta.url), 'utf-8');
+  assert.equal((page.match(/altitudeMode: 'auto'/g) || []).length, 2);
 });

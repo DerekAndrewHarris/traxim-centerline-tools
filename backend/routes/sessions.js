@@ -251,7 +251,7 @@ router.post('/:id/generate-kml', asyncHandler(async (req, res) => {
   
   // Generate KML using the exact lib/io.js method
   const kml = generateLinesKML(geometryDict, {
-    altitudeMode: 'clampToGround',
+    altitudeMode: 'auto', // each route at its smoothed heights; no elevation data: clamped to the ground
     exaggeration: 1,
     offset: 0
   });

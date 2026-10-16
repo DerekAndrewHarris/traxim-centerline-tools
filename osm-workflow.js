@@ -1456,7 +1456,7 @@ async function downloadGeometryKml() {
         const kml = IOFunctions.generateLinesKML(geometryDict, {
             exaggeration: 1,
             offset: 0,
-            altitudeMode: 'clampToGround'
+            altitudeMode: 'auto' // smoothed heights (absolute); a route with no elevation data is clamped to the ground
         });
         
         btn.textContent = 'Creating KMZ...';
@@ -1548,7 +1548,7 @@ async function downloadGeometryBoth() {
         const kml = IOFunctions.generateLinesKML(geometryDict, {
             exaggeration: 1,
             offset: 0,
-            altitudeMode: 'clampToGround'
+            altitudeMode: 'auto' // smoothed heights (absolute); a route with no elevation data is clamped to the ground
         });
         
         // Create KMZ file

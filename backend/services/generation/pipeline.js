@@ -65,7 +65,7 @@ export function parseMaxGradientPercent(value) {
  * @param {Array<object>} results - runGeometryGeneration's results
  * @returns {string[]}
  */
-const NOT_AFFECTED_BY_ELEVATION = 'Infrastructure, Regions, Speedboards and the KMZ do not use elevation and are not affected.';
+const NOT_AFFECTED_BY_ELEVATION = 'Infrastructure, Regions and Speedboards do not use elevation and are not affected; in the KMZ (Google Earth) these routes are drawn on the ground, without heights, instead of at sea level.';
 
 export function describeSeriousProblems(results) {
   const problems = [];
