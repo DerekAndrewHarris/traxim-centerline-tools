@@ -19,7 +19,7 @@ const router = express.Router();
  * Body: {
  *   sessionId: string,
  *   spacingMetres?: number (default: 25),
- *   maxGradientPercent?: number (1-6, default 4: elevation smoothing limit)
+ *   maxGradientPercent?: number (1-6, default 2.5: elevation smoothing limit)
  * }
  * 
  * Response: {

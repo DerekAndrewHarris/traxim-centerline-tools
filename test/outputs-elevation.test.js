@@ -116,7 +116,8 @@ test('serious problems: no elevation data anywhere -> one clear message, with th
     { section: 'B - C', elevation: no429 }
   ]);
   assert.equal(problems.length, 1);
-  assert.match(problems[0], /^No elevation data: all altitudes are 0, so this geometry cannot be used as it is/);
+  assert.match(problems[0], /^Geometry: no elevation data, all altitudes are 0, so the geometry files cannot be used as they are/);
+  assert.match(problems[0], /Infrastructure, Regions and the KMZ do not use elevation and are not affected/);
   assert.match(problems[0], /429/);
   assert.match(problems[0], /Wait 15-30 minutes and generate the files again/);
 });
@@ -128,19 +129,23 @@ test('serious problems: some routes without elevation, and legs that failed', ()
     { section: 'C - D', error: 'No railway ways found' }
   ]);
   assert.equal(problems.length, 2);
-  assert.match(problems[0], /^No elevation data for 1 of 3 routes \(A - B_alt1\)/);
+  assert.match(problems[0], /^Geometry: no elevation data for 1 of 3 routes \(A - B_alt1\)/);
+  assert.match(problems[0], /are not affected/);
   assert.match(problems[0], /Try generating the files again later/);
-  assert.match(problems[1], /Geometry could not be generated for 1 of 3 legs: C - D \(No railway ways found\)/);
+  assert.match(problems[1], /^Geometry, Regions and Infrastructure: geometry could not be generated for 1 of 3 legs: C - D \(No railway ways found\)/);
+  assert.equal(new Set(problems).size, problems.length, 'no problem repeated');
 });
 
 // ── Maximum gradient ────────────────────────────────────────────────────────
 
-test('maximum gradient: default is the value the generator has always used (4%), range 1-6', () => {
-  assert.equal(DEFAULT_RULING_GRADIENT, 0.04);
-  assert.equal(pipeline.MAX_GRADIENT_DEFAULT_PERCENT, 4);
-  assert.equal(pipeline.parseMaxGradientPercent(undefined), 4);
-  assert.equal(pipeline.parseMaxGradientPercent(null), 4);
-  assert.equal(pipeline.parseMaxGradientPercent(''), 4);
+test('maximum gradient: default 2.5% (1 in 40, Derek 16 Oct 2026), range 1-6', () => {
+  assert.equal(DEFAULT_RULING_GRADIENT, 0.025);
+  assert.equal(pipeline.MAX_GRADIENT_DEFAULT_PERCENT, 2.5);
+  assert.equal(pipeline.parseMaxGradientPercent(undefined), 2.5);
+  assert.equal(pipeline.parseMaxGradientPercent(null), 2.5);
+  assert.equal(pipeline.parseMaxGradientPercent(''), 2.5);
+  assert.throws(() => pipeline.parseMaxGradientPercent(7), /default 2\.5, i\.e\. 1 in 40/);
+  assert.equal(pipeline.parseMaxGradientPercent(4), 4, 'the old default can still be chosen');
   assert.equal(pipeline.parseMaxGradientPercent(3.3), 3.3);
   assert.equal(pipeline.parseMaxGradientPercent('2.5'), 2.5);
   assert.equal(pipeline.parseMaxGradientPercent(1), 1);
@@ -155,8 +160,8 @@ test('maximum gradient: smoothing uses the given limit; the default behaviour is
   const raw = [0, 0, 10, 0, 0];
   const chainage = [0, 25, 50, 75, 100];
   const byDefault = applyGradientEnvelopeSmoothing(raw, chainage);
-  const explicit4 = applyGradientEnvelopeSmoothing(raw, chainage, 0.04);
-  assert.deepEqual(byDefault, explicit4, 'default = 4%');
+  const explicitDefault = applyGradientEnvelopeSmoothing(raw, chainage, 0.025);
+  assert.deepEqual(byDefault, explicitDefault, 'default = 2.5%');
   const at2 = applyGradientEnvelopeSmoothing(raw, chainage, 0.02);
   const at6 = applyGradientEnvelopeSmoothing(raw, chainage, 0.06);
   const steepest = (profile) => Math.max(...profile.slice(1).map((h, i) => Math.abs(h - profile[i]) / 25));

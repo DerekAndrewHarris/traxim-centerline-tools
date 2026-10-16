@@ -67,12 +67,12 @@ import { promises as fs } from 'fs';
  *   that's actually just the previous segment's own mainline (walked backward past the shared waypoint)
  *   reads as "far from my own centerline" and gets accepted as a bogus alt route.
  * @param {{maxGradient?: number}} [options] - maxGradient: maximum gradient for elevation smoothing,
- *   as a fraction (0.04 = 4%, the default DEFAULT_RULING_GRADIENT)
+ *   as a fraction (0.025 = 2.5%, the default DEFAULT_RULING_GRADIENT)
  * @returns {Promise<{filePath: string, pointCount: number, lengthKm: number, alternativeCount: number, alternativeFiles: string[], warnings: string[], rawCoords: {lat: number, lon: number}[], elevation: {ok: boolean, reason: string|null}, alternativeElevation: Array<{route: string, ok: boolean, reason: string|null}>, smoothing: {adjustedCount: number, maxAdjustmentM: number}}>}
  */
 export async function generateGeometryForSegment(segmentLabel, segmentBbox, outputDir, spacingMetres = 25, startPoint = null, endPoint = null, progressCallback = null, sections = null, relationWayIdCache = null, sessionPath = null, priorCenterlines = [], options = {}) {
   const warnings = [];
-  // Maximum gradient for elevation smoothing, as a fraction (0.04 = 4%).
+  // Maximum gradient for elevation smoothing, as a fraction (0.025 = 2.5%).
   const rulingGradient = Number.isFinite(options.maxGradient) && options.maxGradient > 0
     ? options.maxGradient
     : DEFAULT_RULING_GRADIENT;

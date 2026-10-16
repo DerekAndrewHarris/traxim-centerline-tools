@@ -22,9 +22,10 @@ import { isValidOutputStamp, makeOutputStamp } from '../../utils/outputNames.js'
 
 // ── Maximum gradient for elevation smoothing (user setting, October 2026) ──
 // The smoothing pulls the elevation profile so that no stretch is steeper
-// than this; the default is the value the generator has always used
-// (DEFAULT_RULING_GRADIENT, 4% = 1 in 25). Tunnels and bridges are
-// interpolated between their portals before this, unchanged.
+// than this. Default DEFAULT_RULING_GRADIENT, 2.5% = 1 in 40 (was 4% until
+// 16 Oct 2026); steeper values are unusual and should be set deliberately.
+// Tunnels and bridges are interpolated between their portals before this,
+// unchanged.
 export const MAX_GRADIENT_DEFAULT_PERCENT = Math.round(DEFAULT_RULING_GRADIENT * 1000) / 10;
 export const MAX_GRADIENT_MIN_PERCENT = 1;
 export const MAX_GRADIENT_MAX_PERCENT = 6;
@@ -50,15 +51,20 @@ export function parseMaxGradientPercent(value) {
 }
 
 /**
- * Problems serious enough that the files cannot be used as they are, from a
+ * Problems serious enough that some files cannot be used as they are, from a
  * geometry job's per-leg results. Shown first and never shortened (the
- * agent's job status and the website), unlike ordinary warnings.
+ * agent's job status and the website's geometry results), unlike ordinary
+ * warnings. Each message starts with the files it affects and says which
+ * are not affected, so the agent's single list is clear and the website
+ * shows it only with the geometry results (not again at Infrastructure).
  *   - legs whose geometry could not be generated at all;
  *   - routes with no elevation data (every altitude 0), e.g. when the public
  *     elevation service refused the requests (HTTP 429).
  * @param {Array<object>} results - runGeometryGeneration's results
  * @returns {string[]}
  */
+const NOT_AFFECTED_BY_ELEVATION = 'Infrastructure, Regions and the KMZ do not use elevation and are not affected.';
+
 export function describeSeriousProblems(results) {
   const problems = [];
   const list = Array.isArray(results) ? results : [];
@@ -66,7 +72,7 @@ export function describeSeriousProblems(results) {
   const failed = list.filter(r => r.error);
   if (failed.length > 0 && succeeded.length > 0) {
     problems.push(
-      `Geometry could not be generated for ${failed.length} of ${list.length} legs: ` +
+      `Geometry, Regions and Infrastructure: geometry could not be generated for ${failed.length} of ${list.length} legs: ` +
       failed.map(r => `${r.section} (${r.error})`).join('; ') +
       '. Those legs have no geometry file, no region and no infrastructure, so the network has gaps.'
     );
@@ -89,13 +95,13 @@ export function describeSeriousProblems(results) {
         : ' Try generating the files again later.');
     if (missing.length === routes.length) {
       problems.unshift(
-        `No elevation data: all altitudes are 0, so this geometry cannot be used as it is ` +
-        `(gradients, and therefore running times, would be wrong).${why}`
+        `Geometry: no elevation data, all altitudes are 0, so the geometry files cannot be used as they are ` +
+        `(gradients, and therefore running times, would be wrong). ${NOT_AFFECTED_BY_ELEVATION}${why}`
       );
     } else {
       problems.unshift(
-        `No elevation data for ${missing.length} of ${routes.length} routes (${missing.map(r => r.route).join(', ')}): ` +
-        `their altitudes are all 0, so those geometry files cannot be used as they are.${why}`
+        `Geometry: no elevation data for ${missing.length} of ${routes.length} routes (${missing.map(r => r.route).join(', ')}): ` +
+        `their altitudes are all 0, so those geometry files cannot be used as they are. ${NOT_AFFECTED_BY_ELEVATION}${why}`
       );
     }
   }

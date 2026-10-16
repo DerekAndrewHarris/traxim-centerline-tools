@@ -429,7 +429,7 @@ test('combined job: geometry then infrastructure; outputs-only ZIP; owner-only d
   assert.ok(status.outputs.every(o => !('source' in o)), 'no server paths in the outputs list');
   assert.equal(status.download_file_name, `Test-route_${stamp}.zip`);
   assert.equal(status.serious_problems, undefined, 'no serious problems when elevation is fine');
-  assert.deepEqual(status.summary.settings, { spacing_metres: 25, max_gradient_percent: 4, network_name: 'Ligurian test' });
+  assert.deepEqual(status.summary.settings, { spacing_metres: 25, max_gradient_percent: 2.5, network_name: 'Ligurian test' });
   assert.equal(status.summary.routes[0].elevation_data, true);
   assert.equal(status.summary.routes[0].smoothing_points_adjusted, 3);
   assert.equal(status.summary.routes[0].smoothing_largest_change_m, 1.3);
@@ -650,7 +650,8 @@ test('no elevation data: completed_with_problems, the problem first and in full,
   assert.equal(status.status, 'completed_with_problems');
   assert.equal(Object.keys(status).filter(k => k !== 'success')[0], 'serious_problems', 'serious problems are the first thing in the answer (the Controller drops success)');
   assert.equal(status.serious_problems.length, 1);
-  assert.match(status.serious_problems[0], /^No elevation data: all altitudes are 0, so this geometry cannot be used as it is/);
+  assert.match(status.serious_problems[0], /^Geometry: no elevation data, all altitudes are 0, so the geometry files cannot be used as they are/);
+  assert.match(status.serious_problems[0], /Infrastructure, Regions and the KMZ do not use elevation and are not affected/);
   assert.match(status.serious_problems[0], /429/);
   assert.match(status.serious_problems[0], /Wait 15-30 minutes/);
   assert.match(status.serious_problems_note, /Tell the user about each of these first/);

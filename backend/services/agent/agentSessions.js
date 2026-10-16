@@ -153,7 +153,7 @@ const STATE_EXPLANATIONS = {
   awaiting_confirmation: 'Sections found. Show the user the numbered list and ask which sections to include. Do not choose for them. They can answer in the chat (then call generator_confirm_sections with their choice) or tick sections on the map page and press "Use these sections" (then generator_get_session shows their choice as confirmed, source "map").',
   confirmed: 'The user\'s choice of sections is recorded (see confirmation: the sections, and whether they were chosen in the chat or on the map). Before starting generation, read the chosen sections back to the user (numbers and names) and say where they were chosen; if the user has not already asked you to generate, ask whether to go ahead. Then start generation with generator_generate_files.',
   generating: 'Generating files. Check progress with generator_get_job_status every 15-30 seconds.',
-  ready: 'Files are ready. Give the user the download link; never fetch it yourself. If generation.serious_problems is present, tell the user about those problems first: the files cannot be used as they are.',
+  ready: 'Files are ready. Give the user the download link; never fetch it yourself. If generation.serious_problems is present, tell the user about those problems first: each says which files cannot be used as they are and which are not affected.',
   generation_failed: 'Generation failed (see generation.error). The user can change the selection (generator_confirm_sections) or the waypoints (new session) and try again.',
   interrupted: 'The File Generator restarted while a job was waiting or running, so that job was lost. Start it again (generator_generate_files), or start a new session if this was the section search.'
 };
@@ -229,7 +229,7 @@ function generationStatusName(gen) {
   return gen.status;
 }
 
-const SERIOUS_PROBLEMS_NOTE = 'Serious problems: the files were made, but cannot be used as they are. ' +
+const SERIOUS_PROBLEMS_NOTE = 'Serious problems: the files were made, but the files each problem names (at its start) cannot be used as they are; it also says which files are not affected. ' +
   'Tell the user about each of these first, before anything else, and do not describe the result as a success.';
 
 function generationView(gen) {

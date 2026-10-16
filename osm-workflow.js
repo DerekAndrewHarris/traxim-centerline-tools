@@ -61,7 +61,8 @@ const state = {
     pickingWaypointId: null, // waypointId currently armed for a map click, or null
     outputStamp: null,   // date stamp of the last geometry run (geometry, Regions, KMZ names)
     infrastructureStamp: null, // date stamp of the last infrastructure run (its own, every run)
-    seriousProblems: []  // problems that make the files unusable as they are
+    seriousProblems: [],  // the geometry run's serious problems (shown at Step 3 only)
+    infrastructureSeriousProblems: [] // the infrastructure run's own (shown at Step 5)
 };
 
 /**
@@ -75,14 +76,14 @@ function stampedFileName(name, stamp = state.outputStamp) {
     return dot > 0 ? `${name.slice(0, dot)}_${stamp}${name.slice(dot)}` : `${name}_${stamp}`;
 }
 
-/** Red box listing problems that make the files unusable as they are (or '' if none). */
+/** Red box listing problems that make files unusable as they are (or '' if none); each problem names the files it affects. */
 function seriousProblemsHtml(problems) {
     if (!problems || problems.length === 0) return '';
     const items = problems.map(p => `<li style="margin-bottom:6px;">${escapeHtml(p)}</li>`).join('');
     return '<div class="serious-problems" style="border:2px solid #e53935;background:rgba(229,57,53,0.12);' +
         'border-radius:6px;padding:10px 12px;margin-bottom:12px;">' +
         '<p style="margin:0 0 6px;color:#ff8a80;"><strong>&#9888; Serious problem' + (problems.length > 1 ? 's' : '') +
-        ': these files cannot be used as they are</strong></p>' +
+        ': read before using these files</strong></p>' +
         `<ul style="margin:0;padding-left:18px;color:#ffcdd2;">${items}</ul></div>`;
 }
 
@@ -237,6 +238,7 @@ function resetWorkflowUI() {
     state.outputStamp = null;
     state.infrastructureStamp = null;
     state.seriousProblems = [];
+    state.infrastructureSeriousProblems = [];
 
     // Waypoints list back to two empty rows
     document.getElementById('waypointsList').innerHTML = '';
@@ -1048,7 +1050,7 @@ async function generateGeometry() {
 
     const maxGradientPercent = parseFloat(document.getElementById('inputMaxGradient').value);
     if (!Number.isFinite(maxGradientPercent) || maxGradientPercent < 1 || maxGradientPercent > 6) {
-        alert('The maximum gradient must be between 1% and 6% (default 4%).');
+        alert('The maximum gradient must be between 1% and 6% (default 2.5%; steeper than 2.5% is unusual, so set it deliberately).');
         return;
     }
 
@@ -1573,6 +1575,7 @@ async function pollInfrastructureJob() {
             document.getElementById('progressInfrastructure').style.display = 'none';
             state.infrastructureStamp = (job.result && job.result.infrastructureStamp) || null;
             displayInfrastructureResults(job.result);
+            state.infrastructureSeriousProblems = (job.result && job.result.seriousProblems) || [];
             
             // Enable download
             enablePanel('panel-download');
@@ -1642,8 +1645,10 @@ function updateDownloadSummary() {
     const summaryDiv = document.getElementById('downloadSummary');
     summaryDiv.style.display = 'block';
     
-    // The geometry's serious problems apply to the whole set of files.
-    summaryDiv.innerHTML = seriousProblemsHtml(state.seriousProblems) + `
+    // Only Infrastructure's own serious problems here. The geometry's (e.g.
+    // no elevation data) are shown with the geometry results at Step 3 and
+    // do not affect Infrastructure, which does not use elevation.
+    summaryDiv.innerHTML = seriousProblemsHtml(state.infrastructureSeriousProblems) + `
         <p class="success"><strong>Infrastructure file generated successfully.</strong></p>
         <p>Click below to download${state.infrastructureStamp ? ` (${escapeHtml(stampedFileName('Infrastructure.csv', state.infrastructureStamp))}: the date and time in the name are when this Infrastructure file was generated; the geometry, Regions and KMZ files it was built from carry ${escapeHtml(state.outputStamp || 'their own stamp')})` : ''}.</p>
     `;

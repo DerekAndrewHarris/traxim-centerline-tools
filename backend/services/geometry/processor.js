@@ -1845,19 +1845,20 @@ function buildAlternativeCenterline(
 
 /**
  * Default ruling gradient used by applyGradientEnvelopeSmoothing when the
- * caller doesn't supply one: 4% (1-in-25). Chosen as a conservative sanity
- * backstop, not a claim about any real railway's actual ruling gradient —
- * generous enough to almost never touch genuinely steep-but-real mountain
- * track (real-world ruling gradients rarely exceed ~3.3%/1-in-30), while
- * still catching the kind of physically-impossible artifacts elevation data
- * can produce (a DEM cell landing on open water near a coastline, a
- * tunnel/bridge chainage-mapping glitch) — see the gradient-smoothing
- * discussion in project history for the concrete cases this was written for.
+ * caller doesn't supply one: 2.5% (1-in-40). Changed from 4% (1-in-25) on
+ * 16 Oct 2026 (Derek): 2.5% is a more typical maximum for real railways and
+ * 4% is very extreme; anyone modelling steeper lines should be aware of it
+ * and set the limit deliberately (users can choose 1-6%, see
+ * generation/pipeline.js). It catches the kind of physically-impossible
+ * artifacts elevation data can produce (a DEM cell landing on open water
+ * near a coastline, a valley side beside a viaduct, a tunnel/bridge
+ * chainage-mapping glitch) — see the gradient-smoothing discussion in
+ * project history for the concrete cases this was written for.
  */
-export const DEFAULT_RULING_GRADIENT = 0.04;
+export const DEFAULT_RULING_GRADIENT = 0.025;
 
 /**
- * Look up the ruling gradient (as a fraction, e.g. 0.04 for 4%) that applies
+ * Look up the ruling gradient (as a fraction, e.g. 0.025 for 2.5%) that applies
  * at a given chainage, preferring a zone override over the default.
  *
  * @param {number} km - Chainage in kilometres
@@ -1900,7 +1901,7 @@ function rulingGradientAt(km, defaultGradient, zones) {
  *
  * @param {number[]} rawElevations
  * @param {number[]} chainageM - Cumulative distance per point, metres (e.g. from buildCumulativeDistances)
- * @param {number} [defaultGradient] - Ruling gradient as a fraction (e.g. 0.04 for 4%); defaults to DEFAULT_RULING_GRADIENT
+ * @param {number} [defaultGradient] - Ruling gradient as a fraction (e.g. 0.025 for 2.5%); defaults to DEFAULT_RULING_GRADIENT
  * @param {Array<{startKm: number, endKm: number, maxGradientPercent: number}>} [zones] - Optional chainage-range overrides
  * @returns {{smoothed: number[], adjustedCount: number, maxAdjustmentM: number}}
  */
