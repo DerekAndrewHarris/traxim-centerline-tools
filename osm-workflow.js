@@ -62,7 +62,8 @@ const state = {
     outputStamp: null,   // date stamp of the last geometry run (geometry, Regions, Speedboards, KMZ names)
     infrastructureStamp: null, // date stamp of the last infrastructure run (its own, every run)
     seriousProblems: [],  // the geometry run's serious problems (shown at Step 3 only)
-    infrastructureSeriousProblems: [] // the infrastructure run's own (shown at Step 5)
+    infrastructureSeriousProblems: [], // the infrastructure run's own (shown at Step 5)
+    infrastructureResult: null // the last infrastructure result (details and warnings shown at Step 5)
 };
 
 /**
@@ -323,6 +324,7 @@ function resetWorkflowUI() {
     state.infrastructureStamp = null;
     state.seriousProblems = [];
     state.infrastructureSeriousProblems = [];
+    state.infrastructureResult = null;
 
     // Waypoints list back to two empty rows
     document.getElementById('waypointsList').innerHTML = '';
@@ -1730,21 +1732,14 @@ async function pollInfrastructureJob() {
  * Display Infrastructure Results
  */
 function displayInfrastructureResults(result) {
+    // Step 4 collapses as soon as Step 5 opens, so the details and warnings
+    // are shown with the download (Step 5), as the geometry's are with its
+    // download at Step 3. Step 4 keeps only a short line for when it is
+    // reopened.
+    state.infrastructureResult = result || {};
     const resultsDiv = document.getElementById('infrastructureResults');
     resultsDiv.style.display = 'block';
-
-    let html = '<p class="success"><strong>Infrastructure generated successfully:</strong></p>';
-    html += `<ul>`;
-    html += `<li>Nodes: ${result.nodeCount}</li>`;
-    html += `<li>Connections: ${result.connectionCount}</li>`;
-    html += `<li>File: ${escapeHtml(stampedFileName('Infrastructure.csv', state.infrastructureStamp))}</li>`;
-    html += `</ul>`;
-
-    // All warnings that need the user (serious, "check these") in full;
-    // information notes in a "show all" list.
-    html += warningGroupsHtml(result.warningGroups, result.warnings || []);
-
-    resultsDiv.innerHTML = html;
+    resultsDiv.innerHTML = '<p class="success"><strong>Infrastructure generated.</strong> Details and warnings are in Step 5 (Download Infrastructure).</p>';
 }
 
 /**
@@ -1753,14 +1748,27 @@ function displayInfrastructureResults(result) {
 function updateDownloadSummary() {
     const summaryDiv = document.getElementById('downloadSummary');
     summaryDiv.style.display = 'block';
-    
-    // Only Infrastructure's own serious problems here. The geometry's (e.g.
-    // no elevation data) are shown with the geometry results at Step 3 and
-    // do not affect Infrastructure, which does not use elevation.
-    summaryDiv.innerHTML = seriousProblemsHtml(state.infrastructureSeriousProblems) + `
-        <p class="success"><strong>Infrastructure file generated successfully.</strong></p>
-        <p>Click below to download${state.infrastructureStamp ? ` (${escapeHtml(stampedFileName('Infrastructure.csv', state.infrastructureStamp))}: the date and time in the name are when this Infrastructure file was generated; the geometry, Regions, Speedboards and KMZ files it was built from carry ${escapeHtml(state.outputStamp || 'their own stamp')})` : ''}.</p>
-    `;
+    const result = state.infrastructureResult || {};
+
+    // Only Infrastructure's own problems and warnings here. The geometry's
+    // (e.g. no elevation data) are shown with the geometry results at Step 3
+    // and do not affect Infrastructure, which does not use elevation.
+    const groups = result.warningGroups;
+    let html = (groups && groups.serious && groups.serious.length > 0)
+        ? '' : seriousProblemsHtml(state.infrastructureSeriousProblems);
+    html += '<p class="success"><strong>Infrastructure generated successfully:</strong></p>';
+    html += '<ul>';
+    if (result.nodeCount !== undefined) html += `<li>Nodes: ${result.nodeCount}</li>`;
+    if (result.connectionCount !== undefined) html += `<li>Connections: ${result.connectionCount}</li>`;
+    html += `<li>File: ${escapeHtml(stampedFileName('Infrastructure.csv', state.infrastructureStamp))}</li>`;
+    html += '</ul>';
+
+    // All warnings that need the user (serious, "check these") in full;
+    // information notes in a "show all" list.
+    html += warningGroupsHtml(groups, result.warnings || []);
+
+    html += `<p>Click below to download${state.infrastructureStamp ? ` (${escapeHtml(stampedFileName('Infrastructure.csv', state.infrastructureStamp))}: the date and time in the name are when this Infrastructure file was generated; the geometry, Regions, Speedboards and KMZ files it was built from carry ${escapeHtml(state.outputStamp || 'their own stamp')})` : ''}.</p>`;
+    summaryDiv.innerHTML = html;
 }
 
 /**
