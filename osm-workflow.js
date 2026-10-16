@@ -59,7 +59,7 @@ const state = {
     pins: {},           // waypointId -> {lat, lon} for map-clicked waypoints
     pinMarkers: {},      // waypointId -> Leaflet marker for map-clicked waypoints
     pickingWaypointId: null, // waypointId currently armed for a map click, or null
-    outputStamp: null,   // date stamp of the last geometry run (geometry, Regions, KMZ names)
+    outputStamp: null,   // date stamp of the last geometry run (geometry, Regions, Speedboards, KMZ names)
     infrastructureStamp: null, // date stamp of the last infrastructure run (its own, every run)
     seriousProblems: [],  // the geometry run's serious problems (shown at Step 3 only)
     infrastructureSeriousProblems: [] // the infrastructure run's own (shown at Step 5)
@@ -279,6 +279,7 @@ function resetWorkflowUI() {
     document.getElementById('geometryResults').innerHTML = '';
     document.getElementById('btnDownloadGeometryZip').disabled = true;
     document.getElementById('btnDownloadGeometryRegions').disabled = true;
+    document.getElementById('btnDownloadGeometrySpeedboards').disabled = true;
     document.getElementById('btnDownloadGeometryKml').disabled = true;
     document.getElementById('btnDownloadGeometryBoth').disabled = true;
 
@@ -1143,6 +1144,7 @@ async function pollGeometryJob() {
             enablePanel('panel-download-geometry');
             document.getElementById('btnDownloadGeometryZip').disabled = false;
             document.getElementById('btnDownloadGeometryRegions').disabled = false;
+            document.getElementById('btnDownloadGeometrySpeedboards').disabled = false;
             document.getElementById('btnDownloadGeometryKml').disabled = false;
             document.getElementById('btnDownloadGeometryBoth').disabled = false;
 
@@ -1257,6 +1259,18 @@ function displayGeometryResults(result) {
         html += '</ul>';
     }
 
+    // ── Speedboards.csv (October 2026) ────────────────────────────────────
+    // No speed data is flagged prominently (the file is still valid, with no
+    // speedboards); otherwise its notes are listed like the Regions notice.
+    const sb = result.speedboards;
+    if (sb && sb.noSpeedData) {
+        html += `<p class="warning" style="margin-top:10px"><strong>⚠ Speedboards.csv: no speed data found</strong></p>` +
+                `<p style="color:#ffb74d;font-size:11px;">${escapeHtml((sb.warnings && sb.warnings[0]) || 'No speed data was found in OpenStreetMap. Speeds can still be managed with Auto-Curve Speed Limiting in the settings.')}</p>`;
+    } else if (sb && Array.isArray(sb.warnings) && sb.warnings.length > 0) {
+        html += `<p style="margin-top:10px"><strong>Speedboards.csv:</strong></p><ul>` +
+                sb.warnings.map(w => `<li style="font-size:11px;">${escapeHtml(w)}</li>`).join('') + '</ul>';
+    }
+
     // ── Regions.csv defaults notice ───────────────────────────────────────
     if (result.regionsWarning) {
         html += `<p class="warning" style="margin-top:10px"><strong>⚠ Regions.csv:</strong></p>` +
@@ -1286,31 +1300,45 @@ async function downloadGeometryZip() {
  * Download Regions.csv
  */
 async function downloadRegionsCsv() {
-    const btn = document.getElementById('btnDownloadGeometryRegions');
+    return downloadSessionCsv('Regions.csv', 'btnDownloadGeometryRegions');
+}
+
+/**
+ * Download Speedboards.csv (made by the geometry step, beside Regions.csv)
+ */
+async function downloadSpeedboardsCsv() {
+    return downloadSessionCsv('Speedboards.csv', 'btnDownloadGeometrySpeedboards');
+}
+
+/**
+ * Download one CSV from the session folder, with the geometry run's stamp.
+ */
+async function downloadSessionCsv(fileName, buttonId) {
+    const btn = document.getElementById(buttonId);
     try {
         btn.disabled = true;
         btn.textContent = 'Downloading...';
 
-        const response = await fetch(`${API_BASE}/sessions/files/${state.sessionId}/Regions.csv`);
+        const response = await fetch(`${API_BASE}/sessions/files/${state.sessionId}/${fileName}`);
         if (!response.ok) throw new Error(`Download failed: ${response.status}`);
 
         const blob = await response.blob();
         const url = window.URL.createObjectURL(blob);
         const a = document.createElement('a');
         a.href = url;
-        a.download = stampedFileName('Regions.csv');
+        a.download = stampedFileName(fileName);
         document.body.appendChild(a);
         a.click();
         window.URL.revokeObjectURL(url);
         document.body.removeChild(a);
 
         btn.disabled = false;
-        btn.textContent = 'Download Regions.csv';
+        btn.textContent = `Download ${fileName}`;
     } catch (error) {
         console.error('Download error:', error);
         alert('Download failed: ' + error.message);
         btn.disabled = false;
-        btn.textContent = 'Download Regions.csv';
+        btn.textContent = `Download ${fileName}`;
     }
 }
 
@@ -1398,7 +1426,7 @@ async function downloadGeometryKml() {
 }
 
 /**
- * Download All (Geometry ZIP + Regions.csv + KMZ)
+ * Download All (Geometry ZIP + Regions.csv + Speedboards.csv + KMZ)
  */
 async function downloadGeometryBoth() {
     try {
@@ -1419,6 +1447,12 @@ async function downloadGeometryBoth() {
         const regionsResponse = await fetch(`${API_BASE}/sessions/files/${state.sessionId}/Regions.csv`);
         if (!regionsResponse.ok) throw new Error(`Failed to download Regions.csv: ${regionsResponse.status}`);
         const regionsBlob = await regionsResponse.blob();
+
+        // Speedboards.csv, also made by the geometry step. A session from
+        // before October 2026 has none: then it is simply left out.
+        btn.textContent = 'Downloading Speedboards.csv...';
+        const speedboardsResponse = await fetch(`${API_BASE}/sessions/files/${state.sessionId}/Speedboards.csv`);
+        const speedboardsBlob = speedboardsResponse.ok ? await speedboardsResponse.blob() : null;
 
         btn.textContent = 'Reading CSV files...';
         
@@ -1482,6 +1516,19 @@ async function downloadGeometryBoth() {
             URL.revokeObjectURL(regionsUrl);
         }, 500);
 
+        if (speedboardsBlob) {
+            setTimeout(() => {
+                const sbUrl = URL.createObjectURL(speedboardsBlob);
+                const sbLink = document.createElement('a');
+                sbLink.href = sbUrl;
+                sbLink.download = stampedFileName('Speedboards.csv');
+                document.body.appendChild(sbLink);
+                sbLink.click();
+                document.body.removeChild(sbLink);
+                URL.revokeObjectURL(sbUrl);
+            }, 750);
+        }
+
         setTimeout(() => {
             const kmzUrl = URL.createObjectURL(kmzBlob);
             const kmzLink = document.createElement('a');
@@ -1494,7 +1541,7 @@ async function downloadGeometryBoth() {
         }, 1000);
 
         btn.disabled = false;
-        btn.textContent = 'Download All (ZIP + Regions + KMZ)';
+        btn.textContent = 'Download All (ZIP + Regions + Speedboards + KMZ)';
 
         console.log(`Generated all formats with ${Object.keys(geometryDict).length} sections`);
     } catch (error) {
@@ -1503,7 +1550,7 @@ async function downloadGeometryBoth() {
 
         const btn = document.getElementById('btnDownloadGeometryBoth');
         btn.disabled = false;
-        btn.textContent = 'Download All (ZIP + Regions + KMZ)';
+        btn.textContent = 'Download All (ZIP + Regions + Speedboards + KMZ)';
     }
 }
 
@@ -1650,7 +1697,7 @@ function updateDownloadSummary() {
     // do not affect Infrastructure, which does not use elevation.
     summaryDiv.innerHTML = seriousProblemsHtml(state.infrastructureSeriousProblems) + `
         <p class="success"><strong>Infrastructure file generated successfully.</strong></p>
-        <p>Click below to download${state.infrastructureStamp ? ` (${escapeHtml(stampedFileName('Infrastructure.csv', state.infrastructureStamp))}: the date and time in the name are when this Infrastructure file was generated; the geometry, Regions and KMZ files it was built from carry ${escapeHtml(state.outputStamp || 'their own stamp')})` : ''}.</p>
+        <p>Click below to download${state.infrastructureStamp ? ` (${escapeHtml(stampedFileName('Infrastructure.csv', state.infrastructureStamp))}: the date and time in the name are when this Infrastructure file was generated; the geometry, Regions, Speedboards and KMZ files it was built from carry ${escapeHtml(state.outputStamp || 'their own stamp')})` : ''}.</p>
     `;
 }
 
@@ -2043,6 +2090,7 @@ document.addEventListener('DOMContentLoaded', function() {
     document.getElementById('btnGenerateGeometry').addEventListener('click', generateGeometry);
     document.getElementById('btnDownloadGeometryZip').addEventListener('click', downloadGeometryZip);
     document.getElementById('btnDownloadGeometryRegions').addEventListener('click', downloadRegionsCsv);
+    document.getElementById('btnDownloadGeometrySpeedboards').addEventListener('click', downloadSpeedboardsCsv);
     document.getElementById('btnDownloadGeometryKml').addEventListener('click', downloadGeometryKml);
     document.getElementById('btnDownloadGeometryBoth').addEventListener('click', downloadGeometryBoth);
     document.getElementById('btnGenerateInfrastructure').addEventListener('click', generateInfrastructure);

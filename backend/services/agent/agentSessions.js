@@ -9,9 +9,9 @@
  *      confirmAgentSectionsFromMap  ...or made by the user on the map page
  *                           ("Use these sections"), recorded with source map
  *   4. startAgentGeneration one combined job: geometry, then infrastructure
- *                           (Regions.csv is written by the geometry step)
+ *                           (Regions.csv and Speedboards.csv are written by the geometry step)
  *   5. getAgentJobStatus    progress; outputs list when done
- *   6. streamAgentOutputs   outputs-only ZIP (Infrastructure, Regions, Geometry.kmz,
+ *   6. streamAgentOutputs   outputs-only ZIP (Infrastructure, Regions, Speedboards, Geometry.kmz,
  *                           Geometry/), names date-stamped per run
  *
  * Every function takes the caller's user id (from the Controller, see
@@ -49,7 +49,7 @@ import {
 } from '../generation/pipeline.js';
 import { makeOutputStamp, safeFileBase, stampedName } from '../../utils/outputNames.js';
 import { computeSearchBboxes } from './searchBoxes.js';
-import { legLabels, summariseSections, shortenWarnings, summariseGeometry } from './sectionSummary.js';
+import { legLabels, summariseSections, shortenWarnings, summariseGeometry, summariseSpeedboards } from './sectionSummary.js';
 import { agentLimits, generationStarts, sessionCreations } from './limits.js';
 
 /** Replaceable in tests (no network, no real generation). */
@@ -172,7 +172,7 @@ function waypointList(meta) {
 /**
  * The files that go into the download ZIP: `file` is the name in the ZIP,
  * `source` the file on disk (never shown to the agent). Date stamps (see
- * utils/outputNames.js): Regions and the KMZ carry the stamp of the
+ * utils/outputNames.js): Regions, Speedboards and the KMZ carry the stamp of the
  * geometry run they came from; Infrastructure carries its own run's stamp
  * (every infrastructure run has a new one); the geometry files keep their
  * names.
@@ -184,6 +184,7 @@ function listOutputFilesSync(sessionPath, stamps = {}) {
   for (const [name, stamp] of [
     ['Infrastructure.csv', stamps.infrastructure],
     ['Regions.csv', stamps.geometry],
+    ['Speedboards.csv', stamps.geometry],
     ['Geometry.kmz', stamps.geometry]
   ]) {
     const file = path.join(sessionPath, name);
@@ -209,7 +210,7 @@ function fileStampsView(gen) {
   return {
     geometry_regions_kmz: gen.outputStamp,
     infrastructure: gen.infrastructureStamp || null,
-    explained: 'Regions, the KMZ and the ZIP name carry the stamp of the geometry run (when it started); Infrastructure carries the stamp of its own run, which was built from that geometry. All the files in this ZIP belong together.'
+    explained: 'Regions, Speedboards, the KMZ and the ZIP name carry the stamp of the geometry run (when it started); Infrastructure carries the stamp of its own run, which was built from that geometry. All the files in this ZIP belong together.'
   };
 }
 
@@ -670,6 +671,7 @@ async function runCombinedGeneration(data, updateProgress) {
 
     const allWarnings = [
       ...(geometry.regionsWarning ? [geometry.regionsWarning] : []),
+      ...((geometry.speedboards && geometry.speedboards.warnings) || []),
       ...(geometry.results || []).flatMap(r => (r.warnings || []).map(w => `${r.section}: ${w}`)),
       ...(infrastructure.warnings || [])
     ];
@@ -684,6 +686,7 @@ async function runCombinedGeneration(data, updateProgress) {
         network_name: networkName
       },
       routes: summariseGeometry(geometry),
+      speedboards: summariseSpeedboards(geometry.speedboards),
       legs_generated: geometry.successfulSections,
       legs_total: geometry.totalSections,
       infrastructure_nodes: infrastructure.nodeCount,
@@ -849,7 +852,7 @@ export async function getAgentJobStatus(userId, jobId) {
 
 /**
  * Stream the outputs-only ZIP to an HTTP response:
- * Infrastructure_<stamp>.csv, Regions_<stamp>.csv, Geometry_<stamp>.kmz and
+ * Infrastructure_<stamp>.csv, Regions_<stamp>.csv, Speedboards_<stamp>.csv, Geometry_<stamp>.kmz and
  * the geometry CSVs in a Geometry/ folder; the ZIP is <label>_<stamp>.zip.
  * Never the OSM caches, *_wayids.csv, *_topology.json,
  * corridor_polygons.json or session.json.

@@ -87,8 +87,11 @@ function installStandIns() {
     fs.writeFileSync(path.join(sessionPath, 'osm_topology.json'), '{"ways":[]}');
     fs.writeFileSync(path.join(sessionPath, 'corridor_polygons.json'), '[]');
     fs.writeFileSync(path.join(sessionPath, 'osm_stations.json'), '[]');
+    // The real Speedboards step, with no OSM ways: no speed data.
+    const speedboards = await pipeline.writeSpeedboards(sessionPath, path.join(sessionPath, 'geometry'), [], []);
     return {
       sessionId, totalSections: segments.length, successfulSections: segments.length, results, regionsWarning: 'Regions.csv: defaults used',
+      speedboards,
       seriousProblems: pipeline.describeSeriousProblems(results)
     };
   };
@@ -423,10 +426,15 @@ test('combined job: geometry then infrastructure; outputs-only ZIP; owner-only d
   assert.match(status.summary.file_stamps.explained, /belong together/);
   assert.equal(lastGeometryData.outputStamp, stamp, 'the geometry step got the same stamp');
   assert.deepEqual(status.outputs.map(o => o.file), [
-    `Infrastructure_${infraStamp}.csv`, `Regions_${stamp}.csv`, `Geometry_${stamp}.kmz`,
+    `Infrastructure_${infraStamp}.csv`, `Regions_${stamp}.csv`, `Speedboards_${stamp}.csv`, `Geometry_${stamp}.kmz`,
     'Geometry/Genova_Centrale_-_Town_44.10.csv', 'Geometry/Town_44.10_-_Pisa_Centrale.csv'
   ]);
   assert.ok(status.outputs.every(o => !('source' in o)), 'no server paths in the outputs list');
+  // Speedboards: made even with no speed data, and that is said plainly.
+  assert.equal(status.summary.speedboards.no_speed_data, true);
+  assert.match(status.summary.speedboards.note, /Auto-Curve Speed Limiting/);
+  assert.ok(status.warnings.some(w => /NO SPEED DATA/.test(w)), 'no-speed-data warning near the top');
+  assert.match(status.summary.file_stamps.explained, /Speedboards/);
   assert.equal(status.download_file_name, `Test-route_${stamp}.zip`);
   assert.equal(status.serious_problems, undefined, 'no serious problems when elevation is fine');
   assert.deepEqual(status.summary.settings, { spacing_metres: 25, max_gradient_percent: 2.5, network_name: 'Ligurian test' });
@@ -454,7 +462,8 @@ test('combined job: geometry then infrastructure; outputs-only ZIP; owner-only d
     'Geometry/Town_44.10_-_Pisa_Centrale.csv',
     `Geometry_${stamp}.kmz`,
     `Infrastructure_${infraStamp}.csv`,
-    `Regions_${stamp}.csv`
+    `Regions_${stamp}.csv`,
+    `Speedboards_${stamp}.csv`
   ].sort(), 'outputs only: no osm_*.json, corridor_polygons.json, _wayids, _topology or session.json');
   // The KMZ is a ZIP holding doc.kml, like the website's KMZ button makes.
   const kmz = fs.readFileSync(path.join(tempRoot, id, 'Geometry.kmz'));
@@ -651,7 +660,7 @@ test('no elevation data: completed_with_problems, the problem first and in full,
   assert.equal(Object.keys(status).filter(k => k !== 'success')[0], 'serious_problems', 'serious problems are the first thing in the answer (the Controller drops success)');
   assert.equal(status.serious_problems.length, 1);
   assert.match(status.serious_problems[0], /^Geometry: no elevation data, all altitudes are 0, so the geometry files cannot be used as they are/);
-  assert.match(status.serious_problems[0], /Infrastructure, Regions and the KMZ do not use elevation and are not affected/);
+  assert.match(status.serious_problems[0], /Infrastructure, Regions, Speedboards and the KMZ do not use elevation and are not affected/);
   assert.match(status.serious_problems[0], /429/);
   assert.match(status.serious_problems[0], /Wait 15-30 minutes/);
   assert.match(status.serious_problems_note, /Tell the user about each of these first/);

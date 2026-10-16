@@ -120,3 +120,26 @@ export function summariseGeometry(geometryResult) {
     return summary;
   });
 }
+
+/**
+ * Speedboards summary for the agent (from runGeometryGeneration's
+ * `speedboards`). With no speed data it says so plainly, with the advice.
+ * @param {object} sb
+ */
+export function summariseSpeedboards(sb) {
+  if (!sb) return undefined;
+  if (!sb.file) {
+    return { file_made: false, note: (sb.warnings && sb.warnings[0]) || 'No Speedboards file was made.' };
+  }
+  const summary = {
+    rows: sb.boardCount,
+    routes_with_speed_data: sb.regionsWithData,
+    routes: sb.regionCount,
+    no_speed_data: !!sb.noSpeedData
+  };
+  if (sb.noSpeedData) {
+    summary.note = 'No speed data was found in OpenStreetMap for these routes: the Speedboards file is valid but has no speedboards. ' +
+      'Tell the user, and that speeds can still be managed with Auto-Curve Speed Limiting in the settings.';
+  }
+  return summary;
+}
