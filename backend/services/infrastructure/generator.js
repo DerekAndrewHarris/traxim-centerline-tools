@@ -664,6 +664,54 @@ function resolveKmConstraints(nodes, geometryBySection) {
   return stats;
 }
 
+/**
+ * Minimum spacing along a line between drawn nodes that are not platforms or
+ * end nodes (Draw column, October 2026). Drawing every node made the Train
+ * Graph unreadable.
+ */
+export const DRAW_MIN_SPACING_M = 500;
+
+/**
+ * Set node.draw (the Draw column; Timing Point follows it) for every node:
+ *   - platform nodes: always drawn;
+ *   - end nodes (exactly one connection): always drawn, so every line's
+ *     start and end shows on the Train Graph;
+ *   - every other node (turnouts, diamonds, other through nodes): drawn
+ *     only if it is at least DRAW_MIN_SPACING_M along the line from the
+ *     previous drawn node. "Along the line" = by kilometrage on each region
+ *     the node is on, walking from the lowest km up; a node drawn because of
+ *     one region counts as drawn on its other regions too.
+ * Turnouts get no priority: in a busy station throat they would put the
+ * clutter straight back.
+ * @param {Array<object>} nodes
+ * @returns {number} number of drawn nodes
+ */
+export function assignDrawFlags(nodes) {
+  const spacingKm = DRAW_MIN_SPACING_M / 1000;
+  const links = (n) => [n.fNode, n.tNode, n.dNode, n.xNode].filter(Boolean).length;
+  const drawn = new Set(nodes.filter(n => n.railwayType === 'platform' || links(n) === 1));
+
+  const byRegion = new Map();
+  for (const n of nodes) {
+    for (const [rf, kf] of [['region', 'km'], ['region2', 'km2'], ['region3', 'km3']]) {
+      if (!n[rf] || n[kf] == null) continue;
+      if (!byRegion.has(n[rf])) byRegion.set(n[rf], []);
+      byRegion.get(n[rf]).push({ node: n, km: n[kf] });
+    }
+  }
+  for (const region of [...byRegion.keys()].sort()) {
+    const members = byRegion.get(region).sort((a, b) => a.km - b.km || (a.node.name < b.node.name ? -1 : 1));
+    let lastDrawnKm = -Infinity;
+    for (const { node, km } of members) {
+      if (drawn.has(node)) { lastDrawnKm = km; continue; }
+      // Small tolerance: kilometrages are written to the metre.
+      if (km - lastDrawnKm >= spacingKm - 1e-9) { drawn.add(node); lastDrawnKm = km; }
+    }
+  }
+  for (const n of nodes) n.draw = drawn.has(n);
+  return drawn.size;
+}
+
 /** Smallest and largest km of a geometry's points, and the points at each end. */
 function geometryEnds(points) {
   let first = points[0], last = points[0];
@@ -2831,6 +2879,11 @@ async function generateInfrastructureForSections(confirmedSections, networkName,
   // projected past the end of the line.
   clampAllKmToGeometry(nodes, geometryBySection);
 
+  // Which nodes the Train Graph draws (Draw column), see assignDrawFlags.
+  const drawCount = assignDrawFlags(nodes);
+  warnings.push(`Draw: ${drawCount} of ${nodes.length} nodes are drawn on the Train Graph (all platforms and end nodes, ` +
+    `other nodes at least ${DRAW_MIN_SPACING_M} m apart along each line). Change single nodes in the Network Editor if needed.`);
+
   updateProgress(93, 'Building CSV output');
 
   // Diamond sanity check: a genuine diamond crossing's four arms should lead
@@ -2946,8 +2999,8 @@ function buildInfrastructureCsv(nodes, networkName, nodeCount, connectionCount) 
         '20', // Width — same for turnouts and diamonds (the Network Editor now draws diamonds with horizontal ends)
         node.rotation ?? 0,
         node.flip ? 'True' : 'False',
-        'True', // Draw
-        'True', // Timing Point — mirrors Draw, preserving pre-v7 behaviour where the two were coupled
+        node.draw === false ? 'False' : 'True', // Draw (assignDrawFlags; nodes without the flag are drawn, as before)
+        node.draw === false ? 'False' : 'True', // Timing Point — mirrors Draw, preserving pre-v7 behaviour where the two were coupled
         'False', // Capacity Point
         node.signalledF === false ? 'False' : 'True',
         node.signalledT === false ? 'False' : 'True',
