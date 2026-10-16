@@ -37,6 +37,7 @@ import {
   projectOntoGeometry,
   enforceReciprocalLinks
 } from './processor.js';
+import { platformFacesAlongside, platformNumbersOf, assignPlatformNumbers } from './platforms.js';
 
 // Relation-based topology fetching (osmGeometry.js's fetchSegmentGeometryViaRelations)
 // pre-filters relation ways against each segment's bbox expanded by this margin, so
@@ -156,7 +157,8 @@ async function fetchPlatformsFromOverpass(bbox) {
         // tracks while its centroid sits between both, closer to neither.
         geometry: element.geometry.map(c => ({ lat: c.lat, lon: c.lon })),
         name: element.tags?.name || 'Platform',
-        ref: element.tags?.ref || null
+        ref: element.tags?.ref || null,
+        local_ref: element.tags?.local_ref || null
       });
     }
   }
@@ -1029,8 +1031,13 @@ export function mergeClosePlatformNodes(nodes, warnings = []) {
       }
       const centre = (Math.min(...cluster.map(m => m.from)) + Math.max(...cluster.map(m => m.to))) / 2;
       const off = (m) => Math.abs(m.pos - centre);
-      const best = Math.min(...cluster.map(off));
-      const keep = cluster
+      // A node from a platform that has a number in OSM is kept in
+      // preference to one from an unnumbered outline of the same platform,
+      // so the merge never swaps a real number for none.
+      const numbered = cluster.filter(m => m.node._platformFace && m.node._platformFace.numbers.length > 0);
+      const pool = numbered.length > 0 ? numbered : cluster;
+      const best = Math.min(...pool.map(off));
+      const keep = pool
         .filter(m => off(m) <= best + 10)
         .sort((x, y) => (y.to - y.from) - (x.to - x.from) || (x.node.name < y.node.name ? -1 : 1))[0];
 
@@ -1041,7 +1048,8 @@ export function mergeClosePlatformNodes(nodes, warnings = []) {
         toRemove.add(m.node);
         removed++;
       }
-      const label = (m) => `OSM platform "${m.node._platformOsmName ?? m.node.name}" (way ${m.node._platformOsmId ?? '?'})`;
+      const label = (m) => `OSM platform "${m.node._platformOsmName ?? m.node.name}"` +
+        `${m.node._platformOsmRef ? ` ref "${m.node._platformOsmRef}"` : ''} (way ${m.node._platformOsmId ?? '?'})`;
       const others = cluster.filter(m => m !== keep)
         .map(m => `${label(m)} ${Math.round(Math.abs(m.pos - keep.pos))} m away`);
       warnings.push(`PLATFORMS MERGED at ${keep.node.lat.toFixed(5)}, ${keep.node.lon.toFixed(5)}: ${cluster.length} platform nodes ` +
@@ -2196,7 +2204,7 @@ async function generateInfrastructureForSections(confirmedSections, networkName,
       // tagged ref="1;2". The faces are found from the geometry (one track per
       // side, see platformFacesBySide); the ref only adds a warning when it
       // promises more faces than there are tracks beside the platform.
-      const refFaceCount = (platform.ref || '').split(/[;,]/).map(s => s.trim()).filter(Boolean).length;
+      const refFaceCount = platformNumbersOf(platform).length;
 
       let nearbyWays = findNearbyTrackWays(platformGeometry, splitTopo.ways, PLATFORM_WAY_MATCH_THRESHOLD_M);
       let usedFallback = false;
@@ -2216,17 +2224,42 @@ async function generateInfrastructureForSections(confirmedSections, networkName,
       }
 
       // One face per side of the platform: the nearest track on that side
-      // whose way resolves to an established link (see platformFacesBySide).
-      const faces = platformFacesBySide(platformGeometry, point, nearbyWays, waysById);
+      // that runs alongside the platform and whose way resolves to an
+      // established link (see platformFacesAlongside). Platforms cached
+      // without an outline (a single point) use the older side test.
+      const maxGapM = (usedFallback ? PLATFORM_WAY_MATCH_FALLBACK_M : PLATFORM_WAY_MATCH_THRESHOLD_M) + 2;
+      const alongside = platformFacesAlongside(platformGeometry, nearbyWays, waysById, maxGapM);
+      const faces = alongside ? alongside.faces : platformFacesBySide(platformGeometry, point, nearbyWays, waysById);
+      if (faces.length === 0) {
+        warnings.push(`Platform "${platform.name}"${platform.ref ? ` ref "${platform.ref}"` : ''} (${platform.id}): no track runs ` +
+          `alongside it (tracks only touch its ends) — skipped.`);
+        continue;
+      }
       const resolvedLinks = [];
       for (const face of faces) {
         for (const cand of face.ways) {
           const bounds = resolveWayBounds(cand.wayId, waysById, adj, sectionNodeKeys);
           if (!bounds) continue;
-          resolvedLinks.push({ wayId: cand.wayId, dist: cand.dist, side: face.side, ...bounds });
+          resolvedLinks.push({ wayId: cand.wayId, dist: cand.dist, alongM: cand.alongM ?? 0, side: face.side, ...bounds });
           break;
         }
       }
+      // Rank the faces by how far their track runs alongside the platform
+      // (0 = furthest), for numbering a platform with fewer numbers than
+      // tracks (e.g. ref "1" with a bay platform cut into it).
+      const byAlong = [...resolvedLinks].sort((p, q) => q.alongM - p.alongM || p.dist - q.dist);
+      resolvedLinks.forEach(l => { l.rank = byAlong.indexOf(l); });
+      const platformNumbers = platformNumbersOf(platform);
+      const platformAxis = alongside ? alongside.axis : null;
+      // A track that ends (buffer stop) at the platform: a bay / dock platform.
+      const endsAtPlatform = (wayId) => {
+        const way = waysById.get(wayId);
+        if (!way || !way.coords || way.coords.length < 2 || platformGeometry.length < 2) return false;
+        return [way.coords[0], way.coords[way.coords.length - 1]].some(c => {
+          const conns = adj.get(makeCoordKey(c.lat, c.lon));
+          return conns && conns.length === 1 && nearestPointOnWay(c, platformGeometry).distM <= 30;
+        });
+      };
 
       if (isDebugTarget) {
         for (const f of faces) console.error(`  side ${f.side}: ${f.ways.map(w => `${w.wayId}@${w.dist.toFixed(1)}m`).join(', ')}`);
@@ -2379,6 +2412,18 @@ async function generateInfrastructureForSections(confirmedSections, networkName,
           _platformGeometry: platformGeometry, // for mergeClosePlatformNodes; removed before output
           _platformOsmId: platform.id,
           _platformOsmName: platform.name,
+          _platformOsmRef: platform.ref || platform.local_ref || null,
+          // For the platform numbers (assignPlatformNumbers, naming pass).
+          _platformFace: {
+            osmId: platform.id,
+            ref: platform.ref || platform.local_ref || null,
+            numbers: platformNumbers,
+            side: link.side,
+            axis: platformAxis,
+            faceCount: resolvedLinks.length,
+            rank: link.rank,
+            bay: endsAtPlatform(link.wayId)
+          },
         };
         nodes.push(platformNode);
         nodesByName.set(platName, platformNode);
@@ -2615,7 +2660,8 @@ async function generateInfrastructureForSections(confirmedSections, networkName,
 
   // ── Step 13: Naming pass — rename nodes to [Nearest Station] [Suffix] ──
   // Rules (matching MCP convention):
-  //   • platform nodes              → "[Station] [N]"  (1-based platform number, sorted by km)
+  //   • platform nodes              → "[Station] [N]"  (N = the platform number from OSM, see
+  //                                   assignPlatformNumbers; "[Station] Unnumbered A" when OSM has none)
   //   • D-D mutual loop pairs       → "[Station] [Cardinal]"  (N/S/E/W)
   //   • all other nodes             → "[Station] [Letter]"  (A/B/C... in km order within section)
   {
@@ -2692,11 +2738,54 @@ async function generateInfrastructureForSections(confirmedSections, networkName,
       };
 
       for (const [aName, { platforms, loopEndpoints, others }] of groups) {
-        // Platform nodes: numbered 1, 2, 3 ... in km order
+        // Platform nodes: the platform's own number from OpenStreetMap (its
+        // ref), the right one of two for the side of the platform the track
+        // is on (assignPlatformNumbers). Never a number made up from the
+        // order along the line: a platform without a number of its own gets
+        // a provisional name "[Station] Unnumbered A" and a warning.
         platforms.sort((a, b) => a.km - b.km);
-        let pNum = 1;
+        const anchor = stationAnchors.find(s => s.name === aName);
+        const { number, notes, orderAssumed } = assignPlatformNumbers(platforms, anchor);
+        const usedNumbers = new Map(); // number -> node names given it
+        let unnumbered = 0;
+        const unnumberedList = [];
         for (const n of platforms) {
-          renameMap.set(n.name, claim(`${aName} ${pNum++}`));
+          const num = number.get(n);
+          let desired;
+          if (num !== null && num !== undefined) {
+            desired = `${aName} ${num}`;
+            if (taken.has(desired)) {
+              // The same number twice at one station: keep both, lettered,
+              // and say so (never "...42" for a second platform 4).
+              let k = 1;
+              while (taken.has(`${aName} ${num} ${ALPHA[k] || k}`)) k++;
+              desired = `${aName} ${num} ${ALPHA[k] || k}`;
+            }
+            if (!usedNumbers.has(num)) usedNumbers.set(num, []);
+            usedNumbers.get(num).push(desired);
+          } else {
+            const letter = unnumbered < ALPHA.length ? ALPHA[unnumbered] : `Z${unnumbered - ALPHA.length + 2}`;
+            unnumbered++;
+            desired = `${aName} Unnumbered ${letter}`;
+            unnumberedList.push(`"${desired}" at ${n.lat.toFixed(5)}, ${n.lon.toFixed(5)} (${notes.get(n) || 'OpenStreetMap gives it no platform number'})`);
+          }
+          renameMap.set(n.name, claim(desired));
+        }
+        if (unnumberedList.length > 0) {
+          warnings.push(`PLATFORMS NOT NUMBERED at ${aName}: ${unnumberedList.length} platform node${unnumberedList.length === 1 ? ' has a provisional name' : 's have provisional names'} ` +
+            `instead of a guessed number: ${unnumberedList.join('; ')}. Give ${unnumberedList.length === 1 ? 'it its real name' : 'them their real names'} ` +
+            `in the Network Editor (or delete any that are not platforms).`);
+        }
+        for (const [num, names] of usedNumbers) {
+          if (names.length > 1) {
+            warnings.push(`PLATFORM NUMBER USED TWICE at ${aName}: platform ${num} is on ${names.length} tracks ` +
+              `(${names.join(', ')}). OpenStreetMap may map one platform twice on different tracks; check them in the Network Editor.`);
+          }
+        }
+        if (orderAssumed.length > 0) {
+          warnings.push(`PLATFORM NUMBER ORDER ASSUMED at ${aName}: OSM gives ${orderAssumed.map(r => `"${r}"`).join(', ')} as one ` +
+            `platform with two numbers, and there is no other numbered platform at this station to show which way the numbers run, ` +
+            `so the lower number was put on the track nearer the station's own OSM point (usually the station building). Check it.`);
         }
 
         // Loop endpoint pairs: cardinal direction suffix
@@ -2909,6 +2998,8 @@ async function generateInfrastructureForSections(confirmedSections, networkName,
     delete node._platformGeometry;
     delete node._platformOsmId;
     delete node._platformOsmName;
+    delete node._platformOsmRef;
+    delete node._platformFace;
   }
 
   // ── Step 15: Branch-conflict and link-mismatch validation ──
