@@ -48,6 +48,7 @@ import {
   runInfrastructureGeneration
 } from '../generation/pipeline.js';
 import { makeOutputStamp, safeFileBase, stampedName } from '../../utils/outputNames.js';
+import { groupWarnings } from '../../utils/warningKinds.js';
 import { computeSearchBboxes } from './searchBoxes.js';
 import { legLabels, summariseSections, shortenWarnings, summariseGeometry, summariseSpeedboards } from './sectionSummary.js';
 import { agentLimits, generationStarts, sessionCreations } from './limits.js';
@@ -233,6 +234,29 @@ function generationStatusName(gen) {
 const SERIOUS_PROBLEMS_NOTE = 'Serious problems: the files were made, but the files each problem names (at its start) cannot be used as they are; it also says which files are not affected. ' +
   'Tell the user about each of these first, before anything else, and do not describe the result as a success.';
 
+/**
+ * A finished generation's warnings for the agent: every warning the user
+ * must see in full (warnings_to_review), then the information notes,
+ * shortened. Records from before October 2026 have one shortened list.
+ */
+function warningsView(gen) {
+  const view = {};
+  if (Array.isArray(gen.warningsToReview)) {
+    view.warnings_to_review = gen.warningsToReview;
+    view.warnings_to_review_note = WARNINGS_TO_REVIEW_NOTE;
+    if (Array.isArray(gen.notes) && gen.notes.length > 0) view.notes = gen.notes;
+    if (gen.notesOmitted) view.notes_omitted = gen.notesOmitted;
+  } else if (gen.warnings) {
+    view.warnings = gen.warnings;
+    if (gen.warningsOmitted) view.warnings_omitted = gen.warningsOmitted;
+  }
+  return view;
+}
+
+const WARNINGS_TO_REVIEW_NOTE = 'Pass on every one of these to the user, in full or clearly summarised by kind with every location kept ' +
+  '(platform merges, platforms without numbers, slips, diamonds, link problems, missing speed data, failed data fetches): ' +
+  'each is something to check or fix in the files, e.g. in the Network Editor. "notes" are information only and can be skipped or summarised.';
+
 function generationView(gen) {
   if (!gen) return null;
   const view = {};
@@ -262,8 +286,7 @@ function generationView(gen) {
   if (gen.finishedAt) view.finished_at = gen.finishedAt;
   if (gen.error) view.error = gen.error;
   if (gen.summary) view.summary = gen.summary;
-  if (gen.warnings) view.warnings = gen.warnings;
-  if (gen.warningsOmitted) view.warnings_omitted = gen.warningsOmitted;
+  Object.assign(view, warningsView(gen));
   if (gen.outputs) view.outputs = gen.outputs;
   if (gen.zipFileName) view.download_file_name = gen.zipFileName;
   return view;
@@ -675,7 +698,12 @@ async function runCombinedGeneration(data, updateProgress) {
       ...(geometry.results || []).flatMap(r => (r.warnings || []).map(w => `${r.section}: ${w}`)),
       ...(infrastructure.warnings || [])
     ];
-    const { warnings, omitted } = shortenWarnings(allWarnings);
+    // Warnings the user must see (serious, and "check these": platform
+    // merges and numbers, slips, diamonds, no speed data, ...) are kept in
+    // full and never shortened; only the information notes are shortened.
+    const groups = groupWarnings(allWarnings);
+    const warningsToReview = [...groups.serious, ...groups.review];
+    const { warnings: notes, omitted: notesOmitted } = shortenWarnings(groups.info, { maxItems: 10, maxChars: 300 });
     // Serious problems are kept apart from the warnings: never shortened,
     // shown first (see describeSeriousProblems in generation/pipeline.js).
     const seriousProblems = Array.isArray(geometry.seriousProblems) ? geometry.seriousProblems : [];
@@ -703,13 +731,14 @@ async function runCombinedGeneration(data, updateProgress) {
         infrastructureStamp: infrastructure.infrastructureStamp || null,
         seriousProblems,
         summary,
-        warnings,
-        warningsOmitted: omitted,
+        warningsToReview,
+        notes,
+        notesOmitted,
         outputs
       };
       agent.generation.zipFileName = zipFileName({ agent });
     });
-    return { seriousProblems, summary, warnings, outputs };
+    return { seriousProblems, summary, warningsToReview, notes, outputs };
   } catch (error) {
     try {
       updateAgentMetadataSync(sessionId, agent => {
@@ -837,8 +866,7 @@ export async function getAgentJobStatus(userId, jobId) {
 
   if (kind === 'generation' && (response.status === 'completed' || response.status === 'completed_with_problems')) {
     response.summary = record.summary;
-    response.warnings = record.warnings;
-    if (record.warningsOmitted) response.warnings_omitted = record.warningsOmitted;
+    Object.assign(response, warningsView(record));
     response.outputs = record.outputs;
     if (record.zipFileName) response.download_file_name = record.zipFileName;
   }

@@ -102,7 +102,9 @@ function installStandIns() {
       csv: '#7,Traxim v7 test\n',
       nodeCount: infraNodeCount,
       connectionCount: 130,
-      warnings: ['Naming anchors available (3): ' + 'x'.repeat(2000), 'SIGNAL OMISSION: ...']
+      warnings: ['Naming anchors available (3): ' + 'x'.repeat(2000), 'SIGNAL OMISSION: ...',
+        ...Array.from({ length: 30 }, (_, i) => `PLATFORMS MERGED at 44.1${i}, 9.8: 2 platform nodes ... ` + 'y'.repeat(500)),
+        ...Array.from({ length: 15 }, (_, i) => `Loaded ${i} cached ways and 0 tagged nodes from osm_topology.json.`)]
     }));
 }
 
@@ -414,7 +416,17 @@ test('combined job: geometry then infrastructure; outputs-only ZIP; owner-only d
   assert.equal(status.summary.node_limit, 5000);
   assert.equal(status.summary.legs_generated, 2);
   assert.equal(status.summary.routes[0].length_km, 12.3);
-  assert.ok(status.warnings.some(w => /shortened/.test(w)), 'long warning shortened');
+  // Warnings to review: every one, in full, never shortened (30 long
+  // platform merges, the no-speed-data warning, ...); information notes
+  // shortened and capped.
+  assert.equal(status.warnings, undefined, 'no single mixed list any more');
+  assert.equal(status.warnings_to_review.filter(w => /PLATFORMS MERGED/.test(w)).length, 30, 'every platform merge');
+  assert.ok(status.warnings_to_review.every(w => !/shortened/.test(w)), 'none shortened');
+  assert.ok(status.warnings_to_review.some(w => /SIGNAL OMISSION/.test(w)));
+  assert.match(status.warnings_to_review_note, /every one/);
+  assert.ok(status.notes.length <= 10, 'notes capped');
+  assert.ok(status.notes_omitted > 0);
+  assert.ok(status.notes.some(w => /Naming anchors/.test(w) && /shortened/.test(w)), 'long note shortened');
   // Date stamps: the geometry run's stamp on the ZIP, Regions and KMZ; the
   // infrastructure run's own stamp on Infrastructure; the geometry files keep
   // their names (Traxim reads region names from inside them).
@@ -433,7 +445,7 @@ test('combined job: geometry then infrastructure; outputs-only ZIP; owner-only d
   // Speedboards: made even with no speed data, and that is said plainly.
   assert.equal(status.summary.speedboards.no_speed_data, true);
   assert.match(status.summary.speedboards.note, /Auto-Curve Speed Limiting/);
-  assert.ok(status.warnings.some(w => /NO SPEED DATA/.test(w)), 'no-speed-data warning near the top');
+  assert.ok(status.warnings_to_review.some(w => /NO SPEED DATA/.test(w)), 'no-speed-data warning to review');
   assert.match(status.summary.file_stamps.explained, /Speedboards/);
   assert.equal(status.download_file_name, `Test-route_${stamp}.zip`);
   assert.equal(status.serious_problems, undefined, 'no serious problems when elevation is fine');

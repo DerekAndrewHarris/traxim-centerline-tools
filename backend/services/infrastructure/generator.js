@@ -2275,7 +2275,7 @@ async function generateInfrastructureForSections(confirmedSections, networkName,
           `only ${resolvedLinks.length} side(s) of the platform ha${resolvedLinks.length === 1 ? 's' : 've'} a track beside it — inserting what was found.`);
       }
       if (resolvedLinks.length > 1) {
-        warnings.push(`Platform "${platform.name}" (${platform.id}): island platform — one platform node on the track along each side.`);
+        warnings.push(`Platform "${platform.name}" (${platform.id}): tracks on both sides — one platform node on the track along each side.`);
       }
 
       const usedArms = new Set(); // the same link must never get two faces of one platform

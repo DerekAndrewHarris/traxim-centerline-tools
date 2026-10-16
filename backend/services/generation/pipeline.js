@@ -20,6 +20,7 @@ import { DEFAULT_RULING_GRADIENT } from '../geometry/processor.js';
 import { readSessionMetadataSync, updateSessionMetadata } from '../../utils/tempFiles.js';
 import { buildGeometryKml } from '../../utils/kmlGenerator.js';
 import { isValidOutputStamp, makeOutputStamp } from '../../utils/outputNames.js';
+import { groupWarnings } from '../../utils/warningKinds.js';
 
 // ── Maximum gradient for elevation smoothing (user setting, October 2026) ──
 // The smoothing pulls the elevation profile so that no stretch is steeper
@@ -521,7 +522,12 @@ export async function runGeometryGeneration(data, updateProgress) {
     speedboards,
     seriousProblems,
     maxGradientPercent,
-    outputStamp
+    outputStamp,
+    // Every section's warnings (prefixed with the section) in three groups:
+    // serious and review are always shown in full, info on request.
+    warningGroups: groupWarnings(results.flatMap(r => (r.warnings || [])
+      .filter(w => !/topology json saved/i.test(w))
+      .map(w => `${r.section}: ${w}`)))
   };
 }
 
@@ -615,7 +621,9 @@ export async function runInfrastructureGeneration(jobData, progressCallback, gen
     geometryStamp,
     nodeCount: result.nodeCount,
     connectionCount: result.connectionCount,
-    warnings: result.warnings
+    warnings: result.warnings,
+    // serious and review: always shown in full; info: on request.
+    warningGroups: groupWarnings(result.warnings)
   };
 }
 
