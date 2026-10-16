@@ -6,10 +6,13 @@
  *                           work out the search boxes, find the sections
  *   2. getAgentSessionState the numbered section list (and later progress)
  *   3. confirmAgentSections the USER's choice, made in the chat, recorded
+ *      confirmAgentSectionsFromMap  ...or made by the user on the map page
+ *                           ("Use these sections"), recorded with source map
  *   4. startAgentGeneration one combined job: geometry, then infrastructure
  *                           (Regions.csv is written by the geometry step)
  *   5. getAgentJobStatus    progress; outputs list when done
- *   6. streamAgentOutputs   outputs-only ZIP (Infrastructure, Regions, Geometry/)
+ *   6. streamAgentOutputs   outputs-only ZIP (Infrastructure, Regions, Geometry.kml,
+ *                           Geometry/), names date-stamped per run
  *
  * Every function takes the caller's user id (from the Controller, see
  * utils/internalAuth.js) and only ever touches that user's own sessions:
@@ -39,10 +42,12 @@ import {
   buildGeometrySegments,
   enrichConfirmedSections,
   mergeSearchBboxes,
+  parseMaxGradientPercent,
   readMapOverlays,
   runGeometryGeneration,
   runInfrastructureGeneration
 } from '../generation/pipeline.js';
+import { makeOutputStamp, safeFileBase, stampedName } from '../../utils/outputNames.js';
 import { computeSearchBboxes } from './searchBoxes.js';
 import { legLabels, summariseSections, shortenWarnings, summariseGeometry } from './sectionSummary.js';
 import { agentLimits, generationStarts, sessionCreations } from './limits.js';
@@ -73,6 +78,7 @@ const SPACING_MAX = 100;
 const MAX_LABEL = 100;
 const MAX_PLACE = 200;
 const MAX_USER_REPLY = 1000;
+const MAX_CONFIRMED_BY = 200;
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -144,10 +150,10 @@ export function deriveState(meta) {
 const STATE_EXPLANATIONS = {
   searching: 'Finding the waypoints and searching OpenStreetMap for railway sections. Check again in 15-30 seconds.',
   search_failed: 'The section search failed (see search.error). Start a new session, adjusting the waypoints if the error says so.',
-  awaiting_confirmation: 'Sections found. Show the user the numbered list and ask which sections to include. Do not choose for them. Then call generator_confirm_sections with their choice.',
-  confirmed: 'The user\'s choice of sections is recorded. You may now start generation with generator_generate_files.',
+  awaiting_confirmation: 'Sections found. Show the user the numbered list and ask which sections to include. Do not choose for them. They can answer in the chat (then call generator_confirm_sections with their choice) or tick sections on the map page and press "Use these sections" (then generator_get_session shows their choice as confirmed, source "map").',
+  confirmed: 'The user\'s choice of sections is recorded (see confirmation: the sections, and whether they were chosen in the chat or on the map). Before starting generation, read the chosen sections back to the user (numbers and names) and say where they were chosen; if the user has not already asked you to generate, ask whether to go ahead. Then start generation with generator_generate_files.',
   generating: 'Generating files. Check progress with generator_get_job_status every 15-30 seconds.',
-  ready: 'Files are ready. Give the user the download link; never fetch it yourself.',
+  ready: 'Files are ready. Give the user the download link; never fetch it yourself. If generation.serious_problems is present, tell the user about those problems first: the files cannot be used as they are.',
   generation_failed: 'Generation failed (see generation.error). The user can change the selection (generator_confirm_sections) or the waypoints (new session) and try again.',
   interrupted: 'The File Generator restarted while a job was waiting or running, so that job was lost. Start it again (generator_generate_files), or start a new session if this was the section search.'
 };
@@ -163,30 +169,67 @@ function waypointList(meta) {
   }));
 }
 
-function listOutputsSync(sessionPath) {
+/**
+ * The files that go into the download ZIP: `file` is the name in the ZIP
+ * (Infrastructure, Regions and the KML date-stamped with the run's stamp;
+ * the geometry files keep their names, see utils/outputNames.js), `source`
+ * the file on disk (never shown to the agent).
+ */
+function listOutputFilesSync(sessionPath, stamp) {
   const outputs = [];
-  for (const name of ['Infrastructure.csv', 'Regions.csv']) {
+  for (const name of ['Infrastructure.csv', 'Regions.csv', 'Geometry.kml']) {
     const file = path.join(sessionPath, name);
-    if (fsSync.existsSync(file)) outputs.push({ file: name, size_bytes: fsSync.statSync(file).size });
+    if (fsSync.existsSync(file)) outputs.push({ file: stampedName(name, stamp), size_bytes: fsSync.statSync(file).size, source: file });
   }
   const geometryDir = path.join(sessionPath, 'geometry');
   let names = [];
   try { names = fsSync.readdirSync(geometryDir).filter(isGeometryCsvFile).sort(); } catch { /* none */ }
   for (const name of names) {
-    outputs.push({ file: `Geometry/${name}`, size_bytes: fsSync.statSync(path.join(geometryDir, name)).size });
+    const file = path.join(geometryDir, name);
+    outputs.push({ file: `Geometry/${name}`, size_bytes: fsSync.statSync(file).size, source: file });
   }
   return outputs;
 }
 
+function listOutputsSync(sessionPath, stamp) {
+  return listOutputFilesSync(sessionPath, stamp).map(({ file, size_bytes }) => ({ file, size_bytes }));
+}
+
+/** The download ZIP's file name: "<label>_<stamp>.zip" (as the Network Editor names its files). */
+function zipFileName(meta) {
+  const agent = meta.agent || {};
+  const gen = agent.generation || {};
+  const base = safeFileBase(agent.label || gen.networkName, 'Traxim-files');
+  return gen.outputStamp ? `${base}_${gen.outputStamp}.zip` : `${base}.zip`;
+}
+
+/** Status name shown to the agent for a generation record. */
+function generationStatusName(gen) {
+  if (gen.status === 'completed' && Array.isArray(gen.seriousProblems) && gen.seriousProblems.length > 0) {
+    return 'completed_with_problems';
+  }
+  return gen.status;
+}
+
+const SERIOUS_PROBLEMS_NOTE = 'Serious problems: the files were made, but cannot be used as they are. ' +
+  'Tell the user about each of these first, before anything else, and do not describe the result as a success.';
+
 function generationView(gen) {
   if (!gen) return null;
-  const view = {
+  const view = {};
+  if (Array.isArray(gen.seriousProblems) && gen.seriousProblems.length > 0) {
+    view.serious_problems = gen.seriousProblems;
+    view.serious_problems_note = SERIOUS_PROBLEMS_NOTE;
+  }
+  Object.assign(view, {
     job_id: gen.jobId,
-    status: gen.status,
+    status: generationStatusName(gen),
     network_name: gen.networkName,
     spacing_metres: gen.spacingMetres,
+    max_gradient_percent: gen.maxGradientPercent,
     queued_at: gen.queuedAt
-  };
+  });
+  if (gen.outputStamp) view.file_stamp = gen.outputStamp;
   const job = jobQueue.getJob(gen.jobId);
   if (job && (gen.status === 'queued' || gen.status === 'running')) {
     view.status = jobStatusName(job.status);
@@ -203,6 +246,30 @@ function generationView(gen) {
   if (gen.warnings) view.warnings = gen.warnings;
   if (gen.warningsOmitted) view.warnings_omitted = gen.warningsOmitted;
   if (gen.outputs) view.outputs = gen.outputs;
+  if (gen.zipFileName) view.download_file_name = gen.zipFileName;
+  return view;
+}
+
+/** The recorded choice, for the agent: which sections, where and by whom. */
+function confirmationView(meta) {
+  const c = meta.agent && meta.agent.confirmation;
+  if (!c) return null;
+  const candidates = meta.candidateSections || [];
+  const source = c.source || 'chat';
+  const view = {
+    source,
+    source_explained: source === 'map'
+      ? 'Chosen by the user on the map page (File Generator, "Use these sections" button).'
+      : 'Chosen by the user in the chat with the agent (generator_confirm_sections).',
+    section_numbers: c.sectionNumbers,
+    sections: (c.sectionNumbers || []).map(n => ({
+      number: n,
+      name: (candidates[n - 1] && candidates[n - 1].name) || 'Unnamed section'
+    })),
+    confirmed_at: c.at
+  };
+  if (c.confirmedBy) view.confirmed_by = c.confirmedBy;
+  if (c.userReply) view.user_reply = c.userReply;
   return view;
 }
 
@@ -231,13 +298,7 @@ async function stateView(meta, { map = false } = {}) {
       ...(agent.search && agent.search.overpassFailures ? { overpass_failures: agent.search.overpassFailures } : {})
     },
     sections: [],
-    confirmation: agent.confirmation
-      ? {
-          section_numbers: agent.confirmation.sectionNumbers,
-          confirmed_at: agent.confirmation.at,
-          user_reply: agent.confirmation.userReply
-        }
-      : null,
+    confirmation: confirmationView(meta),
     generation: generationView(agent.generation)
   };
   if (agent.search && agent.search.status === 'done') {
@@ -466,7 +527,22 @@ export async function confirmAgentSections(userId, sessionId, body = {}) {
   const candidates = meta.candidateSections || [];
   if (candidates.length === 0) throw new AgentError('No sections were found in this session, so there is nothing to confirm. Start a new session with different waypoints.', 409);
 
-  const numbers = body.section_numbers;
+  const chosen = validSectionNumbers(body.section_numbers, candidates);
+
+  const userReply = cleanText(body.user_reply, MAX_USER_REPLY);
+  if (!userReply) {
+    throw new AgentError('user_reply is required: quote the user\'s own message in which they chose these sections. Ask the user first; never choose sections on their behalf.');
+  }
+
+  await recordConfirmation(sessionId, meta, chosen, { userReply, source: 'chat', confirmedByUserId: userId });
+  return stateView(readSessionMetadataSync(sessionId));
+}
+
+/**
+ * Check a list of section numbers against the session's candidates.
+ * @returns {number[]} unique, sorted
+ */
+function validSectionNumbers(numbers, candidates) {
   if (!Array.isArray(numbers) || numbers.length === 0) {
     throw new AgentError('section_numbers must list the numbers (from the section list) of the sections the user chose, e.g. [1, 3, 4].');
   }
@@ -477,13 +553,12 @@ export async function confirmAgentSections(userId, sessionId, body = {}) {
     }
     if (!chosen.includes(n)) chosen.push(n);
   }
-  chosen.sort((a, b) => a - b);
+  return chosen.sort((a, b) => a - b);
+}
 
-  const userReply = cleanText(body.user_reply, MAX_USER_REPLY);
-  if (!userReply) {
-    throw new AgentError('user_reply is required: quote the user\'s own message in which they chose these sections. Ask the user first; never choose sections on their behalf.');
-  }
-
+/** Store a confirmed choice (same enrichment as the website's confirm). */
+async function recordConfirmation(sessionId, meta, chosen, record) {
+  const candidates = meta.candidateSections || [];
   const selected = chosen.map(n => ({ osmId: candidates[n - 1].osmId, osmType: candidates[n - 1].osmType, name: candidates[n - 1].name }));
   const confirmedSections = enrichConfirmedSections(selected, candidates, meta.searchBboxes || []);
   await updateSessionMetadata(sessionId, {
@@ -491,27 +566,67 @@ export async function confirmAgentSections(userId, sessionId, body = {}) {
     confirmationTimestamp: new Date().toISOString()
   });
   updateAgentMetadataSync(sessionId, agent => {
-    agent.confirmation = { sectionNumbers: chosen, at: new Date().toISOString(), userReply, via: 'agent chat' };
+    agent.confirmation = { sectionNumbers: chosen, at: new Date().toISOString(), ...record };
     // A new choice replaces any earlier generation result.
     agent.generation = null;
   });
-  return stateView(readSessionMetadataSync(sessionId));
+}
+
+/**
+ * The second pathway (October 2026): the user ticks sections on the map
+ * page (?session=<id>) and presses "Use these sections". Reaches here only
+ * through the Controller's browser route (login cookie + ownership), never
+ * from an agent token or the MCP connector. Allowed only while the session
+ * is waiting for a choice: once sections are chosen (in the chat or on the
+ * map) the page shows the choice instead.
+ *
+ * @param {number} userId
+ * @param {string} sessionId
+ * @param {{section_numbers: number[], confirmed_by?: string}} body
+ *   confirmed_by: who pressed the button (the Controller sends the account's e-mail)
+ */
+export async function confirmAgentSectionsFromMap(userId, sessionId, body = {}) {
+  const meta = ownedSession(userId, sessionId);
+  const state = deriveState(meta);
+  if (state !== 'awaiting_confirmation') {
+    const why = {
+      searching: 'The section search is still running. Reload the page in a minute.',
+      search_failed: 'The section search failed, so there is nothing to choose. Ask the agent to start again.',
+      confirmed: 'Sections have already been chosen for this session (in the chat or on the map). Reload the page to see the choice; to change it, tell the agent in the chat.',
+      generating: 'Files are being generated for this session, so the choice can no longer be changed here.',
+      ready: 'Files have already been generated for this session, so the choice can no longer be changed here. To change it, tell the agent in the chat.',
+      generation_failed: 'Sections were already chosen and generation was tried. To change the choice, tell the agent in the chat.',
+      interrupted: 'This session was interrupted by a File Generator restart. Ask the agent to start again.'
+    }[state] || 'The sections can no longer be chosen here.';
+    throw new AgentError(why, 409);
+  }
+  const candidates = meta.candidateSections || [];
+  if (candidates.length === 0) throw new AgentError('No sections were found in this session, so there is nothing to choose.', 409);
+  const chosen = validSectionNumbers(body.section_numbers, candidates);
+  const confirmedBy = cleanText(body.confirmed_by, MAX_CONFIRMED_BY) || null;
+  await recordConfirmation(sessionId, meta, chosen, { source: 'map', confirmedBy, confirmedByUserId: userId });
+  return stateView(readSessionMetadataSync(sessionId), { map: true });
 }
 
 // ── 4. Combined generation job ──────────────────────────────────────────────
 
 async function runCombinedGeneration(data, updateProgress) {
-  const { sessionId, spacingMetres, networkName, maxNodes } = data;
+  const { sessionId, spacingMetres, networkName, maxNodes, maxGradientPercent } = data;
   const sessionPath = sessionPathOf(sessionId);
+  // One date stamp for every file of this run (utils/outputNames.js).
+  const outputStamp = makeOutputStamp();
   updateAgentMetadataSync(sessionId, agent => {
-    if (agent.generation) agent.generation.status = 'running';
+    if (agent.generation) {
+      agent.generation.status = 'running';
+      agent.generation.outputStamp = outputStamp;
+    }
   });
   try {
     const meta = readSessionMetadataSync(sessionId);
     const segments = buildGeometrySegments(meta);
 
     const geometry = await deps.runGeometryGeneration(
-      { sessionId, sessionPath, spacingMetres, segments },
+      { sessionId, sessionPath, spacingMetres, segments, maxGradientPercent, outputStamp },
       (p, step) => updateProgress(Math.floor(p * 0.6), `Geometry: ${step}`)
     );
     if (!geometry.successfulSections) {
@@ -539,27 +654,38 @@ async function runCombinedGeneration(data, updateProgress) {
       ...(infrastructure.warnings || [])
     ];
     const { warnings, omitted } = shortenWarnings(allWarnings);
+    // Serious problems are kept apart from the warnings: never shortened,
+    // shown first (see describeSeriousProblems in generation/pipeline.js).
+    const seriousProblems = Array.isArray(geometry.seriousProblems) ? geometry.seriousProblems : [];
     const summary = {
+      settings: {
+        spacing_metres: spacingMetres,
+        max_gradient_percent: maxGradientPercent,
+        network_name: networkName
+      },
       routes: summariseGeometry(geometry),
       legs_generated: geometry.successfulSections,
       legs_total: geometry.totalSections,
       infrastructure_nodes: infrastructure.nodeCount,
       infrastructure_connections: infrastructure.connectionCount,
-      node_limit: maxNodes
+      node_limit: maxNodes,
+      file_stamp: outputStamp
     };
-    const outputs = listOutputsSync(sessionPath);
+    const outputs = listOutputsSync(sessionPath, outputStamp);
     updateAgentMetadataSync(sessionId, agent => {
       agent.generation = {
         ...agent.generation,
         status: 'completed',
         finishedAt: new Date().toISOString(),
+        seriousProblems,
         summary,
         warnings,
         warningsOmitted: omitted,
         outputs
       };
+      agent.generation.zipFileName = zipFileName({ agent });
     });
-    return { summary, warnings, outputs };
+    return { seriousProblems, summary, warnings, outputs };
   } catch (error) {
     try {
       updateAgentMetadataSync(sessionId, agent => {
@@ -584,7 +710,7 @@ export async function startAgentGeneration(userId, sessionId, body = {}) {
   if (state === 'searching') throw new AgentError('The section search is still running. Wait for it, show the user the list and record their choice first.', 409);
   if (state === 'search_failed') throw new AgentError('The section search failed for this session. Start a new session.', 409);
   if (!meta.agent.confirmation || !Array.isArray(meta.confirmedSections) || meta.confirmedSections.length === 0) {
-    throw new AgentError('The user has not chosen any sections yet. Show them the numbered section list, ask which to include, and record their answer with generator_confirm_sections before generating.', 409);
+    throw new AgentError('The user has not chosen any sections yet. Show them the numbered section list and ask which to include: record their answer with generator_confirm_sections, or they can tick sections on the map page and press "Use these sections". Then read the choice back to them before generating.', 409);
   }
 
   let spacingMetres = SPACING_DEFAULT;
@@ -593,6 +719,12 @@ export async function startAgentGeneration(userId, sessionId, body = {}) {
     if (!Number.isFinite(spacingMetres) || spacingMetres < SPACING_MIN || spacingMetres > SPACING_MAX) {
       throw new AgentError(`spacing_metres must be between ${SPACING_MIN} and ${SPACING_MAX} (default ${SPACING_DEFAULT}).`);
     }
+  }
+  let maxGradientPercent;
+  try {
+    maxGradientPercent = parseMaxGradientPercent(body.max_gradient_percent);
+  } catch (rangeError) {
+    throw new AgentError(`max_gradient_percent: ${rangeError.message}`);
   }
   const networkName = cleanText(body.network_name, MAX_LABEL) || 'Railway Network';
 
@@ -604,12 +736,12 @@ export async function startAgentGeneration(userId, sessionId, body = {}) {
   checkActiveJobs(userId);
 
   updateAgentMetadataSync(sessionId, agent => {
-    agent.generation = { status: 'queued', queuedAt: new Date().toISOString(), networkName, spacingMetres };
+    agent.generation = { status: 'queued', queuedAt: new Date().toISOString(), networkName, spacingMetres, maxGradientPercent };
   });
   generationStarts.record(userId);
   const jobId = jobQueue.createJob(
     'agent-generation',
-    { ownerId: userId, sessionId, spacingMetres, networkName, maxNodes: limits.maxNodes },
+    { ownerId: userId, sessionId, spacingMetres, networkName, maxGradientPercent, maxNodes: limits.maxNodes },
     (data, updateProgress) => runCombinedGeneration(data, updateProgress)
   );
   updateAgentMetadataSync(sessionId, agent => { agent.generation.jobId = jobId; });
@@ -622,6 +754,7 @@ export async function startAgentGeneration(userId, sessionId, body = {}) {
     queue_position: jobQueue.queuePosition(jobId) || undefined,
     network_name: networkName,
     spacing_metres: spacingMetres,
+    max_gradient_percent: maxGradientPercent,
     expected_duration: `roughly ${Math.max(1, legs)} to ${Math.max(3, legs * 3)} minutes (geometry about 30-60 s per leg, then 2-5 minutes for infrastructure)`,
     generations_used_this_hour: allowed.used + 1,
     generations_per_hour_limit: limits.generationsPerHour
@@ -653,9 +786,15 @@ export async function getAgentJobStatus(userId, jobId) {
   const record = kind === 'generation' ? meta.agent.generation : meta.agent.search;
   const job = jobQueue.getJob(jobId);
 
-  const response = { job_id: jobId, kind, session_id: meta.id, session_expires_at: meta.expiresAt };
+  // Serious problems first, in full (never shortened like the warnings).
+  const response = {};
+  if (kind === 'generation' && Array.isArray(record.seriousProblems) && record.seriousProblems.length > 0) {
+    response.serious_problems = record.seriousProblems;
+    response.serious_problems_note = SERIOUS_PROBLEMS_NOTE;
+  }
+  Object.assign(response, { job_id: jobId, kind, session_id: meta.id, session_expires_at: meta.expiresAt });
   if (record.status === 'completed' || record.status === 'done') {
-    response.status = 'completed';
+    response.status = kind === 'generation' ? generationStatusName(record) : 'completed';
   } else if (record.status === 'failed') {
     response.status = 'failed';
     response.error = record.error;
@@ -672,11 +811,12 @@ export async function getAgentJobStatus(userId, jobId) {
       : 'The File Generator restarted during the section search. Start a new session.';
   }
 
-  if (kind === 'generation' && response.status === 'completed') {
+  if (kind === 'generation' && (response.status === 'completed' || response.status === 'completed_with_problems')) {
     response.summary = record.summary;
     response.warnings = record.warnings;
     if (record.warningsOmitted) response.warnings_omitted = record.warningsOmitted;
     response.outputs = record.outputs;
+    if (record.zipFileName) response.download_file_name = record.zipFileName;
   }
   if (kind === 'section_search' && response.status === 'completed') {
     response.next_step = 'Call generator_get_session to see the numbered list of sections.';
@@ -687,10 +827,11 @@ export async function getAgentJobStatus(userId, jobId) {
 // ── 6. Outputs-only download ────────────────────────────────────────────────
 
 /**
- * Stream the outputs-only ZIP to an HTTP response: Infrastructure.csv,
- * Regions.csv and the geometry CSVs in a Geometry/ folder. Never the OSM
- * caches, *_wayids.csv, *_topology.json, corridor_polygons.json or
- * session.json.
+ * Stream the outputs-only ZIP to an HTTP response:
+ * Infrastructure_<stamp>.csv, Regions_<stamp>.csv, Geometry_<stamp>.kml and
+ * the geometry CSVs in a Geometry/ folder; the ZIP is <label>_<stamp>.zip.
+ * Never the OSM caches, *_wayids.csv, *_topology.json,
+ * corridor_polygons.json or session.json.
  */
 export async function streamAgentOutputs(userId, sessionId, res) {
   const meta = ownedSession(userId, sessionId);
@@ -698,12 +839,10 @@ export async function streamAgentOutputs(userId, sessionId, res) {
     throw new AgentError('The files for this session are not ready (generation has not finished successfully).', 409);
   }
   const sessionPath = sessionPathOf(sessionId);
-  const outputs = listOutputsSync(sessionPath);
+  const outputs = listOutputFilesSync(sessionPath, meta.agent.generation.outputStamp);
   if (outputs.length === 0) throw new AgentError('No output files were found for this session.', 404);
 
-  const base = (meta.agent.label || meta.agent.generation.networkName || 'traxim-files')
-    .replace(/[^A-Za-z0-9 _.-]+/g, '').trim().replace(/\s+/g, '-').slice(0, 60) || 'traxim-files';
-  const fileName = `${base}-${sessionId.slice(0, 8)}.zip`;
+  const fileName = zipFileName(meta);
 
   res.setHeader('Content-Type', 'application/zip');
   res.setHeader('Content-Disposition', `attachment; filename="${fileName}"`);
@@ -716,10 +855,7 @@ export async function streamAgentOutputs(userId, sessionId, res) {
     archive.on('end', resolve);
     archive.pipe(res);
     for (const out of outputs) {
-      const source = out.file.startsWith('Geometry/')
-        ? path.join(sessionPath, 'geometry', out.file.slice('Geometry/'.length))
-        : path.join(sessionPath, out.file);
-      archive.file(source, { name: out.file });
+      archive.file(out.source, { name: out.file });
     }
     archive.finalize();
   });

@@ -43,6 +43,8 @@ const SECTIONS = [
 ];
 
 let infraNodeCount = 120;
+let elevationAvailable = true;   // false: the stand-in geometry has no elevation data (as with HTTP 429)
+let lastGeometryData = null;     // what the combined job passed to the geometry step
 
 function geometryCsv(name) {
   return `#region name,latitude,longitude,elevation,kilometerage,raw_elevation\n${name},44.4,8.9,10,0,10\n${name},44.41,8.91,11,0.135,11\n`;
@@ -60,7 +62,9 @@ function installStandIns() {
     failedBboxCount: 0,
     totalBboxCount: bboxes.length
   });
-  agent.deps.runGeometryGeneration = async ({ sessionId, sessionPath, segments }, progress) => {
+  agent.deps.runGeometryGeneration = async (data, progress) => {
+    const { sessionId, sessionPath, segments } = data;
+    lastGeometryData = data;
     progress(50, 'stand-in geometry');
     const dir = path.join(sessionPath, 'geometry');
     fs.mkdirSync(dir, { recursive: true });
@@ -70,13 +74,22 @@ function installStandIns() {
       fs.writeFileSync(path.join(dir, `${file}.csv`), geometryCsv(seg.label));
       fs.writeFileSync(path.join(dir, `${file}_wayids.csv`), 'wayId\n1\n');
       fs.writeFileSync(path.join(dir, `${file}_topology.json`), '{}');
-      results.push({ section: seg.label, lengthKm: 12.345, pointCount: 500, alternativeCount: 0, warnings: ['a geometry warning'] });
+      results.push({
+        section: seg.label, lengthKm: 12.345, pointCount: 500, alternativeCount: 0, warnings: ['a geometry warning'],
+        elevation: elevationAvailable ? { ok: true, reason: null } : { ok: false, reason: 'Elevation batch 1 failed after 2 retries: Open-Elevation API returned 429 (too many requests)' },
+        alternativeElevation: [],
+        smoothing: { adjustedCount: 3, maxAdjustmentM: 1.26 }
+      });
     }
+    await pipeline.writeGeometryKml(sessionPath);
     fs.writeFileSync(path.join(sessionPath, 'Regions.csv'), '#regions\n,White,1\n');
     fs.writeFileSync(path.join(sessionPath, 'osm_topology.json'), '{"ways":[]}');
     fs.writeFileSync(path.join(sessionPath, 'corridor_polygons.json'), '[]');
     fs.writeFileSync(path.join(sessionPath, 'osm_stations.json'), '[]');
-    return { sessionId, totalSections: segments.length, successfulSections: segments.length, results, regionsWarning: 'Regions.csv: defaults used' };
+    return {
+      sessionId, totalSections: segments.length, successfulSections: segments.length, results, regionsWarning: 'Regions.csv: defaults used',
+      seriousProblems: pipeline.describeSeriousProblems(results)
+    };
   };
   // The REAL pipeline step (so the node limit check is the real one), with a
   // stand-in for the 2,800-line generator itself.
@@ -167,6 +180,8 @@ beforeEach(() => {
   limits.generationStarts.reset();
   limits.sessionCreations.reset();
   infraNodeCount = 120;
+  elevationAvailable = true;
+  lastGeometryData = null;
   delete process.env.AGENT_MAX_GENERATIONS_PER_HOUR;
   delete process.env.AGENT_MAX_SESSIONS_PER_HOUR;
   process.env.TRAXIM_INTERNAL_KEY = KEY;
@@ -380,10 +395,22 @@ test('combined job: geometry then infrastructure; outputs-only ZIP; owner-only d
   assert.equal(status.summary.legs_generated, 2);
   assert.equal(status.summary.routes[0].length_km, 12.3);
   assert.ok(status.warnings.some(w => /shortened/.test(w)), 'long warning shortened');
+  // One date stamp per run on the ZIP, Infrastructure, Regions and KML; the
+  // geometry files keep their names (Traxim reads region names from inside them).
+  const stamp = status.summary.file_stamp;
+  assert.match(stamp, /^\d{4}-\d{2}-\d{2}_\d{6}$/);
+  assert.equal(lastGeometryData.outputStamp, stamp, 'the geometry step got the same stamp');
   assert.deepEqual(status.outputs.map(o => o.file), [
-    'Infrastructure.csv', 'Regions.csv',
+    `Infrastructure_${stamp}.csv`, `Regions_${stamp}.csv`, `Geometry_${stamp}.kml`,
     'Geometry/Genova_Centrale_-_Town_44.10.csv', 'Geometry/Town_44.10_-_Pisa_Centrale.csv'
   ]);
+  assert.ok(status.outputs.every(o => !('source' in o)), 'no server paths in the outputs list');
+  assert.equal(status.download_file_name, `Test-route_${stamp}.zip`);
+  assert.equal(status.serious_problems, undefined, 'no serious problems when elevation is fine');
+  assert.deepEqual(status.summary.settings, { spacing_metres: 25, max_gradient_percent: 4, network_name: 'Ligurian test' });
+  assert.equal(status.summary.routes[0].elevation_data, true);
+  assert.equal(status.summary.routes[0].smoothing_points_adjusted, 3);
+  assert.equal(status.summary.routes[0].smoothing_largest_change_m, 1.3);
   assert.ok(!JSON.stringify(status).includes(tempRoot), 'no server paths');
 
   const state = await call('GET', `/internal/agent/sessions/${id}`);
@@ -399,13 +426,17 @@ test('combined job: geometry then infrastructure; outputs-only ZIP; owner-only d
   const zip = await call('GET', `/internal/agent/sessions/${id}/download`);
   assert.equal(zip.status, 200);
   assert.equal(zip.headers.get('content-type'), 'application/zip');
-  assert.match(zip.headers.get('content-disposition'), /attachment; filename="Test-route-[0-9a-f]{8}\.zip"/);
+  assert.equal(zip.headers.get('content-disposition'), `attachment; filename="Test-route_${stamp}.zip"`);
   assert.deepEqual(zipEntryNames(zip.buffer), [
     'Geometry/Genova_Centrale_-_Town_44.10.csv',
     'Geometry/Town_44.10_-_Pisa_Centrale.csv',
-    'Infrastructure.csv',
-    'Regions.csv'
+    `Geometry_${stamp}.kml`,
+    `Infrastructure_${stamp}.csv`,
+    `Regions_${stamp}.csv`
   ], 'outputs only: no osm_*.json, corridor_polygons.json, _wayids, _topology or session.json');
+  const kml = fs.readFileSync(path.join(tempRoot, id, 'Geometry.kml'), 'utf8');
+  assert.match(kml, /<name>Genova Centrale - Town 44\.10<\/name>/, 'one line per geometry file, named like the website does');
+  assert.match(kml, /8\.91000000,44\.41000000,0\.000/, 'lon,lat order, clamped to the ground');
   assert.equal((await call('GET', `/internal/agent/sessions/${id}/download`, { userId: BOB })).status, 404);
 
   // Map data for the session view page.
@@ -493,4 +524,150 @@ test('list, expiry and delete', async () => {
   assert.equal(deleted.status, 200);
   assert.equal(fs.existsSync(path.join(tempRoot, id)), false);
   assert.equal((await call('GET', `/internal/agent/sessions/${id}`)).status, 404);
+});
+
+// ── Choosing sections on the map (second pathway, October 2026) ────────────
+
+test('map choice: recorded with source "map", who and when; only while waiting for a choice', async () => {
+  const { id } = await newSessionWithSections();
+
+  const bad = await call('POST', `/internal/agent/sessions/${id}/confirm-map`, { body: { section_numbers: [9] } });
+  assert.equal(bad.status, 400);
+  assert.match(bad.data.error, /1 to 3/);
+  const none = await call('POST', `/internal/agent/sessions/${id}/confirm-map`, { body: { section_numbers: [] } });
+  assert.equal(none.status, 400);
+  const asBob = await call('POST', `/internal/agent/sessions/${id}/confirm-map`, { userId: BOB, body: { section_numbers: [1] } });
+  assert.equal(asBob.status, 404);
+
+  const ok = await call('POST', `/internal/agent/sessions/${id}/confirm-map`, {
+    body: { section_numbers: [3, 1], confirmed_by: 'alice@example.com' }
+  });
+  assert.equal(ok.status, 200, JSON.stringify(ok.data));
+  assert.equal(ok.data.state, 'confirmed');
+  assert.ok(ok.data.map, 'map data returned for the page');
+  const c = ok.data.confirmation;
+  assert.equal(c.source, 'map');
+  assert.match(c.source_explained, /map page/);
+  assert.deepEqual(c.section_numbers, [1, 3]);
+  assert.deepEqual(c.sections, [{ number: 1, name: 'Linea Genova-Pisa' }, { number: 3, name: 'Raccordo' }]);
+  assert.equal(c.confirmed_by, 'alice@example.com');
+  assert.ok(c.confirmed_at);
+  assert.equal(c.user_reply, undefined);
+
+  // The agent sees the same, with the read-back instruction.
+  const state = await call('GET', `/internal/agent/sessions/${id}`);
+  assert.equal(state.data.confirmation.source, 'map');
+  assert.match(state.data.what_next, /read the chosen sections back to the user/);
+  const meta = JSON.parse(fs.readFileSync(path.join(tempRoot, id, 'session.json'), 'utf8'));
+  assert.deepEqual(meta.confirmedSections.map(s => s.osmId), ['111', '333'], 'same enrichment as the chat choice');
+  assert.equal(meta.agent.confirmation.confirmedByUserId, ALICE);
+
+  // Once chosen (either way) the map cannot choose again...
+  const again = await call('POST', `/internal/agent/sessions/${id}/confirm-map`, { body: { section_numbers: [2] } });
+  assert.equal(again.status, 409);
+  assert.match(again.data.error, /already been chosen/);
+  // ...but the chat confirmation still works, and is recorded as "chat".
+  const chat = await call('POST', `/internal/agent/sessions/${id}/confirm`, { body: { section_numbers: [2], user_reply: 'Actually only 2' } });
+  assert.equal(chat.status, 200);
+  assert.equal(chat.data.confirmation.source, 'chat');
+  assert.equal(chat.data.confirmation.user_reply, 'Actually only 2');
+  assert.deepEqual(chat.data.confirmation.sections, [{ number: 2, name: 'Regionale 11' }]);
+
+  // A map choice is enough to generate; after generation the map is closed.
+  const { status } = await generateAndWait(id);
+  assert.equal(status.status, 'completed');
+  const late = await call('POST', `/internal/agent/sessions/${id}/confirm-map`, { body: { section_numbers: [1] } });
+  assert.equal(late.status, 409);
+  assert.match(late.data.error, /already been generated/);
+});
+
+test('map choice is refused while the section search is running or failed', async () => {
+  const { id } = await newSessionWithSections(ALICE, [{ place: 'Genova' }, { place: 'Nowhere-at-all' }]);
+  const r = await call('POST', `/internal/agent/sessions/${id}/confirm-map`, { body: { section_numbers: [1] } });
+  assert.equal(r.status, 409);
+  assert.match(r.data.error, /search failed/);
+});
+
+// ── Maximum gradient ────────────────────────────────────────────────────────
+
+test('max_gradient_percent: validated (1-6), passed to the geometry step, recorded in the summary', async () => {
+  const { id } = await newSessionWithSections();
+  await call('POST', `/internal/agent/sessions/${id}/confirm`, { body: { section_numbers: [1], user_reply: '1' } });
+  for (const bad of [0.5, 7, 'steep', true]) {
+    const r = await call('POST', `/internal/agent/sessions/${id}/generate`, { body: { max_gradient_percent: bad } });
+    assert.equal(r.status, 400, `value ${JSON.stringify(bad)}`);
+    assert.match(r.data.error, /between 1 and 6/);
+  }
+  const started = await call('POST', `/internal/agent/sessions/${id}/generate`, { body: { max_gradient_percent: 2.5 } });
+  assert.equal(started.status, 200);
+  assert.equal(started.data.max_gradient_percent, 2.5);
+  const status = await waitFor(async () => {
+    const r = await call('GET', `/internal/agent/jobs/${started.data.job_id}`);
+    return r.data.status === 'completed' ? r.data : null;
+  }, 'generation');
+  assert.equal(lastGeometryData.maxGradientPercent, 2.5);
+  assert.equal(status.summary.settings.max_gradient_percent, 2.5);
+  const state = await call('GET', `/internal/agent/sessions/${id}`);
+  assert.equal(state.data.generation.max_gradient_percent, 2.5);
+});
+
+// ── Serious problems (no elevation data) ────────────────────────────────────
+
+test('no elevation data: completed_with_problems, the problem first and in full, also in the session', async () => {
+  elevationAvailable = false;
+  const { id } = await newSessionWithSections();
+  await call('POST', `/internal/agent/sessions/${id}/confirm`, { body: { section_numbers: [1], user_reply: '1' } });
+  const started = await call('POST', `/internal/agent/sessions/${id}/generate`, { body: {} });
+  const status = await waitFor(async () => {
+    const r = await call('GET', `/internal/agent/jobs/${started.data.job_id}`);
+    return r.data.status !== 'queued' && r.data.status !== 'running' ? r.data : null;
+  }, 'generation');
+  assert.equal(status.status, 'completed_with_problems');
+  assert.equal(Object.keys(status).filter(k => k !== 'success')[0], 'serious_problems', 'serious problems are the first thing in the answer (the Controller drops success)');
+  assert.equal(status.serious_problems.length, 1);
+  assert.match(status.serious_problems[0], /^No elevation data: all altitudes are 0, so this geometry cannot be used as it is/);
+  assert.match(status.serious_problems[0], /429/);
+  assert.match(status.serious_problems[0], /Wait 15-30 minutes/);
+  assert.match(status.serious_problems_note, /Tell the user about each of these first/);
+  assert.equal(status.summary.routes[0].elevation_data, false);
+  assert.ok(status.outputs.length > 0, 'the files are still listed (the user may want to look at them)');
+
+  const state = await call('GET', `/internal/agent/sessions/${id}`);
+  assert.equal(state.data.state, 'ready');
+  assert.match(state.data.what_next, /serious_problems/);
+  assert.equal(Object.keys(state.data.generation)[0], 'serious_problems');
+  assert.equal(state.data.generation.status, 'completed_with_problems');
+  assert.equal((await call('GET', `/internal/agent/sessions/${id}/download`)).status, 200, 'download still possible');
+});
+
+// ── Website routes ──────────────────────────────────────────────────────────
+
+test('website: maximum gradient checked by the geometry route; geometry ZIP named with the run\'s stamp', async () => {
+  const plain = { 'Content-Type': 'application/json' };
+  const created = await call('POST', '/api/file-generator/sessions', { headers: plain });
+  const id = created.data.session.id;
+  for (const bad of [0, 9, 'x']) {
+    const r = await call('POST', '/api/file-generator/geometry/generate', { headers: plain, body: { sessionId: id, maxGradientPercent: bad } });
+    assert.equal(r.status, 400, `maxGradientPercent ${bad}`);
+    assert.match(r.data.error, /between 1 and 6/);
+  }
+  // Without the field, the route goes on to its usual checks (no sections confirmed yet).
+  const noSections = await call('POST', '/api/file-generator/geometry/generate', { headers: plain, body: { sessionId: id } });
+  assert.equal(noSections.status, 400);
+  assert.match(noSections.data.error, /No confirmed sections/);
+
+  // Geometry ZIP: old name without a stamp, stamped name once a run recorded one.
+  const dir = path.join(tempRoot, id, 'geometry');
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, 'A_-_B.csv'), geometryCsv('A - B'));
+  const before = await call('GET', `/api/file-generator/sessions/${id}/download-geometry`, { headers: plain });
+  assert.equal(before.status, 200);
+  assert.match(before.headers.get('content-disposition'), new RegExp(`traxim-geometry-${id}\\.zip`));
+  const file = path.join(tempRoot, id, 'session.json');
+  const meta = JSON.parse(fs.readFileSync(file, 'utf8'));
+  meta.outputStamp = '2026-10-16_093012';
+  fs.writeFileSync(file, JSON.stringify(meta));
+  const after = await call('GET', `/api/file-generator/sessions/${id}/download-geometry`, { headers: plain });
+  assert.match(after.headers.get('content-disposition'), /filename="Geometry_2026-10-16_093012\.zip"/);
+  assert.deepEqual(zipEntryNames(after.buffer), ['A_-_B.csv'], 'geometry file names unchanged');
 });

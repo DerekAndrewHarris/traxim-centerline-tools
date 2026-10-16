@@ -10,7 +10,10 @@
  *   POST   /sessions                    create a session from waypoints (starts the section search)
  *   GET    /sessions                    the user's sessions that have not expired
  *   GET    /sessions/:id                state; ?detail=map adds map data for the session view page
- *   POST   /sessions/:id/confirm        record the user's chosen sections
+ *   POST   /sessions/:id/confirm        record the user's chosen sections (chosen in the chat)
+ *   POST   /sessions/:id/confirm-map    record the sections the user chose on the map page
+ *                                        (the Controller calls this only from its browser
+ *                                        route: login cookie, never an agent token)
  *   POST   /sessions/:id/generate       start the combined generation job
  *   GET    /sessions/:id/download       outputs-only ZIP
  *   DELETE /sessions/:id                delete a session
@@ -22,6 +25,7 @@ import { requireInternalCaller } from '../utils/internalAuth.js';
 import {
   AgentError,
   confirmAgentSections,
+  confirmAgentSectionsFromMap,
   createAgentSession,
   deleteAgentSession,
   getAgentJobStatus,
@@ -59,6 +63,7 @@ router.post('/sessions', handle(req => createAgentSession(req.agentUserId, req.b
 router.get('/sessions', handle(req => listAgentSessions(req.agentUserId)));
 router.get('/sessions/:id', handle(req => getAgentSessionState(req.agentUserId, req.params.id, { map: req.query.detail === 'map' })));
 router.post('/sessions/:id/confirm', handle(req => confirmAgentSections(req.agentUserId, req.params.id, req.body || {})));
+router.post('/sessions/:id/confirm-map', handle(req => confirmAgentSectionsFromMap(req.agentUserId, req.params.id, req.body || {})));
 router.post('/sessions/:id/generate', handle(req => startAgentGeneration(req.agentUserId, req.params.id, req.body || {})));
 router.get('/sessions/:id/download', handle(async (req, res) => {
   await streamAgentOutputs(req.agentUserId, req.params.id, res);
