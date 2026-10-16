@@ -127,14 +127,14 @@
 
                                 <div id="sectionsResults" class="results-box" style="display: none;"></div>
 
-                                <div class="form-group" id="spacingGroup" style="display: none; margin-top: 15px;">
+                                <div class="form-group form-inline" id="spacingGroup" style="display: none; margin-top: 15px;">
                                     <label for="inputSpacing">Point Spacing (meters)</label>
-                                    <input type="number" id="inputSpacing" value="25" min="10" max="100" />
+                                    <input type="number" id="inputSpacing" class="input-short" value="25" min="10" max="100" />
                                 </div>
-                                <div class="form-group" id="maxGradientGroup" style="display: none; margin-top: 15px;">
+                                <div class="form-group form-inline" id="maxGradientGroup" style="display: none; margin-top: 15px;">
                                     <label for="inputMaxGradient">Maximum gradient for elevation smoothing (%)</label>
-                                    <input type="number" id="inputMaxGradient" value="2.5" min="1" max="6" step="0.1" />
-                                    <p style="font-size: 11px; opacity: 0.8; margin: 4px 0 0;">The elevation data is coarse (about 30 m grid) and can give slopes no railway has, for example where a grid point falls in a valley or on the sea beside the line. The profile is smoothed so that no stretch is steeper than this value. Default 2.5% (1 in 40), a typical maximum for real railways; allowed 1% to 6%. Gradients steeper than 2.5% are unusual: only set a higher value deliberately, for a line you know is that steep. Tunnels and bridges are handled separately (straight between their ends). Always check the elevation profile of the result.</p>
+                                    <input type="number" id="inputMaxGradient" class="input-short" value="2.5" min="1" max="6" step="0.1" />
+                                    <p class="form-note" style="font-size: 11px; opacity: 0.8; margin: 4px 0 0;">The elevation data is coarse (about 30 m grid) and can give slopes no railway has, for example where a grid point falls in a valley or on the sea beside the line. The profile is smoothed so that no stretch is steeper than this value. Default 2.5% (1 in 40), a typical maximum for real railways; allowed 1% to 6%. Gradients steeper than 2.5% are unusual: only set a higher value deliberately, for a line you know is that steep. Tunnels and bridges are handled separately (straight between their ends). Always check the elevation profile of the result.</p>
                                 </div>
                                 <button id="btnGenerateGeometry" class="btn-primary" style="display: none; margin-top: 10px;" disabled>Confirm routes and generate geometry (this may take a few minutes)</button>
 
@@ -180,9 +180,13 @@
                                 <div class="instruction-box">
                                     <p>Generate Infrastructure.csv with junctions, platforms, and connections</p>
                                 </div>
-                                <div class="form-group">
+                                <div class="form-group form-inline">
                                     <label for="inputNetworkName">Network Name</label>
-                                    <input type="text" id="inputNetworkName" placeholder="e.g., Italian Coastal Railway" />
+                                    <!-- autocomplete off: the browser's own memory listed old names in its own order;
+                                         the list below is the page's own (most recent first, at most 6). -->
+                                    <input type="text" id="inputNetworkName" class="input-name" maxlength="80" autocomplete="off"
+                                           list="recentNetworkNames" placeholder="e.g., Italian Coastal Railway" />
+                                    <datalist id="recentNetworkNames"></datalist>
                                 </div>
                                 <button id="btnGenerateInfrastructure" class="btn-primary" disabled>Generate Infrastructure</button>
                                 

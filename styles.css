@@ -892,6 +892,36 @@ footer {
     box-shadow: 0 0 0 2px rgba(67, 160, 71, 0.2);
 }
 
+/* A label with a small input right beside it (October 2026): the input is
+   only as wide as its value needs, so a value like "2.5" does not look like
+   a heading. A note under the pair goes on its own line. */
+.panel-content .form-group.form-inline {
+    flex-direction: row;
+    flex-wrap: wrap;
+    align-items: center;
+    column-gap: 8px;
+    margin-bottom: 16px;
+}
+
+.panel-content .form-group.form-inline label {
+    margin-bottom: 0;
+}
+
+.panel-content .form-group.form-inline input.input-short {
+    width: calc(6ch + 22px);
+    flex: none;
+}
+
+.panel-content .form-group.form-inline input.input-name {
+    width: calc(32ch + 22px);
+    max-width: 100%;
+    flex: 0 1 auto;
+}
+
+.panel-content .form-group.form-inline .form-note {
+    flex-basis: 100%;
+}
+
 /* Two-column layout for Step 1 (Route Definition) */
 .route-step-layout {
     display: grid;

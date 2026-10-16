@@ -87,6 +87,90 @@ function seriousProblemsHtml(problems) {
         `<ul style="margin:0;padding-left:18px;color:#ffcdd2;">${items}</ul></div>`;
 }
 
+/**
+ * Warnings in three groups (October 2026; the server sorts them, see
+ * backend/utils/warningKinds.js): serious and "check these" are always shown
+ * in full; the informational ones are in a "show all" list that opens on
+ * click. Before this, only the first five warnings were shown, which hid the
+ * platform merges at La Spezia.
+ * @param {{serious?: string[], review?: string[], info?: string[]}|null} groups
+ * @param {string[]} [fallback] - plain warning list (older server): all shown as "check these"
+ */
+function warningGroupsHtml(groups, fallback = []) {
+    const g = groups || { serious: [], review: fallback || [], info: [] };
+    const serious = g.serious || [], review = g.review || [], info = g.info || [];
+    const items = (list, colour) => list.map(w => `<li style="margin-bottom:4px;color:${colour};">${escapeHtml(w)}</li>`).join('');
+    let html = '';
+    if (serious.length > 0) {
+        html += '<div class="warnings-serious" style="border:2px solid #e53935;background:rgba(229,57,53,0.10);border-radius:6px;padding:8px 12px;margin:10px 0;">' +
+            `<p style="margin:0 0 6px;color:#ff8a80;"><strong>&#9888; Problems (${serious.length}): some data is missing</strong></p>` +
+            `<ul style="margin:0;padding-left:18px;font-size:12px;">${items(serious, '#ffcdd2')}</ul></div>`;
+    }
+    if (review.length > 0) {
+        html += '<div class="warnings-review" style="border:1px solid #ffb74d;border-radius:6px;padding:8px 12px;margin:10px 0;">' +
+            `<p style="margin:0 0 6px;color:#ffb74d;"><strong>&#9888; Check these in the files (${review.length})</strong></p>` +
+            `<ul style="margin:0;padding-left:18px;font-size:12px;">${items(review, '#ffe0b2')}</ul></div>`;
+    }
+    if (info.length > 0) {
+        html += `<details class="warnings-info" style="margin:8px 0;"><summary style="cursor:pointer;color:#aaa;font-size:12px;">` +
+            `Show all ${info.length} information note${info.length === 1 ? '' : 's'} (what the generator did; nothing to fix)</summary>` +
+            `<ul style="padding-left:18px;font-size:11px;">${items(info, '#aaa')}</ul></details>`;
+    }
+    return html;
+}
+
+/*
+ * Recent network names (October 2026). The Network Name box used to show the
+ * browser's own autofill list (old names in the browser's own order). It is
+ * now switched off (autocomplete="off") and the page keeps its own list:
+ * most recently used first, at most 6, no duplicates (ignoring capitals); a
+ * name used again moves to the top and the oldest drops off. Kept in this
+ * browser's localStorage; if that is unavailable (private window, blocked
+ * storage) the list still works until the page is closed.
+ */
+const RECENT_NAMES_KEY = 'traxim.fileGenerator.recentNetworkNames';
+const RECENT_NAMES_MAX = 6;
+let recentNamesMemory = [];
+
+/** The list with `name` added at the top (pure; used by the tests). */
+function addRecentName(list, name, max = RECENT_NAMES_MAX) {
+    const clean = String(name || '').trim();
+    const old = (Array.isArray(list) ? list : []).filter(n => typeof n === 'string' && n.trim());
+    if (!clean) return old.slice(0, max);
+    return [clean, ...old.filter(n => n.trim().toLowerCase() !== clean.toLowerCase())].slice(0, max);
+}
+
+function loadRecentNetworkNames() {
+    try {
+        const raw = window.localStorage.getItem(RECENT_NAMES_KEY);
+        if (raw) {
+            const list = JSON.parse(raw);
+            if (Array.isArray(list)) return addRecentName(list, '');
+        }
+    } catch (e) { /* storage unavailable: use this page's own memory */ }
+    return recentNamesMemory.slice();
+}
+
+function rememberNetworkName(name) {
+    const list = addRecentName(loadRecentNetworkNames(), name);
+    recentNamesMemory = list;
+    try { window.localStorage.setItem(RECENT_NAMES_KEY, JSON.stringify(list)); } catch (e) { /* kept in memory only */ }
+    renderRecentNetworkNames(list);
+    return list;
+}
+
+/** Fill the dropdown under the Network Name box. */
+function renderRecentNetworkNames(list = loadRecentNetworkNames()) {
+    const datalist = document.getElementById('recentNetworkNames');
+    if (!datalist) return;
+    datalist.innerHTML = '';
+    for (const name of list) {
+        const option = document.createElement('option');
+        option.value = name;
+        datalist.appendChild(option);
+    }
+}
+
 // Map Reference
 let osmMap = null;
 const mapLayers = {
@@ -1201,17 +1285,12 @@ function displayGeometryResults(result) {
     const succeeded = (result.results || []).filter(r => !r.error);
     const failed    = (result.results || []).filter(r =>  r.error);
 
-    // Collect all warnings from successful segments, split into OSM query failures
-    // vs. other informational warnings
-    const osmFailures = [];
-    const otherWarnings = [];
+    // Every section's warnings, grouped by the server (serious / check these
+    // / information). An older server sends no groups: then all are shown.
+    const fallbackWarnings = [];
     for (const r of succeeded) {
         for (const w of (r.warnings || [])) {
-            if (/overpass|query fail|osm api|timeout|rate.limit/i.test(w)) {
-                osmFailures.push({ section: r.section, warning: w });
-            } else if (!/topology json saved/i.test(w)) {
-                otherWarnings.push({ section: r.section, warning: w });
-            }
+            if (!/topology json saved/i.test(w)) fallbackWarnings.push(`${r.section}: ${w}`);
         }
     }
 
@@ -1240,23 +1319,11 @@ function displayGeometryResults(result) {
                 `You can retry the whole process after a short break to allow OSM query limits to reset.</p>`;
     }
 
-    // ── OSM query failures (non-fatal) ────────────────────────────────────
-    if (osmFailures.length > 0) {
-        html += `<p class="warning" style="margin-top:10px"><strong>⚠ OSM query issues:</strong></p><ul>`;
-        for (const f of osmFailures) {
-            html += `<li style="color:#ffb74d;font-size:11px;">${escapeHtml(f.section)}: ${escapeHtml(f.warning)}</li>`;
-        }
-        html += `</ul><p style="color:#aaa;font-size:11px;">Some queries failed but the section was still generated using available data. ` +
+    // ── Warnings: serious and "check these" in full, information on request ──
+    html += warningGroupsHtml(result.warningGroups, fallbackWarnings);
+    if (result.warningGroups && (result.warningGroups.serious || []).some(w => /overpass|query fail|osm api|time ?out|rate.limit/i.test(w))) {
+        html += `<p style="color:#aaa;font-size:11px;">Some OpenStreetMap queries failed but the section was still generated using available data. ` +
                 `Geometry may be incomplete. If the result looks wrong, retry after a short break.</p>`;
-    }
-
-    // ── Other warnings ────────────────────────────────────────────────────
-    if (otherWarnings.length > 0) {
-        html += `<p style="color:#aaa;margin-top:8px;font-size:11px;"><strong>Notes:</strong></p><ul>`;
-        for (const w of otherWarnings) {
-            html += `<li style="color:#aaa;font-size:11px;">${escapeHtml(w.section)}: ${escapeHtml(w.warning)}</li>`;
-        }
-        html += '</ul>';
     }
 
     // ── Speedboards.csv (October 2026) ────────────────────────────────────
@@ -1568,7 +1635,9 @@ async function generateInfrastructure() {
         btn.disabled = true;
         btn.textContent = 'Starting Generation...';
 
-        const networkName = document.getElementById('inputNetworkName').value.trim() || 'Railway Network';
+        const typedName = document.getElementById('inputNetworkName').value.trim();
+        const networkName = typedName || 'Railway Network';
+        if (typedName) rememberNetworkName(typedName);
 
         const response = await fetch(`${API_BASE}/infrastructure/generate`, {
             method: 'POST',
@@ -1671,16 +1740,9 @@ function displayInfrastructureResults(result) {
     html += `<li>File: ${escapeHtml(stampedFileName('Infrastructure.csv', state.infrastructureStamp))}</li>`;
     html += `</ul>`;
 
-    if (result.warnings && result.warnings.length > 0) {
-        html += '<p><strong>Warnings:</strong></p><ul>';
-        result.warnings.slice(0, 5).forEach(w => {
-            html += `<li class="warning">${escapeHtml(w)}</li>`;
-        });
-        if (result.warnings.length > 5) {
-            html += `<li class="warning">... and ${result.warnings.length - 5} more warnings</li>`;
-        }
-        html += '</ul>';
-    }
+    // All warnings that need the user (serious, "check these") in full;
+    // information notes in a "show all" list.
+    html += warningGroupsHtml(result.warningGroups, result.warnings || []);
 
     resultsDiv.innerHTML = html;
 }
@@ -2100,6 +2162,7 @@ document.addEventListener('DOMContentLoaded', function() {
     document.getElementById('btnDownloadGeometryKml').addEventListener('click', downloadGeometryKml);
     document.getElementById('btnDownloadGeometryBoth').addEventListener('click', downloadGeometryBoth);
     document.getElementById('btnGenerateInfrastructure').addEventListener('click', generateInfrastructure);
+    renderRecentNetworkNames();
     document.getElementById('inputNetworkName').addEventListener('input', function() {
         const btn = document.getElementById('btnGenerateInfrastructure');
         // Only enable if the panel is unlocked (not disabled) and there is a name
