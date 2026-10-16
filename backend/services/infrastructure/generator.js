@@ -908,6 +908,51 @@ function findNearbyTrackWays(platformGeometry, ways, thresholdM) {
 }
 
 /**
+ * OSM ways on one side of a platform that are the SAME track (their gap to
+ * the platform edge is within this of the nearest one's). A different,
+ * parallel track is at least ~3.5 m further away.
+ */
+export const SAME_TRACK_GAP_TOLERANCE_M = 2;
+
+/**
+ * Order one face's ways for choosing the one the platform node goes on.
+ *
+ * OpenStreetMap often splits the track beside a long platform into several
+ * ways. The node is put on the chosen way at the point nearest the
+ * platform's centre, so the way must be the one that runs beside the
+ * centre: if a way that only runs along one END of the platform were chosen
+ * (because its gap to the platform edge happened to be a few centimetres
+ * smaller), the node would land at that end, possibly hundreds of metres
+ * from the platform's middle (La Spezia Centrale, OSM way 617064909 "2 - 3":
+ * its node landed at the platform's east tip, so the platform merge measured
+ * the wrong distance).
+ *
+ * Ways of the same track (gap within SAME_TRACK_GAP_TOLERANCE_M of the
+ * nearest) come first, the one passing nearest the centre first; any
+ * further-away tracks follow in their original order.
+ *
+ * @param {Array<{wayId:string, dist:number}>} ways - the face's ways, nearest first
+ * @param {{lat:number, lon:number}} centre - the platform's centre point
+ * @param {Map<string, {coords:Array<{lat,lon}>}>} waysById
+ * @returns {Array<{wayId:string, dist:number}>}
+ */
+export function faceWaysBesideCentre(ways, centre, waysById) {
+  if (!ways || ways.length < 2) return ways || [];
+  const nearestGap = Math.min(...ways.map(w => w.dist));
+  const sameTrack = ways.filter(w => w.dist <= nearestGap + SAME_TRACK_GAP_TOLERANCE_M);
+  const others = ways.filter(w => !sameTrack.includes(w));
+  const fromCentre = (w) => {
+    const way = waysById.get(w.wayId);
+    return way && way.coords && way.coords.length >= 2 ? nearestPointOnWay(centre, way.coords).distM : Infinity;
+  };
+  const ranked = sameTrack
+    .map((w, i) => ({ w, i, d: fromCentre(w) }))
+    .sort((p, q) => p.d - q.d || p.i - q.i)
+    .map(x => x.w);
+  return [...ranked, ...others];
+}
+
+/**
  * True when two platform outlines touch or overlap (any vertex of one within
  * 5 m of the other's outline) - i.e. they are the same physical platform.
  */
@@ -2237,7 +2282,7 @@ async function generateInfrastructureForSections(confirmedSections, networkName,
       }
       const resolvedLinks = [];
       for (const face of faces) {
-        for (const cand of face.ways) {
+        for (const cand of faceWaysBesideCentre(face.ways, point, waysById)) {
           const bounds = resolveWayBounds(cand.wayId, waysById, adj, sectionNodeKeys);
           if (!bounds) continue;
           resolvedLinks.push({ wayId: cand.wayId, dist: cand.dist, alongM: cand.alongM ?? 0, side: face.side, ...bounds });

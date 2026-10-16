@@ -225,3 +225,25 @@ test('platforms either side of a turnout are not merged', () => {
   assert.equal(mergeClosePlatformNodes(nodes, []), 0);
   assert.equal(nodes.length, 6);
 });
+
+// ── La Spezia test run, 16 October 2026 ──
+
+test('platform node goes beside the middle of a long platform, not at its end, when OSM splits the track there', async () => {
+  // La Spezia Centrale "2 - 3" (OSM way 617064909): the track beside the
+  // platform is two OSM ways; the one that only runs along the platform's
+  // east END was a few centimetres nearer the platform edge, so the node went
+  // on it, at the platform's tip (150 m from its middle here), and the
+  // platform merge measured the wrong distance.
+  const net = new Net()
+    .point('W', -300, 0).point('J1', 600, 0).point('A', 1050, 0).point('J2', 1400, 0).point('E', 2300, 0)
+    .point('L1', 650, 4.5).point('L2', 1350, 4.5)
+    .way(1, ['W', 'J1']).way(2, ['J1', 'A']).way(5, ['A', 'J2']).way(3, ['J1', 'L1', 'L2', 'J2']).way(4, ['J2', 'E']);
+  // Outline 700-1100 m, its track edge 1.4 m from the track at the west end
+  // and 0.8 m at the east end, so way 5 (1050-1400 m) is "nearest".
+  const outline = [[700, -1.4], [1100, -0.8], [1100, -3.6], [700, -3.6], [700, -1.4]];
+  const { rows } = await generate(net, [platform(70, 'Long', outline, '1')]);
+  const plats = platformRows(rows);
+  assert.equal(plats.length, 1);
+  const x = (Number(plats[0].Longitude) - ll(0, 0).lon) * 111320 * Math.cos(ll(0, 0).lat * Math.PI / 180);
+  assert.ok(Math.abs(x - 900) < 60, `node at ${x.toFixed(0)} m, expected beside the platform middle (900 m)`);
+});
