@@ -14,6 +14,7 @@ import assert from 'node:assert/strict';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
+import zlib from 'zlib';
 
 // Must be set before the modules below are loaded (they read them at load time).
 const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'fg-agent-test-'));
@@ -81,7 +82,7 @@ function installStandIns() {
         smoothing: { adjustedCount: 3, maxAdjustmentM: 1.26 }
       });
     }
-    await pipeline.writeGeometryKml(sessionPath);
+    await pipeline.writeGeometryKmz(sessionPath);
     fs.writeFileSync(path.join(sessionPath, 'Regions.csv'), '#regions\n,White,1\n');
     fs.writeFileSync(path.join(sessionPath, 'osm_topology.json'), '{"ways":[]}');
     fs.writeFileSync(path.join(sessionPath, 'corridor_polygons.json'), '[]');
@@ -150,6 +151,22 @@ async function generateAndWait(id, userId = ALICE, body = { network_name: 'Ligur
     return ['completed', 'failed'].includes(r.data.status) ? r.data : null;
   }, 'generation');
   return { jobId, status };
+}
+
+/** Text of one entry in a ZIP (stored or deflated). */
+function zipEntryText(buffer, wanted) {
+  for (let i = 0; i < buffer.length - 46; i++) {
+    if (buffer.readUInt32LE(i) !== 0x02014b50) continue;
+    const method = buffer.readUInt16LE(i + 10);
+    const size = buffer.readUInt32LE(i + 20);
+    const nameLength = buffer.readUInt16LE(i + 28);
+    const localOffset = buffer.readUInt32LE(i + 42);
+    if (buffer.toString('utf8', i + 46, i + 46 + nameLength) !== wanted) continue;
+    const start = localOffset + 30 + buffer.readUInt16LE(localOffset + 26) + buffer.readUInt16LE(localOffset + 28);
+    const data = buffer.subarray(start, start + size);
+    return (method === 8 ? zlib.inflateRawSync(data) : data).toString('utf8');
+  }
+  throw new Error(`${wanted} not in ZIP`);
 }
 
 /** File names in a ZIP (central directory). */
@@ -395,13 +412,18 @@ test('combined job: geometry then infrastructure; outputs-only ZIP; owner-only d
   assert.equal(status.summary.legs_generated, 2);
   assert.equal(status.summary.routes[0].length_km, 12.3);
   assert.ok(status.warnings.some(w => /shortened/.test(w)), 'long warning shortened');
-  // One date stamp per run on the ZIP, Infrastructure, Regions and KML; the
-  // geometry files keep their names (Traxim reads region names from inside them).
-  const stamp = status.summary.file_stamp;
+  // Date stamps: the geometry run's stamp on the ZIP, Regions and KMZ; the
+  // infrastructure run's own stamp on Infrastructure; the geometry files keep
+  // their names (Traxim reads region names from inside them).
+  const stamp = status.summary.file_stamps.geometry_regions_kmz;
+  const infraStamp = status.summary.file_stamps.infrastructure;
   assert.match(stamp, /^\d{4}-\d{2}-\d{2}_\d{6}$/);
+  assert.match(infraStamp, /^\d{4}-\d{2}-\d{2}_\d{6}$/);
+  assert.ok(infraStamp >= stamp, 'infrastructure is stamped when its own step starts');
+  assert.match(status.summary.file_stamps.explained, /belong together/);
   assert.equal(lastGeometryData.outputStamp, stamp, 'the geometry step got the same stamp');
   assert.deepEqual(status.outputs.map(o => o.file), [
-    `Infrastructure_${stamp}.csv`, `Regions_${stamp}.csv`, `Geometry_${stamp}.kml`,
+    `Infrastructure_${infraStamp}.csv`, `Regions_${stamp}.csv`, `Geometry_${stamp}.kmz`,
     'Geometry/Genova_Centrale_-_Town_44.10.csv', 'Geometry/Town_44.10_-_Pisa_Centrale.csv'
   ]);
   assert.ok(status.outputs.every(o => !('source' in o)), 'no server paths in the outputs list');
@@ -430,11 +452,14 @@ test('combined job: geometry then infrastructure; outputs-only ZIP; owner-only d
   assert.deepEqual(zipEntryNames(zip.buffer), [
     'Geometry/Genova_Centrale_-_Town_44.10.csv',
     'Geometry/Town_44.10_-_Pisa_Centrale.csv',
-    `Geometry_${stamp}.kml`,
-    `Infrastructure_${stamp}.csv`,
+    `Geometry_${stamp}.kmz`,
+    `Infrastructure_${infraStamp}.csv`,
     `Regions_${stamp}.csv`
-  ], 'outputs only: no osm_*.json, corridor_polygons.json, _wayids, _topology or session.json');
-  const kml = fs.readFileSync(path.join(tempRoot, id, 'Geometry.kml'), 'utf8');
+  ].sort(), 'outputs only: no osm_*.json, corridor_polygons.json, _wayids, _topology or session.json');
+  // The KMZ is a ZIP holding doc.kml, like the website's KMZ button makes.
+  const kmz = fs.readFileSync(path.join(tempRoot, id, 'Geometry.kmz'));
+  assert.deepEqual(zipEntryNames(kmz), ['doc.kml']);
+  const kml = zipEntryText(kmz, 'doc.kml');
   assert.match(kml, /<name>Genova Centrale - Town 44\.10<\/name>/, 'one line per geometry file, named like the website does');
   assert.match(kml, /8\.91000000,44\.41000000,0\.000/, 'lon,lat order, clamped to the ground');
   assert.equal((await call('GET', `/internal/agent/sessions/${id}/download`, { userId: BOB })).status, 404);
@@ -669,5 +694,26 @@ test('website: maximum gradient checked by the geometry route; geometry ZIP name
   fs.writeFileSync(file, JSON.stringify(meta));
   const after = await call('GET', `/api/file-generator/sessions/${id}/download-geometry`, { headers: plain });
   assert.match(after.headers.get('content-disposition'), /filename="Geometry_2026-10-16_093012\.zip"/);
-  assert.deepEqual(zipEntryNames(after.buffer), ['A_-_B.csv'], 'geometry file names unchanged');
+  assert.deepEqual(zipEntryNames(after.buffer), ['Geometry/A_-_B.csv'], 'Geometry/ folder like the agent ZIP; file names unchanged');
+});
+
+test('website: every infrastructure run gets its own stamp; the geometry stamp is reported beside it', async () => {
+  const plain = { 'Content-Type': 'application/json' };
+  const created = await call('POST', '/api/file-generator/sessions', { headers: plain });
+  const id = created.data.session.id;
+  const sessionPath = path.join(tempRoot, id);
+  const file = path.join(sessionPath, 'session.json');
+  const meta = JSON.parse(fs.readFileSync(file, 'utf8'));
+  meta.outputStamp = '2026-10-16_093012';
+  fs.writeFileSync(file, JSON.stringify(meta));
+  const generate = async () => ({ csv: 'x', nodeCount: 1, connectionCount: 1, warnings: [] });
+  const data = { sessionId: id, sessionPath, confirmedSections: [], networkName: 'n', geometryDir: sessionPath, bbox: '0,0,1,1' };
+  const first = await pipeline.runInfrastructureGeneration({ ...data, infrastructureStamp: '2026-10-16_100000' }, () => {}, generate);
+  assert.equal(first.infrastructureStamp, '2026-10-16_100000');
+  assert.equal(first.geometryStamp, '2026-10-16_093012');
+  const second = await pipeline.runInfrastructureGeneration(data, () => {}, generate);
+  assert.match(second.infrastructureStamp, /^\d{4}-\d{2}-\d{2}_\d{6}$/);
+  assert.notEqual(second.infrastructureStamp, first.infrastructureStamp, 'a new run, a new name');
+  assert.equal(second.geometryStamp, '2026-10-16_093012', 'the geometry stamp is unchanged');
+  assert.equal(JSON.parse(fs.readFileSync(file, 'utf8')).infrastructureStamp, second.infrastructureStamp);
 });

@@ -2,12 +2,14 @@
  * Download file names with a date stamp (October 2026).
  *
  * Same pattern as the Network Editor, which saves
- * <ProjectName>_<yyyy-MM-dd_HHmmss>.csv. One stamp per generation run (the
- * time the run started), recorded in session.json as `outputStamp`, so the
- * files of one run carry the same stamp and two runs never share one.
+ * <ProjectName>_<yyyy-MM-dd_HHmmss>.csv. Each geometry run has one stamp
+ * (the time it started, session.json `outputStamp`) for the geometry ZIP,
+ * Regions and the KMZ; each infrastructure run has its own new stamp
+ * (`infrastructureStamp`), so regenerating Infrastructure never gives a
+ * file the same name as before (decided 16 Oct 2026).
  *
  * Only the names people download are stamped:
- *   Infrastructure_<stamp>.csv, Regions_<stamp>.csv, Geometry_<stamp>.kml/.kmz,
+ *   Infrastructure_<stamp>.csv, Regions_<stamp>.csv, Geometry_<stamp>.kmz,
  *   the geometry ZIP and the agent's ZIP.
  * NOT stamped, on purpose:
  *   - the geometry CSV files and the "Geometry" folder in the ZIP. Traxim
@@ -23,6 +25,9 @@
  *
  * The stamp is in the server's chosen time zone: FILE_STAMP_TIME_ZONE (an
  * IANA name such as "Australia/Sydney" or "Europe/London"), default UTC.
+ * Derek decided (16 Oct 2026) to keep UTC: names sort correctly whoever
+ * makes them, it suits users anywhere, and Explorer shows each file's local
+ * modified time anyway.
  */
 
 const STAMP_PATTERN = /^\d{4}-\d{2}-\d{2}_\d{6}$/;

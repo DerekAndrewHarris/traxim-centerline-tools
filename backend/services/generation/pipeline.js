@@ -10,6 +10,7 @@
 import path from 'path';
 import fs from 'fs/promises';
 import fsSync from 'fs';
+import archiver from 'archiver';
 import { generateGeometryForSegment } from '../geometry/generator.js';
 import { prefetchRelationWayIds } from '../osm/osmGeometry.js';
 import { generateRegionsCsv, readGeometryRegionNames, orderRegionNames, DEFAULTS_WARNING as REGIONS_DEFAULTS_WARNING } from '../regions/generator.js';
@@ -202,29 +203,39 @@ export function buildGeometrySegments(sessionData) {
 }
 
 /**
- * Geometry.kml in the session folder (beside Regions.csv): every route in
- * geometry/ as a line, for checking in Google Earth. The same KML as the
- * website's "Generate & Download KMZ" button. Removed when there is no
- * geometry. Never fails the job.
+ * Geometry.kmz in the session folder (beside Regions.csv): every route in
+ * geometry/ as a line, for checking in Google Earth. The same KMZ as the
+ * website's "Generate & Download KMZ" button: a ZIP holding doc.kml (the
+ * same KML, see utils/kmlGenerator.js). Removed when there is no geometry.
+ * Never fails the job.
  * @param {string} sessionDirPath
  */
-export async function writeGeometryKml(sessionDirPath) {
-  const kmlPath = path.join(sessionDirPath, 'Geometry.kml');
+export async function writeGeometryKmz(sessionDirPath) {
+  const kmzPath = path.join(sessionDirPath, 'Geometry.kmz');
   try {
     const built = await buildGeometryKml(path.join(sessionDirPath, 'geometry'));
-    if (built) {
-      await fs.writeFile(kmlPath, built.kml, 'utf-8');
-    } else {
-      await fs.rm(kmlPath, { force: true });
+    if (!built) {
+      await fs.rm(kmzPath, { force: true });
+      return;
     }
-  } catch (kmlErr) {
-    console.warn(`[Geometry API] Could not write Geometry.kml: ${kmlErr.message}`);
+    await new Promise((resolve, reject) => {
+      const output = fsSync.createWriteStream(kmzPath);
+      const archive = archiver('zip', { zlib: { level: 9 } });
+      output.on('close', resolve);
+      output.on('error', reject);
+      archive.on('error', reject);
+      archive.pipe(output);
+      archive.append(built.kml, { name: 'doc.kml' }); // KMZ format requires doc.kml
+      archive.finalize();
+    });
+  } catch (kmzErr) {
+    console.warn(`[Geometry API] Could not write Geometry.kmz: ${kmzErr.message}`);
   }
 }
 
 /**
  * The geometry job: geometry CSVs (main route + _altN per segment),
- * Regions.csv, Geometry.kml, osm_topology.json and corridor data.
+ * Regions.csv, Geometry.kmz, osm_topology.json and corridor data.
  *
  * @param {{sessionId: string, sessionPath: string, spacingMetres: number, segments: Array,
  *          maxGradientPercent?: number, outputStamp?: string}} data
@@ -385,7 +396,7 @@ export async function runGeometryGeneration(data, updateProgress) {
   // Strip infraTopology from results before returning (large payload)
   for (const r of results) delete r.infraTopology;
 
-  await writeGeometryKml(sessionDirPath);
+  await writeGeometryKmz(sessionDirPath);
 
   // Update session metadata with real corridorBboxes derived from centerline
   // geometry (replacing the preliminary ones set at /confirm from searchBboxes).
@@ -490,14 +501,19 @@ export function mergeSearchBboxes(searchBboxes) {
  * the OSM topology. Regions.csv is deliberately NOT written here (see the
  * comment below).
  *
- * @param {{sessionId, sessionPath, confirmedSections, networkName, geometryDir, bbox, maxNodes?}} jobData
+ * @param {{sessionId, sessionPath, confirmedSections, networkName, geometryDir, bbox, maxNodes?, infrastructureStamp?}} jobData
  *   maxNodes: optional node limit (agent jobs only). When the network has
  *   more nodes, a NodeLimitError is thrown and Infrastructure.csv is not written.
+ *   infrastructureStamp: date stamp for this run's Infrastructure download
+ *   name. Every infrastructure run has its own (default: when it starts), so
+ *   regenerating Infrastructure never gives a file the same name as before;
+ *   the geometry, Regions and KMZ keep the stamp of their geometry run.
  * @param {(progress: number, step: string) => void} progressCallback
  * @param {Function} [generate] - the generator (tests pass a stand-in)
  */
 export async function runInfrastructureGeneration(jobData, progressCallback, generate = generateInfrastructureForSections) {
   const { sessionId, confirmedSections, networkName, geometryDir, bbox, sessionPath, maxNodes } = jobData;
+  const infrastructureStamp = isValidOutputStamp(jobData.infrastructureStamp) ? jobData.infrastructureStamp : makeOutputStamp();
 
   // Generate infrastructure
   const result = await generate(
@@ -532,17 +548,20 @@ export async function runInfrastructureGeneration(jobData, progressCallback, gen
     infrastructureTimestamp: new Date().toISOString(),
     infrastructureNodeCount: result.nodeCount,
     infrastructureConnectionCount: result.connectionCount,
-    infrastructureWarnings: result.warnings
+    infrastructureWarnings: result.warnings,
+    infrastructureStamp
   });
 
-  let stamp = null;
-  try { stamp = (readSessionMetadataSync(sessionId) || {}).outputStamp || null; } catch { /* no stamp */ }
+  // The stamp of the geometry run this Infrastructure was built from.
+  let geometryStamp = null;
+  try { geometryStamp = (readSessionMetadataSync(sessionId) || {}).outputStamp || null; } catch { /* no stamp */ }
 
   return {
     filePath: outputPath,
     fileName: 'Infrastructure.csv',
     regionsFile: 'Regions.csv',
-    outputStamp: stamp,
+    infrastructureStamp,
+    geometryStamp,
     nodeCount: result.nodeCount,
     connectionCount: result.connectionCount,
     warnings: result.warnings

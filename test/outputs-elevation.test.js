@@ -44,7 +44,7 @@ test('stamped names keep the file type words the Controller looks for', () => {
   const stamp = '2026-10-16_093012';
   assert.equal(stampedName('Infrastructure.csv', stamp), 'Infrastructure_2026-10-16_093012.csv');
   assert.equal(stampedName('Regions.csv', stamp), 'Regions_2026-10-16_093012.csv');
-  assert.equal(stampedName('Geometry.kml', stamp), 'Geometry_2026-10-16_093012.kml');
+  assert.equal(stampedName('Geometry.kmz', stamp), 'Geometry_2026-10-16_093012.kmz');
   assert.equal(stampedName('Regions.csv', null), 'Regions.csv', 'no stamp: unchanged');
   assert.equal(stampedName('Regions.csv', '../x'), 'Regions.csv', 'anything that is not a stamp is ignored');
   assert.ok(/infrastructure/i.test(stampedName('Infrastructure.csv', stamp)));

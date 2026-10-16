@@ -169,7 +169,9 @@ router.get('/:id/download-geometry', asyncHandler(async (req, res) => {
   // geometry file — including it risks a user mistaking it for one and
   // feeding it back in as track geometry) aren't useful to a user
   // downloading geometry — exclude both.
-  archive.directory(geometryDir, false, (data) =>
+  // The files go in a Geometry/ folder, the same layout as the agent's
+  // download ZIP (decided 16 Oct 2026).
+  archive.directory(geometryDir, 'Geometry', (data) =>
     (data.name.endsWith('.json') || data.name.endsWith('_wayids.csv')) ? false : data
   );
   await archive.finalize();

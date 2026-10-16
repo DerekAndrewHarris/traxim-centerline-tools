@@ -11,7 +11,7 @@
  *   4. startAgentGeneration one combined job: geometry, then infrastructure
  *                           (Regions.csv is written by the geometry step)
  *   5. getAgentJobStatus    progress; outputs list when done
- *   6. streamAgentOutputs   outputs-only ZIP (Infrastructure, Regions, Geometry.kml,
+ *   6. streamAgentOutputs   outputs-only ZIP (Infrastructure, Regions, Geometry.kmz,
  *                           Geometry/), names date-stamped per run
  *
  * Every function takes the caller's user id (from the Controller, see
@@ -170,14 +170,22 @@ function waypointList(meta) {
 }
 
 /**
- * The files that go into the download ZIP: `file` is the name in the ZIP
- * (Infrastructure, Regions and the KML date-stamped with the run's stamp;
- * the geometry files keep their names, see utils/outputNames.js), `source`
- * the file on disk (never shown to the agent).
+ * The files that go into the download ZIP: `file` is the name in the ZIP,
+ * `source` the file on disk (never shown to the agent). Date stamps (see
+ * utils/outputNames.js): Regions and the KMZ carry the stamp of the
+ * geometry run they came from; Infrastructure carries its own run's stamp
+ * (every infrastructure run has a new one); the geometry files keep their
+ * names.
+ * @param {string} sessionPath
+ * @param {{geometry?: string, infrastructure?: string}} stamps
  */
-function listOutputFilesSync(sessionPath, stamp) {
+function listOutputFilesSync(sessionPath, stamps = {}) {
   const outputs = [];
-  for (const name of ['Infrastructure.csv', 'Regions.csv', 'Geometry.kml']) {
+  for (const [name, stamp] of [
+    ['Infrastructure.csv', stamps.infrastructure],
+    ['Regions.csv', stamps.geometry],
+    ['Geometry.kmz', stamps.geometry]
+  ]) {
     const file = path.join(sessionPath, name);
     if (fsSync.existsSync(file)) outputs.push({ file: stampedName(name, stamp), size_bytes: fsSync.statSync(file).size, source: file });
   }
@@ -191,8 +199,18 @@ function listOutputFilesSync(sessionPath, stamp) {
   return outputs;
 }
 
-function listOutputsSync(sessionPath, stamp) {
-  return listOutputFilesSync(sessionPath, stamp).map(({ file, size_bytes }) => ({ file, size_bytes }));
+function listOutputsSync(sessionPath, stamps) {
+  return listOutputFilesSync(sessionPath, stamps).map(({ file, size_bytes }) => ({ file, size_bytes }));
+}
+
+/** Which stamp belongs to which files, for the agent. */
+function fileStampsView(gen) {
+  if (!gen || !gen.outputStamp) return undefined;
+  return {
+    geometry_regions_kmz: gen.outputStamp,
+    infrastructure: gen.infrastructureStamp || null,
+    explained: 'Regions, the KMZ and the ZIP name carry the stamp of the geometry run (when it started); Infrastructure carries the stamp of its own run, which was built from that geometry. All the files in this ZIP belong together.'
+  };
 }
 
 /** The download ZIP's file name: "<label>_<stamp>.zip" (as the Network Editor names its files). */
@@ -229,7 +247,7 @@ function generationView(gen) {
     max_gradient_percent: gen.maxGradientPercent,
     queued_at: gen.queuedAt
   });
-  if (gen.outputStamp) view.file_stamp = gen.outputStamp;
+  if (gen.outputStamp) view.file_stamps = fileStampsView(gen);
   const job = jobQueue.getJob(gen.jobId);
   if (job && (gen.status === 'queued' || gen.status === 'running')) {
     view.status = jobStatusName(job.status);
@@ -643,7 +661,9 @@ async function runCombinedGeneration(data, updateProgress) {
         networkName,
         geometryDir: path.join(sessionPath, 'geometry'),
         bbox: mergeSearchBboxes(fresh.searchBboxes || []),
-        maxNodes
+        maxNodes,
+        // Infrastructure gets its own stamp (when its step starts).
+        infrastructureStamp: makeOutputStamp()
       },
       (p, step) => updateProgress(60 + Math.floor(p * 0.4), `Infrastructure: ${step}`)
     );
@@ -669,14 +689,15 @@ async function runCombinedGeneration(data, updateProgress) {
       infrastructure_nodes: infrastructure.nodeCount,
       infrastructure_connections: infrastructure.connectionCount,
       node_limit: maxNodes,
-      file_stamp: outputStamp
+      file_stamps: fileStampsView({ outputStamp, infrastructureStamp: infrastructure.infrastructureStamp })
     };
-    const outputs = listOutputsSync(sessionPath, outputStamp);
+    const outputs = listOutputsSync(sessionPath, { geometry: outputStamp, infrastructure: infrastructure.infrastructureStamp });
     updateAgentMetadataSync(sessionId, agent => {
       agent.generation = {
         ...agent.generation,
         status: 'completed',
         finishedAt: new Date().toISOString(),
+        infrastructureStamp: infrastructure.infrastructureStamp || null,
         seriousProblems,
         summary,
         warnings,
@@ -828,7 +849,7 @@ export async function getAgentJobStatus(userId, jobId) {
 
 /**
  * Stream the outputs-only ZIP to an HTTP response:
- * Infrastructure_<stamp>.csv, Regions_<stamp>.csv, Geometry_<stamp>.kml and
+ * Infrastructure_<stamp>.csv, Regions_<stamp>.csv, Geometry_<stamp>.kmz and
  * the geometry CSVs in a Geometry/ folder; the ZIP is <label>_<stamp>.zip.
  * Never the OSM caches, *_wayids.csv, *_topology.json,
  * corridor_polygons.json or session.json.
@@ -839,7 +860,8 @@ export async function streamAgentOutputs(userId, sessionId, res) {
     throw new AgentError('The files for this session are not ready (generation has not finished successfully).', 409);
   }
   const sessionPath = sessionPathOf(sessionId);
-  const outputs = listOutputFilesSync(sessionPath, meta.agent.generation.outputStamp);
+  const gen = meta.agent.generation;
+  const outputs = listOutputFilesSync(sessionPath, { geometry: gen.outputStamp, infrastructure: gen.infrastructureStamp });
   if (outputs.length === 0) throw new AgentError('No output files were found for this session.', 404);
 
   const fileName = zipFileName(meta);
