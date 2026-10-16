@@ -112,7 +112,7 @@ export function rect(x0, x1, y0, y1) {
 
 /**
  * Write a session folder for the infrastructure generator.
- * @param {{geometry: Object<string,string>, net: Net, platforms?: Array, stations?: Array, corridorBbox?: object}} spec
+ * @param {{geometry: Object<string,string>, net: Net, platforms?: Array|null, stations?: Array, corridorBbox?: object}} spec
  *   geometry: file name -> CSV text
  * @returns {Promise<{sessionPath: string, geometryDir: string, bbox: string}>}
  */
@@ -124,7 +124,11 @@ export async function writeSession(spec) {
     await fs.writeFile(path.join(geometryDir, name), csv, 'utf-8');
   }
   await fs.writeFile(path.join(sessionPath, 'osm_topology.json'), JSON.stringify(spec.net.topology()), 'utf-8');
-  await fs.writeFile(path.join(sessionPath, 'osm_platforms.json'), JSON.stringify(spec.platforms || []), 'utf-8');
+  // platforms: null = no cache file, so the generator fetches platforms
+  // (tests then pass a stand-in Overpass request).
+  if (spec.platforms !== null) {
+    await fs.writeFile(path.join(sessionPath, 'osm_platforms.json'), JSON.stringify(spec.platforms || []), 'utf-8');
+  }
   await fs.writeFile(path.join(sessionPath, 'osm_stations.json'), JSON.stringify(spec.stations || []), 'utf-8');
   const meta = { id: path.basename(sessionPath) };
   if (spec.corridorBbox) meta.confirmedSections = [{ name: 'test', corridorBbox: spec.corridorBbox }];

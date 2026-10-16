@@ -122,19 +122,32 @@ async function fetchStationsFromOverpass(bbox) {
 /**
  * Fetch railway platform ways from Overpass
  * @param {string} bbox - Bounding box "minLat,minLon,maxLat,maxLon"
+ * @param {Function} [fetchFn] - the Overpass request (tests pass a stand-in)
  * @returns {Promise<Array<{id: string, centLat: number, centLon: number, name: string}>>}
  */
-async function fetchPlatformsFromOverpass(bbox) {
+async function fetchPlatformsFromOverpass(bbox, fetchFn = overpassFetch) {
+  // Expanded by the same margin as the station and topology fetches (see
+  // CORRIDOR_MARGIN_DEG). The bbox passed in is only the search box between
+  // the places the user named, and the line can leave it: La Spezia - Sestri
+  // Levante runs south of La Spezia Centrale's latitude through Manarola and
+  // Riomaggiore, so their tracks and station names were found (wider boxes)
+  // but their platforms never were (October 2026).
+  const parts = bbox.split(',').map(Number);
+  const expandedBbox = [
+    parts[0] - CORRIDOR_MARGIN_DEG, parts[1] - CORRIDOR_MARGIN_DEG,
+    parts[2] + CORRIDOR_MARGIN_DEG, parts[3] + CORRIDOR_MARGIN_DEG
+  ].join(',');
+
   const query = `
     [out:json][timeout:60];
     (
-      way["railway"="platform"](${bbox});
-      way["public_transport"="platform"]["railway"](${bbox});
+      way["railway"="platform"](${expandedBbox});
+      way["public_transport"="platform"]["railway"](${expandedBbox});
     );
     out geom;
   `;
 
-  const data = await overpassFetch(query);
+  const data = await fetchFn(query);
   const platforms = [];
 
   for (const element of data.elements || []) {
@@ -1408,9 +1421,11 @@ function resolveWayBounds(wayId, waysById, adj, sectionNodeKeys) {
  * @param {string} bbox - Bounding box for Overpass queries
  * @param {Function} progressCallback - Progress callback (percent, message)
  * @param {string} [sessionPath] - Session directory for caching OSM data
+ * @param {{overpassFetch?: Function}} [options] - overpassFetch: stand-in for
+ *   the Overpass request that fetches platforms (tests only)
  * @returns {Promise<{csv: string, nodeCount: number, connectionCount: number, warnings: string[]}>}
  */
-async function generateInfrastructureForSections(confirmedSections, networkName, geometryDir, bbox, progressCallback, sessionPath) {
+async function generateInfrastructureForSections(confirmedSections, networkName, geometryDir, bbox, progressCallback, sessionPath, options = {}) {
   const warnings = [];
   const nodes = [];
 
@@ -2267,7 +2282,7 @@ async function generateInfrastructureForSections(confirmedSections, networkName,
       warnings.push(`Loaded ${platforms.length} cached platform(s) from osm_platforms.json.`);
     } else {
       try {
-        platforms = await fetchPlatformsFromOverpass(bbox);
+        platforms = await fetchPlatformsFromOverpass(bbox, options.overpassFetch);
         if (cacheFile) fs.writeFileSync(cacheFile, JSON.stringify(platforms), 'utf-8');
         if (platforms.length > 0) {
           warnings.push(`Fetched ${platforms.length} railway platform(s) from Overpass.`);
