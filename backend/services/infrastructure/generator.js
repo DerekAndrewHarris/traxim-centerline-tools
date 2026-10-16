@@ -988,19 +988,32 @@ function platformsTouch(geomA, geomB) {
 }
 
 /**
- * Platform nodes closer together than this on one track are merged into one
- * node (October 2026 sanity check). OpenStreetMap often maps one platform
- * more than once (La Spezia Centrale: three ways all called "4 - 5";
- * Viareggio: one way for the island and one for each face), and railways
- * sometimes give one platform two numbers (1A/1B, 10/11). Rather than
- * interpreting every naming scheme, any two platform nodes on the same track
- * closer than this are taken to be the same platform.
+ * Platform nodes of the SAME station closer together than this on one track
+ * are merged into one node (October 2026 sanity check). OpenStreetMap often
+ * maps one platform more than once (La Spezia Centrale: three ways all
+ * called "4 - 5"; Viareggio: one way for the island and one for each face;
+ * Monterosso: each long platform in two pieces some 250 m apart), and
+ * railways sometimes give one platform two numbers (1A/1B, 10/11). Rather
+ * than interpreting every naming scheme, any two platform nodes of one
+ * station on the same track closer than this are taken to be the same
+ * platform. Platforms of DIFFERENT stations are never merged, however close
+ * (Riomaggiore and Manarola are about 700 m apart). The station of a
+ * platform node is the station the naming pass gives it: the nearest OSM
+ * station/halt. Was 250 m, any station, until Derek's decision of
+ * 16 Oct 2026.
  */
-export const PLATFORM_MIN_SPACING_M = 250;
+export const PLATFORM_MIN_SPACING_M = 1000;
 
 /**
- * Merge platform nodes closer than PLATFORM_MIN_SPACING_M along one track
- * (or whose OSM outlines touch or overlap) into one node.
+ * Used instead of PLATFORM_MIN_SPACING_M when there are no OSM stations to
+ * tell which station a platform belongs to (then a 1000 m rule could merge
+ * platforms of neighbouring stations).
+ */
+export const PLATFORM_MIN_SPACING_NO_STATION_M = 250;
+
+/**
+ * Merge platform nodes of the same station closer than PLATFORM_MIN_SPACING_M
+ * along one track (or whose OSM outlines touch or overlap) into one node.
  *
  * "One track" = the stretch of track a platform node is on, walking through
  * other platform nodes and plain through nodes (two connections) but
@@ -1008,7 +1021,7 @@ export const PLATFORM_MIN_SPACING_M = 250;
  * crossover are not merged, because trains can use them separately.
  *
  * Which nodes are merged (October 2026, after the La Spezia test): a node
- * joins a group only if it is closer than PLATFORM_MIN_SPACING_M to EVERY
+ * joins a group only if it is of the same station and closer than the spacing to EVERY
  * node already in the group, or its OSM outline touches/overlaps the outline
  * of one of them (the same platform mapped more than once). It used to be
  * enough to be close to the previous node, so a chain A - B - C with A-B and
@@ -1038,9 +1051,28 @@ export const PLATFORM_MIN_SPACING_M = 250;
  *
  * @param {Array<object>} nodes - modified in place
  * @param {string[]} warnings
+ * @param {Array<{name:string, lat:number, lon:number}>} [stations] - OSM
+ *   stations/halts (the naming anchors). Only platform nodes whose nearest
+ *   station is the same are merged. Without stations the spacing is
+ *   PLATFORM_MIN_SPACING_NO_STATION_M.
  * @returns {number} number of platform nodes removed
  */
-export function mergeClosePlatformNodes(nodes, warnings = []) {
+export function mergeClosePlatformNodes(nodes, warnings = [], stations = []) {
+  const haveStations = Array.isArray(stations) && stations.length > 0;
+  const spacingM = haveStations ? PLATFORM_MIN_SPACING_M : PLATFORM_MIN_SPACING_NO_STATION_M;
+  const stationCache = new Map();
+  const stationOf = (n) => {
+    if (!haveStations) return '';
+    if (!stationCache.has(n)) {
+      let best = null, bestD = Infinity;
+      for (const a of stations) {
+        const d = haversineM(n, a);
+        if (d < bestD) { bestD = d; best = a; }
+      }
+      stationCache.set(n, best ? `${best.name}|${best.lat},${best.lon}` : '');
+    }
+    return stationCache.get(n);
+  };
   const ARM_FIELDS = ['fNode', 'tNode', 'dNode', 'xNode'];
   const byName = new Map(nodes.map(n => [n.name, n]));
   const armsOf = (n) => ARM_FIELDS.filter(f => n[f]);
@@ -1098,14 +1130,15 @@ export function mergeClosePlatformNodes(nodes, warnings = []) {
     if (members.length < 2) continue;
 
     // Groups of platform nodes in order along the track: a node joins the
-    // current group when it is closer than the minimum spacing to every
-    // node in it (members are in order, so to the group's first node), or
-    // its outline touches one of theirs.
+    // current group when it belongs to the same station AND is closer than
+    // the minimum spacing to every node in it (members are in order, so to
+    // the group's first node) or its outline touches one of theirs.
     const clusters = [];
     let current = [members[0]];
     for (let i = 1; i < members.length; i++) {
       const m = members[i];
-      const close = m.pos - current[0].pos < PLATFORM_MIN_SPACING_M || current.some(c => touch(c, m));
+      const close = stationOf(m.node) === stationOf(current[0].node) &&
+        (m.pos - current[0].pos < spacingM || current.some(c => touch(c, m)));
       if (close) current.push(m);
       else { clusters.push(current); current = [m]; }
     }
@@ -1220,7 +1253,7 @@ export function mergeClosePlatformNodes(nodes, warnings = []) {
     const parts = [...byRemoved.entries()].map(([id, { node, items }]) => {
       const dists = [...new Set(items.map(r => `${Math.round(r.distM)} m`))];
       const where = tracks > 1 ? (items.length === tracks ? ` on each track` : ` on ${items.length} of the ${tracks} tracks`) : '';
-      const touches = items.some(r => r.touches && r.distM >= PLATFORM_MIN_SPACING_M);
+      const touches = items.some(r => r.touches && r.distM >= spacingM);
       let s = `${label(node)} ${dists.join(' and ')} away${where}` +
         (touches ? ` (merged because its OSM outline touches or overlaps the kept platform's, i.e. the same platform)` : '');
       if (handedOver.get(id)) s += `; its node on another track now belongs to the kept platform`;
@@ -1229,7 +1262,7 @@ export function mergeClosePlatformNodes(nodes, warnings = []) {
     });
     const done = tracks > 1 ? ` Done on ${tracks} tracks (the tracks along each side of the platform).` : '';
     warnings.push(`PLATFORMS MERGED at ${first.keep.node.lat.toFixed(5)}, ${first.keep.node.lon.toFixed(5)}: ` +
-      `platform nodes on one track closer than ${PLATFORM_MIN_SPACING_M} m to each other, or whose OSM outlines touch, are taken as one platform ` +
+      `platform nodes of one station on one track closer than ${spacingM} m to each other, or whose OSM outlines touch, are taken as one platform ` +
       `(OpenStreetMap maps it more than once, or gives it two numbers). Kept the node for ${label(first.keep.node)}; ` +
       `removed the node for ${parts.join(', ')}.${done} Check it in the Network Editor.`);
   }
@@ -2614,7 +2647,7 @@ async function generateInfrastructureForSections(confirmedSections, networkName,
 
     // Sanity check: platform nodes closer than PLATFORM_MIN_SPACING_M on one
     // track become one node.
-    mergeClosePlatformNodes(nodes, warnings);
+    mergeClosePlatformNodes(nodes, warnings, stationAnchors);
   }
 
   // Second orphan removal pass — connections may have been cleared by

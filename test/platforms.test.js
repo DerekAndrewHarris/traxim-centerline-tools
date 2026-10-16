@@ -19,7 +19,7 @@ import assert from 'node:assert/strict';
 import {
   Net, ll, geometryCsv, platform, rect, writeSession, parseInfrastructureCsv, removeSession
 } from './helpers/synthNetwork.js';
-import { generateInfrastructureForSections, mergeClosePlatformNodes, PLATFORM_MIN_SPACING_M } from '../backend/services/infrastructure/generator.js';
+import { generateInfrastructureForSections, mergeClosePlatformNodes, PLATFORM_MIN_SPACING_M, PLATFORM_MIN_SPACING_NO_STATION_M } from '../backend/services/infrastructure/generator.js';
 
 function loopNet({ sidingUnderPlatform = false } = {}) {
   const net = new Net()
@@ -39,12 +39,12 @@ function loopNet({ sidingUnderPlatform = false } = {}) {
   return net;
 }
 
-async function generate(net, platforms) {
+async function generate(net, platforms, stations = [{ id: '1', ...ll(1000, 20), name: 'Testa' }]) {
   const s = await writeSession({
     geometry: { 'A_-_B.csv': geometryCsv('A - B', [[0, 0], [2000, 0]]) },
     net,
     platforms,
-    stations: [{ id: '1', ...ll(1000, 20), name: 'Testa' }]
+    stations
   });
   try {
     const result = await generateInfrastructureForSections([], 'Test', s.geometryDir, s.bbox, null, s.sessionPath);
@@ -106,18 +106,71 @@ test('the same platform mapped twice in OSM (two touching halves) gets one node 
   assert.ok(warnings.some(w => /PLATFORMS MERGED/.test(w)));
 });
 
-test('two separate platforms far apart on the same track both get a node', async () => {
-  const { rows } = await generate(loopNet(), [
-    platform(15, 'Side', rect(700, 800, -3.6, -0.9), '1'),
-    platform(16, 'Side', rect(1200, 1300, -3.6, -0.9), '1')
+// ── Platform sanity check: platform nodes of one station closer than 1000 m
+// on one track are merged (Derek, 16 Oct 2026; was 250 m, any station) ──
+
+test('the minimum platform spacing is a named constant of 1000 m (250 m when there are no stations)', () => {
+  assert.equal(PLATFORM_MIN_SPACING_M, 1000);
+  assert.equal(PLATFORM_MIN_SPACING_NO_STATION_M, 250);
+});
+
+// A longer layout: turnouts at x = 100 and 1900, so 1800 m of plain track.
+function longLoopNet() {
+  return new Net()
+    .point('W', -300, 0).point('J1', 100, 0).point('M1', 1000, 0).point('J2', 1900, 0).point('E', 2300, 0)
+    .point('L1', 150, 4.5).point('L2', 1850, 4.5)
+    .way(1, ['W', 'J1']).way(2, ['J1', 'M1', 'J2']).way(3, ['J1', 'L1', 'L2', 'J2']).way(4, ['J2', 'E']);
+}
+
+test('two stations about 700 m apart: their platforms on one track are never merged', async () => {
+  // Riomaggiore and Manarola are about 700 m apart.
+  const { rows, warnings } = await generate(longLoopNet(), [
+    platform(15, 'Platform', rect(450, 600, -3.6, -0.9), '1'),
+    platform(16, 'Platform', rect(1150, 1300, -3.6, -0.9), '1')
+  ], [
+    { id: '1', ...ll(525, -40), name: 'Riomaggiore' },
+    { id: '2', ...ll(1225, -40), name: 'Manarola' }
   ]);
+  assert.equal(platformRows(rows).length, 2);
+  assert.ok(!warnings.some(x => /PLATFORMS MERGED/.test(x)));
+});
+
+test('one station: platform pieces about 850 m apart on one track become one node', async () => {
+  // Monterosso: each long platform mapped in pieces that do not touch.
+  const { rows, warnings } = await generate(longLoopNet(), [
+    platform(17, 'Platform', rect(300, 450, -3.6, -0.9), null),
+    platform(18, 'Platform', rect(1150, 1300, -3.6, -0.9), null)
+  ], [{ id: '1', ...ll(800, -40), name: 'Monterosso' }]);
+  assert.equal(platformRows(rows).length, 1);
+  assert.ok(warnings.some(x => /PLATFORMS MERGED/.test(x) && /1000 m/.test(x)));
+});
+
+test('one station: platforms more than 1000 m apart on one track are both kept', async () => {
+  const { rows } = await generate(longLoopNet(), [
+    platform(19, 'Platform', rect(200, 300, -3.6, -0.9), '1'),
+    platform(20, 'Platform', rect(1500, 1600, -3.6, -0.9), '1')
+  ], [{ id: '1', ...ll(900, -40), name: 'Testa' }]);
   assert.equal(platformRows(rows).length, 2);
 });
 
-// ── Platform sanity check: nodes closer than 250 m on one track are merged ──
-
-test('the minimum platform spacing is a named constant of 250 m', () => {
-  assert.equal(PLATFORM_MIN_SPACING_M, 250);
+test('1000 m rule with stations: a chain A - B - C (600 m steps) does not merge A and C', () => {
+  const at = (x) => ll(x, 0);
+  const plat = (name, x, id) => ({
+    name, ...at(x), railwayType: 'platform',
+    _platformGeometry: [at(x - 40), at(x + 40)], _platformOsmId: String(id), _platformOsmName: 'Platform',
+    _platformFace: { osmId: String(id), ref: null, numbers: [] }
+  });
+  const nodes = [
+    { name: 'E1', ...at(-500), tNode: 'A', tOnBranch: 'F' },
+    { ...plat('A', 0, 1), fNode: 'E1', fOnBranch: 'T', tNode: 'B', tOnBranch: 'F' },
+    { ...plat('B', 600, 2), fNode: 'A', fOnBranch: 'T', tNode: 'C', tOnBranch: 'F' },
+    { ...plat('C', 1200, 3), fNode: 'B', fOnBranch: 'T', tNode: 'E2', tOnBranch: 'F' },
+    { name: 'E2', ...at(2000), fNode: 'C', fOnBranch: 'T' }
+  ];
+  mergeClosePlatformNodes(nodes, [], [{ name: 'Testa', ...at(600) }]);
+  const left = nodes.filter(n => n.railwayType === 'platform').map(n => n.name);
+  assert.equal(left.length, 2);
+  assert.ok(left.includes('C'));
 });
 
 test('La Spezia case: three OSM ways all called "4 - 5" give one node on each track', async () => {
@@ -173,14 +226,6 @@ test('one platform with two numbers (1A / 1B) on one track becomes one node', as
   assert.ok(w && /Testa 1A/.test(w) && /Testa 1B/.test(w), 'the merge names both OSM platforms');
 });
 
-test('platform nodes 300 m apart on one track are both kept', async () => {
-  const { rows, warnings } = await generate(loopNet(), [
-    platform(50, 'North end', rect(700, 800, -3.6, -0.9), '1'),
-    platform(51, 'South end', rect(1000, 1100, -3.6, -0.9), '1')
-  ]);
-  assert.equal(platformRows(rows).length, 2);
-  assert.ok(!warnings.some(x => /PLATFORMS MERGED/.test(x)));
-});
 
 test('the kept node is the one nearest the centre of the merged platforms', () => {
   // A straight track: E1 - P1 - P2 - P3 - E2 along x (metres), P2 nearest the middle.
