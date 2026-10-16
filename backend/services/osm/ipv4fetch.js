@@ -106,6 +106,8 @@ export async function ipv4Fetch(url, options = {}) {
           resolve({
             ok: res.statusCode >= 200 && res.statusCode < 300,
             status: res.statusCode,
+            statusText: res.statusMessage || '',
+            headers: res.headers || {},
             json: () => {
               try {
                 return Promise.resolve(JSON.parse(data));

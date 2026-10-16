@@ -20,6 +20,58 @@ const ELEV_STRIDE = 8;           // Query every 8th point
 const REQUEST_TIMEOUT_MS = 30000; // 30 second timeout per request
 const MAX_RETRIES = 2;           // Retry failed requests twice
 
+// "Too many requests" (HTTP 429) from the public Open-Elevation service
+// (October 2026: a real run got 429 for every batch, so every altitude was 0).
+// It is a free public service, so we must not hammer it:
+//  - at most one request per MIN_REQUEST_INTERVAL_MS from this process;
+//  - after a 429, wait longer before each retry (RATE_LIMIT_BACKOFF_MS, or
+//    the service's own Retry-After if it sends one, capped at
+//    MAX_RETRY_AFTER_MS), and retry at most twice;
+//  - if it still refuses, the circuit breaker below stops further requests
+//    for a while, and the job reports "no elevation data" as a serious problem.
+const MIN_REQUEST_INTERVAL_MS = 1000;
+const RATE_LIMIT_BACKOFF_MS = [10000, 30000];
+const MAX_RETRY_AFTER_MS = 60000;
+
+/** Replaceable in tests (no network, no real waiting). */
+export const elevationDeps = {
+  fetch: ipv4Fetch,
+  sleep: (ms) => new Promise(resolve => setTimeout(resolve, ms)),
+  now: () => Date.now()
+};
+let lastRequestAt = -Infinity;
+
+/** Tests only: forget the circuit breaker and the request pacing. */
+export function resetElevationServiceState() {
+  circuitOpenedAt = null;
+  lastRequestAt = -Infinity;
+}
+
+/**
+ * Milliseconds to wait before retry number `retry` (0-based) after `error`.
+ * Rate limiting (429) waits much longer than other failures.
+ * @param {Error & {status?: number, retryAfterMs?: number}} error
+ * @param {number} retry
+ */
+export function retryDelayMs(error, retry) {
+  if (error && error.status === 429) {
+    if (Number.isFinite(error.retryAfterMs) && error.retryAfterMs > 0) {
+      return Math.min(error.retryAfterMs, MAX_RETRY_AFTER_MS);
+    }
+    return RATE_LIMIT_BACKOFF_MS[Math.min(retry, RATE_LIMIT_BACKOFF_MS.length - 1)];
+  }
+  return 1000 * Math.pow(2, retry);
+}
+
+/** Retry-After header (seconds, or an HTTP date) in milliseconds, or null. */
+function parseRetryAfter(value, now) {
+  if (value === undefined || value === null || value === '') return null;
+  const seconds = Number(value);
+  if (Number.isFinite(seconds)) return Math.max(0, seconds * 1000);
+  const date = Date.parse(value);
+  return Number.isFinite(date) ? Math.max(0, date - now) : null;
+}
+
 // Circuit breaker: an outage otherwise costs its full retry+backoff ceiling
 // (~93s per batch) on EVERY batch of EVERY segment in a job, since each call
 // rediscovers the outage independently - a 17-segment run can take 5-10
@@ -158,7 +210,7 @@ async function fetchElevationsBatched(points, progressCallback = null) {
     // already exhausted its retries recently, don't repeat the full
     // timeout+retry dance - skip straight to degraded for this batch too.
     if (circuitOpenedAt !== null) {
-      const elapsed = Date.now() - circuitOpenedAt;
+      const elapsed = elevationDeps.now() - circuitOpenedAt;
       if (elapsed < CIRCUIT_COOLDOWN_MS) {
         throw new Error(
           `Elevation service circuit open (failed ${Math.round(elapsed / 1000)}s ago, ` +
@@ -180,9 +232,14 @@ async function fetchElevationsBatched(points, progressCallback = null) {
       } catch (error) {
         lastError = error;
         if (retry < MAX_RETRIES) {
-          // Wait before retry (exponential backoff)
-          const delayMs = 1000 * Math.pow(2, retry);
-          await new Promise(resolve => setTimeout(resolve, delayMs));
+          // Wait before retry: exponential backoff, much longer after a
+          // 429 "too many requests" (see RATE_LIMIT_BACKOFF_MS).
+          const delayMs = retryDelayMs(error, retry);
+          if (error.status === 429) {
+            console.warn(`[Elevation] Service is rate limiting (HTTP 429); waiting ${Math.round(delayMs / 1000)}s before retry ${retry + 1} of ${MAX_RETRIES}`);
+            if (progressCallback) progressCallback(Math.round((batchIdx / totalBatches) * 70), `Elevation service busy (rate limited); waiting ${Math.round(delayMs / 1000)} s before trying again`);
+          }
+          await elevationDeps.sleep(delayMs);
         }
       }
     }
@@ -190,7 +247,7 @@ async function fetchElevationsBatched(points, progressCallback = null) {
     if (!batchResults) {
       // All retries failed - open the circuit so later batches/segments in
       // this process skip straight to degraded instead of repeating this.
-      circuitOpenedAt = Date.now();
+      circuitOpenedAt = elevationDeps.now();
       throw new Error(`Elevation batch ${batchIdx + 1} failed after ${MAX_RETRIES} retries: ${lastError.message}`);
     }
 
@@ -220,8 +277,13 @@ async function queryElevationBatch(points) {
 
   const requestBody = JSON.stringify({ locations });
 
+  // Pace requests: at most one per MIN_REQUEST_INTERVAL_MS (public service).
+  const wait = lastRequestAt + MIN_REQUEST_INTERVAL_MS - elevationDeps.now();
+  if (wait > 0) await elevationDeps.sleep(wait);
+  lastRequestAt = elevationDeps.now();
+
   // Send POST request
-  const response = await ipv4Fetch(OPEN_ELEVATION_URL, {
+  const response = await elevationDeps.fetch(OPEN_ELEVATION_URL, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
@@ -232,7 +294,15 @@ async function queryElevationBatch(points) {
   });
 
   if (!response.ok) {
-    throw new Error(`Open-Elevation API returned ${response.status}: ${response.statusText}`);
+    const error = new Error(
+      response.status === 429
+        ? 'Open-Elevation API returned 429 (too many requests: the public elevation service is busy or rate limiting)'
+        : `Open-Elevation API returned ${response.status}${response.statusText ? ': ' + response.statusText : ''}`
+    );
+    error.status = response.status;
+    const headers = response.headers || {};
+    error.retryAfterMs = parseRetryAfter(headers['retry-after'], elevationDeps.now());
+    throw error;
   }
 
   const data = await response.json();
