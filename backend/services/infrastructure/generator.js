@@ -664,6 +664,75 @@ function resolveKmConstraints(nodes, geometryBySection) {
   return stats;
 }
 
+/** Smallest and largest km of a geometry's points, and the points at each end. */
+function geometryEnds(points) {
+  let first = points[0], last = points[0];
+  for (const p of points) {
+    if (p.km < first.km) first = p;
+    if (p.km > last.km) last = p;
+  }
+  return { minKm: first.km, maxKm: last.km, first, last };
+}
+
+/**
+ * End nodes (October 2026). Where the generated geometry stops (usually at
+ * the first or last waypoint) the OSM track carries on, so the track's end
+ * node is made where the OSM data happens to stop: at the edge of the area
+ * that was searched, often hundreds of metres beyond the geometry. Its
+ * kilometrage was already pulled back to the end of the line, but the node
+ * itself stayed out there (in the Network Editor and Google Earth).
+ *
+ * Now an end node (a node with exactly one connection) that lies beyond the
+ * start or the end of its geometry is put AT that end: kilometrage = the
+ * geometry's minimum or maximum km, position = the geometry's first or last
+ * point. End nodes within the geometry's range are left alone.
+ *
+ * @returns {number} how many end nodes were moved
+ */
+export function clampEndNodesToGeometry(nodes, geometryBySection, warnings = []) {
+  let moved = 0;
+  for (const node of nodes) {
+    const links = [node.fNode, node.tNode, node.dNode, node.xNode].filter(Boolean).length;
+    if (links !== 1) continue;
+    const pts = geometryBySection.get(node.region);
+    if (!pts || pts.length < 2) continue;
+    const { minKm, maxKm, first, last } = geometryEnds(pts);
+    // projectOntoGeometry carries on past the ends of the line, so a node
+    // beyond an end gets a km below the minimum or above the maximum.
+    const km = projectOntoGeometry({ lat: node.lat, lon: node.lon }, pts).km;
+    const END_TOLERANCE_KM = 0.001;
+    let end = null;
+    if (km < minKm - END_TOLERANCE_KM) end = first;
+    else if (km > maxKm + END_TOLERANCE_KM) end = last;
+    if (!end) continue;
+    node.lat = end.lat;
+    node.lon = end.lon;
+    node.km = end.km;
+    moved++;
+  }
+  if (moved > 0) {
+    warnings.push(`End nodes: ${moved} end node(s) lay beyond the start or end of their geometry (where the OpenStreetMap ` +
+      `data was cut off) and were moved to the end of the geometry, at its first or last kilometrage.`);
+  }
+  return moved;
+}
+
+/** Clamp every node's km (all three region slots) into its geometry's km range. */
+export function clampAllKmToGeometry(nodes, geometryBySection) {
+  const ranges = new Map();
+  for (const [region, pts] of geometryBySection) {
+    if (pts && pts.length > 0) { const { minKm, maxKm } = geometryEnds(pts); ranges.set(region, { minKm, maxKm }); }
+  }
+  for (const node of nodes) {
+    for (const [regionField, kmField] of [['region', 'km'], ['region2', 'km2'], ['region3', 'km3']]) {
+      const range = node[regionField] ? ranges.get(node[regionField]) : null;
+      if (!range || node[kmField] == null) continue;
+      if (node[kmField] < range.minKm) node[kmField] = range.minKm;
+      if (node[kmField] > range.maxKm) node[kmField] = range.maxKm;
+    }
+  }
+}
+
 /**
  * Nearest point on a way's own polyline to `point`, and the real distance to
  * it in metres. Reuses projectOntoGeometry() with a synthetic sequential
@@ -1654,6 +1723,9 @@ async function generateInfrastructureForSections(confirmedSections, networkName,
       warnings.push(`Boundary nodes: created ${boundaryCount} artificial end-node(s) where chains exit the network boundary.`);
     }
   }
+
+  // ── Step 8f: End nodes at the end of the geometry (October 2026) ──
+  clampEndNodesToGeometry(nodes, geometryBySection, warnings);
 
   updateProgress(70, 'Applying spatial separation');
 
@@ -2752,6 +2824,12 @@ async function generateInfrastructureForSections(confirmedSections, networkName,
   // every region a node belongs to is final; where nothing is violated this
   // changes nothing.
   resolveKmConstraints(nodes, geometryBySection);
+
+  // Every kilometrage inside its geometry's range. The solver above already
+  // keeps linked nodes in range; this catches a km on a region where a node
+  // has no links (the solver skips such regions), e.g. an alias km that was
+  // projected past the end of the line.
+  clampAllKmToGeometry(nodes, geometryBySection);
 
   updateProgress(93, 'Building CSV output');
 
