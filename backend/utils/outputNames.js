@@ -4,12 +4,13 @@
  * Same pattern as the Network Editor, which saves
  * <ProjectName>_<yyyy-MM-dd_HHmmss>.csv. Each geometry run has one stamp
  * (the time it started, session.json `outputStamp`) for the geometry ZIP,
- * Regions and the KMZ; each infrastructure run has its own new stamp
+ * Regions, Speedboards and the KMZ; each infrastructure run has its own new stamp
  * (`infrastructureStamp`), so regenerating Infrastructure never gives a
  * file the same name as before (decided 16 Oct 2026).
  *
  * Only the names people download are stamped:
- *   Infrastructure_<stamp>.csv, Regions_<stamp>.csv, Geometry_<stamp>.kmz,
+ *   Infrastructure_<stamp>.csv, Regions_<stamp>.csv, Speedboards_<stamp>.csv,
+ *   Geometry_<stamp>.kmz,
  *   the geometry ZIP and the agent's ZIP.
  * NOT stamped, on purpose:
  *   - the geometry CSV files and the "Geometry" folder in the ZIP. Traxim
@@ -18,7 +19,8 @@
  *     names do not matter to Traxim; but the Controller puts a scenario's
  *     geometry in a folder called Geometry, and keeping the names stable
  *     keeps one file per route easy to recognise between runs.
- *   - the files on the server (Infrastructure.csv, Regions.csv): the code
+ *   - the files on the server (Infrastructure.csv, Regions.csv,
+ *     Speedboards.csv): the code
  *     reads them by those names.
  * Stamped names still contain "Infrastructure" and "Regions", which is what
  * the Controller's older name-based upload route looks for.

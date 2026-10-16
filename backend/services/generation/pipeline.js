@@ -13,8 +13,9 @@ import fsSync from 'fs';
 import archiver from 'archiver';
 import { generateGeometryForSegment } from '../geometry/generator.js';
 import { prefetchRelationWayIds } from '../osm/osmGeometry.js';
-import { generateRegionsCsv, readGeometryRegionNames, orderRegionNames, DEFAULTS_WARNING as REGIONS_DEFAULTS_WARNING } from '../regions/generator.js';
-import { REGION_COLOURS, generateInfrastructureForSections } from '../infrastructure/generator.js';
+import { generateRegionsCsv, readGeometryRegionNames, orderRegionNames, isGeometryCsvFile, DEFAULTS_WARNING as REGIONS_DEFAULTS_WARNING } from '../regions/generator.js';
+import { REGION_COLOURS, generateInfrastructureForSections, parseGeometryCsv } from '../infrastructure/generator.js';
+import { generateSpeedboards } from '../speedboards/generator.js';
 import { DEFAULT_RULING_GRADIENT } from '../geometry/processor.js';
 import { readSessionMetadataSync, updateSessionMetadata } from '../../utils/tempFiles.js';
 import { buildGeometryKml } from '../../utils/kmlGenerator.js';
@@ -63,7 +64,7 @@ export function parseMaxGradientPercent(value) {
  * @param {Array<object>} results - runGeometryGeneration's results
  * @returns {string[]}
  */
-const NOT_AFFECTED_BY_ELEVATION = 'Infrastructure, Regions and the KMZ do not use elevation and are not affected.';
+const NOT_AFFECTED_BY_ELEVATION = 'Infrastructure, Regions, Speedboards and the KMZ do not use elevation and are not affected.';
 
 export function describeSeriousProblems(results) {
   const problems = [];
@@ -240,8 +241,43 @@ export async function writeGeometryKmz(sessionDirPath) {
 }
 
 /**
+ * Speedboards.csv in the session folder, from the OSM ways' speed tags and the
+ * geometry files on disk (one region per file, in Regions.csv order). Always
+ * written when geometry exists: with no speed data it is a valid file with no
+ * speedboards, and the result says so (noSpeedData). Never fails the job.
+ * @returns {Promise<{file: string|null, boardCount: number, regionsWithData: number, regionCount: number, noSpeedData: boolean, warnings: string[]}>}
+ */
+export async function writeSpeedboards(sessionDirPath, geometryDir, regionNames, ways) {
+  const speedboardsPath = path.join(sessionDirPath, 'Speedboards.csv');
+  try {
+    const byRegion = new Map();
+    let files = [];
+    try { files = await fs.readdir(geometryDir); } catch { /* no geometry */ }
+    for (const f of files.filter(isGeometryCsvFile)) {
+      const { points, sectionName } = parseGeometryCsv(await fs.readFile(path.join(geometryDir, f), 'utf-8'));
+      if (sectionName && points.length >= 2) byRegion.set(sectionName, points);
+    }
+    if (byRegion.size === 0) {
+      await fs.rm(speedboardsPath, { force: true });
+      return { file: null, boardCount: 0, regionsWithData: 0, regionCount: 0, noSpeedData: true, warnings: [] };
+    }
+    const order = [...regionNames.filter(n => byRegion.has(n)), ...[...byRegion.keys()].filter(n => !regionNames.includes(n))];
+    const result = generateSpeedboards(order.map(region => ({ region, points: byRegion.get(region) })), ways || []);
+    await fs.writeFile(speedboardsPath, result.csv, 'utf-8');
+    console.log(`[Geometry API] Wrote Speedboards.csv (${result.boardCount} rows, ${result.regionsWithData}/${result.regionCount} routes with speed data)`);
+    const { csv, ...summary } = result;
+    return { file: 'Speedboards.csv', ...summary };
+  } catch (err) {
+    console.error('[Geometry API] Failed to write Speedboards.csv:', err);
+    await fs.rm(speedboardsPath, { force: true }).catch(() => {});
+    return { file: null, boardCount: 0, regionsWithData: 0, regionCount: 0, noSpeedData: true,
+      warnings: [`Speedboards: the file could not be made (${err.message}).`] };
+  }
+}
+
+/**
  * The geometry job: geometry CSVs (main route + _altN per segment),
- * Regions.csv, Geometry.kmz, osm_topology.json and corridor data.
+ * Regions.csv, Speedboards.csv, Geometry.kmz, osm_topology.json and corridor data.
  *
  * @param {{sessionId: string, sessionPath: string, spacingMetres: number, segments: Array,
  *          maxGradientPercent?: number, outputStamp?: string}} data
@@ -374,6 +410,7 @@ export async function runGeometryGeneration(data, updateProgress) {
   // Merge infrastructure-format topology from all segments and write a
   // single osm_topology.json so the infrastructure pipeline can skip its
   // own Overpass query.
+  let mergedWays = [];
   try {
     const seenWayIds = new Set();
     const seenNodeIds = new Set();
@@ -390,6 +427,7 @@ export async function runGeometryGeneration(data, updateProgress) {
       }
     }
 
+    mergedWays = allWays;
     if (allWays.length > 0) {
       const topoPath = path.join(sessionDirPath, 'osm_topology.json');
       await fs.writeFile(topoPath, JSON.stringify({ ways: allWays, taggedNodes: allTaggedNodes }), 'utf-8');
@@ -398,6 +436,10 @@ export async function runGeometryGeneration(data, updateProgress) {
   } catch (topoErr) {
     console.warn(`[Geometry API] Failed to write osm_topology.json: ${topoErr.message}`);
   }
+
+  // Speedboards.csv (session root, beside Regions.csv): from the OSM speed
+  // tags on the ways just fetched, aligned to the geometry files on disk.
+  const speedboards = await writeSpeedboards(sessionDirPath, geometryDir, regionNames, mergedWays);
 
   // Strip infraTopology from results before returning (large payload)
   for (const r of results) delete r.infraTopology;
@@ -460,7 +502,8 @@ export async function runGeometryGeneration(data, updateProgress) {
     await updateSessionMetadata(sessionId, {
       outputStamp,
       geometryMaxGradientPercent: maxGradientPercent,
-      geometrySeriousProblems: seriousProblems
+      geometrySeriousProblems: seriousProblems,
+      geometrySpeedboards: speedboards
     });
   } catch (metaErr) {
     console.warn(`[Geometry API] Could not record the output stamp: ${metaErr.message}`);
@@ -474,6 +517,7 @@ export async function runGeometryGeneration(data, updateProgress) {
     successfulSections: results.filter(r => !r.error).length,
     results,
     regionsWarning,
+    speedboards,
     seriousProblems,
     maxGradientPercent,
     outputStamp

@@ -117,7 +117,7 @@ test('serious problems: no elevation data anywhere -> one clear message, with th
   ]);
   assert.equal(problems.length, 1);
   assert.match(problems[0], /^Geometry: no elevation data, all altitudes are 0, so the geometry files cannot be used as they are/);
-  assert.match(problems[0], /Infrastructure, Regions and the KMZ do not use elevation and are not affected/);
+  assert.match(problems[0], /Infrastructure, Regions, Speedboards and the KMZ do not use elevation and are not affected/);
   assert.match(problems[0], /429/);
   assert.match(problems[0], /Wait 15-30 minutes and generate the files again/);
 });
