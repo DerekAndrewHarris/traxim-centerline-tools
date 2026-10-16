@@ -33,7 +33,7 @@ backend/
 │   ├── osm/                # ipv4fetch, overpass, geocoding, sections, osmGeometry
 │   ├── geometry/            # generator.js, processor.js
 │   ├── infrastructure/      # generator.js, processor.js
-│   └── elevation.js         # Open-Elevation API integration
+│   └── elevation.js         # Copernicus DEM tiles (cached on disk) - elevations
 ├── utils/
 │   ├── tempFiles.js       # Session creation & cleanup
 │   ├── zipGenerator.js    # ZIP archive generation

@@ -408,7 +408,7 @@ function singleTraversal(startWayId, startForward, endpointIndex, wayGeometry, t
 /**
  * Tunnel/Bridge Elevation Correction
  *
- * Digital elevation models (Open-Elevation) return ground-surface height at a
+ * Digital elevation models (Copernicus DEM, see elevation.js) return ground-surface height at a
  * lat/lon, which is wrong for a point inside a tunnel (returns the hill above
  * it) or on a bridge/viaduct (returns the valley/river below it). OSM tags
  * ways with `tunnel`/`bridge` when this applies. This can't be corrected with

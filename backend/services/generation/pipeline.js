@@ -59,8 +59,8 @@ export function parseMaxGradientPercent(value) {
  * are not affected, so the agent's single list is clear and the website
  * shows it only with the geometry results (not again at Infrastructure).
  *   - legs whose geometry could not be generated at all;
- *   - routes with no elevation data (every altitude 0), e.g. when the public
- *     elevation service refused the requests (HTTP 429).
+ *   - routes with no elevation data (every altitude 0), e.g. when an
+ *     elevation tile could not be downloaded or read (see elevation.js).
  * @param {Array<object>} results - runGeometryGeneration's results
  * @returns {string[]}
  */
@@ -89,10 +89,11 @@ export function describeSeriousProblems(results) {
   const missing = routes.filter(r => !r.ok);
   if (missing.length > 0) {
     const reason = missing.find(r => r.reason)?.reason;
-    const rateLimited = missing.some(r => /\b429\b|too many requests|rate limit|circuit open/i.test(r.reason || ''));
+    const tileProblem = missing.some(r => /elevation tile|elevation cache folder|geotiff package/i.test(r.reason || ''));
     const why = (reason ? ` Reason: ${reason}.` : '') +
-      (rateLimited
-        ? ' The public elevation service refused the requests because it was busy. Wait 15-30 minutes and generate the files again.'
+      (tileProblem
+        ? ' The elevation data (Copernicus DEM tiles, downloaded once and kept on the server) could not be downloaded or read. ' +
+          'Try generating the files again in a few minutes; if it happens again, tell the Traxim administrator (the server\'s elevation cache needs checking).'
         : ' Try generating the files again later.');
     if (missing.length === routes.length) {
       problems.unshift(

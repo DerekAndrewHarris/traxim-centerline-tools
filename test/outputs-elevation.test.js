@@ -1,14 +1,14 @@
 /**
  * Follow-up changes after the first real agent test (16 Oct 2026):
  * date-stamped download names, the KML in the download, "serious problems"
- * (no elevation data), the maximum-gradient setting, and the elevation
- * service's handling of HTTP 429 "too many requests".
+ * (no elevation data) and the maximum-gradient setting. (The elevation
+ * data itself is tested in elevation-dem.test.js.)
  *
  * Run with:  npm test
- * No network: the elevation service's fetch and sleep are replaced.
+ * No network.
  */
 
-import { test, beforeEach } from 'node:test';
+import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'fs';
 import os from 'os';
@@ -18,7 +18,6 @@ const { makeOutputStamp, stampedName, safeFileBase, isValidOutputStamp } = await
 const { buildGeometryKml, readGeometryCSV } = await import('../backend/utils/kmlGenerator.js');
 const pipeline = await import('../backend/services/generation/pipeline.js');
 const { applyGradientEnvelopeSmoothing, DEFAULT_RULING_GRADIENT } = await import('../backend/services/geometry/processor.js');
-const elevation = await import('../backend/services/elevation.js');
 
 // ── Date-stamped names ──────────────────────────────────────────────────────
 
@@ -100,7 +99,7 @@ test('readGeometryCSV reads the Traxim layout (name first) and plain lat,lon', (
 // ── Serious problems ────────────────────────────────────────────────────────
 
 const ok = { ok: true, reason: null };
-const no429 = { ok: false, reason: 'Elevation batch 1 failed after 2 retries: Open-Elevation API returned 429 (too many requests)' };
+const noTile = { ok: false, reason: 'elevation tile N44 E009 could not be downloaded (HTTP 503)' };
 
 test('serious problems: none when every route has elevation data', () => {
   assert.deepEqual(pipeline.describeSeriousProblems([
@@ -110,16 +109,17 @@ test('serious problems: none when every route has elevation data', () => {
   assert.deepEqual(pipeline.describeSeriousProblems([{ section: 'old result without elevation info' }]), []);
 });
 
-test('serious problems: no elevation data anywhere -> one clear message, with the 429 advice', () => {
+test('serious problems: no elevation data anywhere -> one clear message, with the elevation-tile advice', () => {
   const problems = pipeline.describeSeriousProblems([
-    { section: 'A - B', elevation: no429, alternativeElevation: [{ route: 'A - B_alt1', ok: false, reason: 'circuit open' }] },
-    { section: 'B - C', elevation: no429 }
+    { section: 'A - B', elevation: noTile, alternativeElevation: [{ route: 'A - B_alt1', ok: false, reason: 'elevation tile N44 E009 could not be downloaded a moment ago (HTTP 503); not retried yet' }] },
+    { section: 'B - C', elevation: noTile }
   ]);
   assert.equal(problems.length, 1);
   assert.match(problems[0], /^Geometry: no elevation data, all altitudes are 0, so the geometry files cannot be used as they are/);
   assert.match(problems[0], /Infrastructure, Regions, Speedboards and the KMZ do not use elevation and are not affected/);
-  assert.match(problems[0], /429/);
-  assert.match(problems[0], /Wait 15-30 minutes and generate the files again/);
+  assert.match(problems[0], /N44 E009/);
+  assert.match(problems[0], /Copernicus DEM tiles/);
+  assert.match(problems[0], /tell the Traxim administrator/);
 });
 
 test('serious problems: some routes without elevation, and legs that failed', () => {
@@ -171,79 +171,4 @@ test('maximum gradient: smoothing uses the given limit; the default behaviour is
   // A profile that is already within the limit is left alone.
   const gentle = applyGradientEnvelopeSmoothing([0, 0.5, 1, 1.5], [0, 25, 50, 75], 0.03);
   assert.equal(gentle.adjustedCount, 0);
-});
-
-// ── Elevation service: HTTP 429 ─────────────────────────────────────────────
-
-function response(status, body, headers = {}) {
-  return { ok: status >= 200 && status < 300, status, statusText: '', headers, json: async () => body };
-}
-
-let sleeps;
-let clock;
-beforeEach(() => {
-  elevation.resetElevationServiceState();
-  sleeps = [];
-  clock = 1_000_000;
-  elevation.elevationDeps.sleep = async (ms) => { sleeps.push(ms); clock += ms; };
-  elevation.elevationDeps.now = () => clock;
-});
-
-const points = Array.from({ length: 10 }, (_, i) => ({ lat: 44 + i * 0.001, lon: 9 }));
-
-test('retry delays: long waits after 429 (or the service\'s Retry-After, capped), short otherwise', () => {
-  const tooMany = Object.assign(new Error('429'), { status: 429 });
-  assert.equal(elevation.retryDelayMs(tooMany, 0), 10000);
-  assert.equal(elevation.retryDelayMs(tooMany, 1), 30000);
-  assert.equal(elevation.retryDelayMs(Object.assign(new Error('429'), { status: 429, retryAfterMs: 5000 }), 0), 5000);
-  assert.equal(elevation.retryDelayMs(Object.assign(new Error('429'), { status: 429, retryAfterMs: 3600000 }), 0), 60000);
-  assert.equal(elevation.retryDelayMs(new Error('timeout'), 0), 1000);
-  assert.equal(elevation.retryDelayMs(new Error('timeout'), 1), 2000);
-});
-
-test('429 then success: waits, retries and returns real elevations', async () => {
-  let calls = 0;
-  elevation.elevationDeps.fetch = async (url, options) => {
-    calls++;
-    if (calls === 1) return response(429, null, { 'retry-after': '7' });
-    const { locations } = JSON.parse(options.body);
-    return response(200, { results: locations.map((l, i) => ({ elevation: 100 + i })) });
-  };
-  const result = await elevation.fetchElevations(points);
-  assert.equal(result.degraded, undefined);
-  assert.equal(calls, 2);
-  assert.ok(sleeps.includes(7000), `waited for Retry-After: ${sleeps}`);
-  assert.equal(result[0].elevation, 100);
-  assert.ok(result.every(r => r.elevation >= 100));
-});
-
-test('429 every time: gives up after 2 retries, reports why, and stops asking for a while', async () => {
-  let calls = 0;
-  elevation.elevationDeps.fetch = async () => { calls++; return response(429, null); };
-  const first = await elevation.fetchElevations(points);
-  assert.equal(first.degraded, true);
-  assert.match(first.degradedReason, /429/);
-  assert.ok(first.every(r => r.elevation === 0));
-  assert.equal(calls, 3, 'one try and two retries');
-  assert.ok(sleeps.includes(10000) && sleeps.includes(30000), `backoff waits: ${sleeps}`);
-
-  // Circuit open: the next route does not call the service at all.
-  const second = await elevation.fetchElevations(points);
-  assert.equal(second.degraded, true);
-  assert.match(second.degradedReason, /circuit open/);
-  assert.equal(calls, 3);
-});
-
-test('requests are paced: at most one per second', async () => {
-  const times = [];
-  elevation.elevationDeps.fetch = async (url, options) => {
-    times.push(clock);
-    const { locations } = JSON.parse(options.body);
-    return response(200, { results: locations.map(() => ({ elevation: 5 })) });
-  };
-  // 900 points -> 113 samples -> 2 batches
-  const many = Array.from({ length: 900 }, (_, i) => ({ lat: 44 + i * 0.0001, lon: 9 }));
-  await elevation.fetchElevations(many);
-  assert.equal(times.length, 2);
-  assert.ok(times[1] - times[0] >= 1000, `gap ${times[1] - times[0]} ms`);
 });

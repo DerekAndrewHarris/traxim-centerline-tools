@@ -395,10 +395,14 @@ node["railway"~"^(switch|railway_crossing|buffer_stop)$"](corridorBbox);
 `traxim-centerline-tools` (`backend/services/elevation.js`), and isn't covered elsewhere in
 this document.
 
-**Source**: the [Open-Elevation API](https://open-elevation.com), a Digital Elevation Model
-(DEM) — it returns *ground-surface* height for a given lat/lon. Points are sub-sampled (every
-8th point queried, rest interpolated by array index) to limit API calls, batched at 100
-points/request, with graceful degradation to elevation=0 if the service is unavailable.
+**Source** (since October 2026): the Copernicus DEM GLO-30 (30 m) Digital Elevation Model
+(DEM), self-hosted: 1 x 1 degree Cloud-Optimised GeoTIFF tiles from the AWS open-data bucket
+`copernicus-dem-30m`, downloaded on first use into `ELEVATION_CACHE_DIR` (default
+`/var/lib/traxim-elevation`, about 20-40 MB per tile) and read locally with the `geotiff`
+npm package, bilinear interpolation, every point. All-sea squares have no tile (elevation 0).
+If a tile cannot be had, the route degrades to elevation 0 and the job reports a serious
+problem. (Before October 2026: the public Open-Elevation API, which refused this server with
+HTTP 429.) A DEM returns *ground-surface* height for a given lat/lon.
 
 **Problem**: a DEM is structurally wrong for any point where the track's real elevation
 diverges from the ground surface — inside a **tunnel** (returns the hill above, not the

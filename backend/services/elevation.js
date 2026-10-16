@@ -1,419 +1,395 @@
 /**
- * Elevation Service
- * 
- * Queries elevation data from Open-Elevation API (https://open-elevation.com)
- * with intelligent sub-sampling and interpolation to minimize API calls.
- * 
- * Strategy:
- * - Query every ELEV_STRIDE-th point (default 8) to reduce API load
- * - Interpolate elevations for intermediate points
- * - Batch requests (max 100 points per request)
- * - Graceful degradation: return 0 if API unavailable
+ * Elevation Service (self-hosted, October 2026)
+ *
+ * Altitudes come from the Copernicus DEM GLO-30 (30 m) elevation model,
+ * read from 1 x 1 degree tiles kept on this server. It replaces the public
+ * Open-Elevation API, which refused this server outright (HTTP 429 on the
+ * first request of a run, so every altitude came out as 0).
+ *
+ * Data: Copernicus DEM GLO-30 Public, as Cloud-Optimised GeoTIFFs in the AWS
+ * open-data bucket "copernicus-dem-30m" (free, no key; see
+ * https://copernicus-dem-30m.s3.amazonaws.com/readme.html). One file per
+ * 1-degree square, named after its south-west corner, e.g.
+ *   Copernicus_DSM_COG_10_N44_00_E009_00_DEM/Copernicus_DSM_COG_10_N44_00_E009_00_DEM.tif
+ * ("10" = 1 arc-second, about 30 m). Squares that are all sea have no file
+ * (HTTP 404): the readme says to take their height as 0, and so do we.
+ * Licence: Copernicus DEM, free for the general public; attribution:
+ * "Copernicus DEM (c) DLR e.V. 2010-2014 and (c) Airbus Defence and Space
+ * GmbH 2014-2018 provided under COPERNICUS by the European Union and ESA".
+ *
+ * How it works:
+ *  - The first time a tile is needed it is downloaded (about 20-40 MB) into
+ *    the cache folder, ELEVATION_CACHE_DIR (default /var/lib/traxim-elevation),
+ *    and kept there; later runs read it from disk.
+ *  - Downloads are safe when two jobs need the same tile at once (one
+ *    download, both wait for it), are written to a temporary file and only
+ *    renamed into place once complete and checked (size, and that it opens
+ *    as a GeoTIFF covering the right square), so a half-written tile is
+ *    never used.
+ *  - Every point is looked up (no sub-sampling), with bilinear
+ *    interpolation between the four surrounding 30 m grid points.
+ *  - If a tile cannot be downloaded or read, the whole route gets
+ *    elevation 0 with degraded = true and the reason, which the geometry
+ *    step reports as a serious problem (as before).
+ *
+ * The smoothing (maximum gradient) and the tunnel/bridge handling in the
+ * geometry step use these elevations exactly as they used the old service's.
  */
 
-import { ipv4Fetch } from './osm/ipv4fetch.js';
+import fs from 'fs';
+import fsp from 'fs/promises';
+import path from 'path';
+import crypto from 'crypto';
+import { Readable } from 'stream';
+import { pipeline } from 'stream/promises';
 
-// Configuration
-const OPEN_ELEVATION_URL = 'https://api.open-elevation.com/api/v1/lookup';
-const BATCH_SIZE = 100;          // Max points per API request
-const ELEV_STRIDE = 8;           // Query every 8th point
-const REQUEST_TIMEOUT_MS = 30000; // 30 second timeout per request
-const MAX_RETRIES = 2;           // Retry failed requests twice
+// The geotiff package (npm, version pinned in package.json) is loaded when
+// first needed, so the service still starts if it has not been installed on
+// the server yet; elevation then reports a clear serious problem instead.
+let geotiffModule = null;
+async function loadGeotiff() {
+  if (!geotiffModule) {
+    try {
+      geotiffModule = await import('geotiff');
+    } catch (error) {
+      throw Object.assign(new Error('the geotiff package is not installed on the server (run npm ci in the File Generator folder)'), { code: 'NO_GEOTIFF' });
+    }
+  }
+  return geotiffModule;
+}
 
-// "Too many requests" (HTTP 429) from the public Open-Elevation service
-// (October 2026: a real run got 429 for every batch, so every altitude was 0).
-// It is a free public service, so we must not hammer it:
-//  - at most one request per MIN_REQUEST_INTERVAL_MS from this process;
-//  - after a 429, wait longer before each retry (RATE_LIMIT_BACKOFF_MS, or
-//    the service's own Retry-After if it sends one, capped at
-//    MAX_RETRY_AFTER_MS), and retry at most twice;
-//  - if it still refuses, the circuit breaker below stops further requests
-//    for a while, and the job reports "no elevation data" as a serious problem.
-const MIN_REQUEST_INTERVAL_MS = 1000;
-const RATE_LIMIT_BACKOFF_MS = [10000, 30000];
-const MAX_RETRY_AFTER_MS = 60000;
+/** Default cache folder on the server (must be writable by the service, see the deployment notes). */
+export const DEFAULT_CACHE_DIR = '/var/lib/traxim-elevation';
+/** Where the tiles are downloaded from (overridable for testing or a mirror). */
+export const DEFAULT_DEM_BASE_URL = 'https://copernicus-dem-30m.s3.amazonaws.com';
 
-/** Replaceable in tests (no network, no real waiting). */
+// Size sanity checks for a downloaded tile. Real GLO-30 tiles are about
+// 1-45 MB (smaller at high latitudes and where there is a lot of sea).
+const MIN_TILE_BYTES = 1024;
+const MAX_TILE_BYTES = 150 * 1024 * 1024;
+const DOWNLOAD_TIMEOUT_MS = 5 * 60 * 1000;
+// After a failed download, don't try the same tile again for this long
+// (a job with many legs would otherwise retry, and wait, for every leg).
+const FAILED_TILE_RETRY_AFTER_MS = 2 * 60 * 1000;
+// Decoded 1024 x 1024 blocks kept in memory (4 MB each).
+const MAX_CACHED_BLOCKS = 32;
+// Values at or below this are "no data" (Copernicus has none on land; this is a guard).
+const NO_DATA_BELOW = -1000;
+
+/** Replaceable in tests (no network). */
 export const elevationDeps = {
-  fetch: ipv4Fetch,
-  sleep: (ms) => new Promise(resolve => setTimeout(resolve, ms)),
+  fetch: (...args) => globalThis.fetch(...args),
   now: () => Date.now()
 };
-let lastRequestAt = -Infinity;
 
-/** Tests only: forget the circuit breaker and the request pacing. */
+export function cacheDir() {
+  return process.env.ELEVATION_CACHE_DIR || DEFAULT_CACHE_DIR;
+}
+
+function demBaseUrl() {
+  return (process.env.ELEVATION_DEM_URL || DEFAULT_DEM_BASE_URL).replace(/\/+$/, '');
+}
+
+// ── In-process state ──────────────────────────────────────────────────────
+const inFlight = new Map();     // tile name -> Promise<string|null> (download in progress)
+const missingTiles = new Set(); // tile names known to have no file (sea), this process only
+const failedTiles = new Map();  // tile name -> { at, message }
+const blockCache = new Map();   // `${tile}|${bx}|${by}` -> { data, x0, y0, w, h } (LRU by insertion order)
+
+/** Tests only: forget everything held in memory. */
 export function resetElevationServiceState() {
-  circuitOpenedAt = null;
-  lastRequestAt = -Infinity;
+  inFlight.clear();
+  missingTiles.clear();
+  failedTiles.clear();
+  blockCache.clear();
 }
 
 /**
- * Milliseconds to wait before retry number `retry` (0-based) after `error`.
- * Rate limiting (429) waits much longer than other failures.
- * @param {Error & {status?: number, retryAfterMs?: number}} error
- * @param {number} retry
+ * The tile covering a point: named after the south-west corner of its
+ * 1-degree square.
+ * @returns {{name: string, latFloor: number, lonFloor: number, url: string}}
  */
-export function retryDelayMs(error, retry) {
-  if (error && error.status === 429) {
-    if (Number.isFinite(error.retryAfterMs) && error.retryAfterMs > 0) {
-      return Math.min(error.retryAfterMs, MAX_RETRY_AFTER_MS);
-    }
-    return RATE_LIMIT_BACKOFF_MS[Math.min(retry, RATE_LIMIT_BACKOFF_MS.length - 1)];
-  }
-  return 1000 * Math.pow(2, retry);
+export function tileFor(lat, lon) {
+  const latFloor = Math.floor(lat);
+  const lonFloor = Math.floor(lon);
+  const ns = latFloor >= 0 ? 'N' : 'S';
+  const ew = lonFloor >= 0 ? 'E' : 'W';
+  const name = `Copernicus_DSM_COG_10_${ns}${String(Math.abs(latFloor)).padStart(2, '0')}_00_` +
+               `${ew}${String(Math.abs(lonFloor)).padStart(3, '0')}_00_DEM`;
+  return { name, latFloor, lonFloor, url: `${demBaseUrl()}/${name}/${name}.tif` };
 }
 
-/** Retry-After header (seconds, or an HTTP date) in milliseconds, or null. */
-function parseRetryAfter(value, now) {
-  if (value === undefined || value === null || value === '') return null;
-  const seconds = Number(value);
-  if (Number.isFinite(seconds)) return Math.max(0, seconds * 1000);
-  const date = Date.parse(value);
-  return Number.isFinite(date) ? Math.max(0, date - now) : null;
+/** Short form for messages, e.g. "N44 E009". */
+function shortName(tile) {
+  const m = /_([NS]\d\d)_00_([EW]\d\d\d)_00_/.exec(tile.name);
+  return m ? `${m[1]} ${m[2]}` : tile.name;
 }
-
-// Circuit breaker: an outage otherwise costs its full retry+backoff ceiling
-// (~93s per batch) on EVERY batch of EVERY segment in a job, since each call
-// rediscovers the outage independently - a 17-segment run can take 5-10
-// minutes to fail all the way through. Once a batch exhausts its retries, we
-// assume the service is down for the rest of this process and skip straight
-// to degraded for subsequent batches, re-probing once after a cooldown in
-// case it recovers mid-session (e.g. a later job run).
-const CIRCUIT_COOLDOWN_MS = 5 * 60 * 1000;
-let circuitOpenedAt = null;
 
 /**
- * Fetch elevations for an array of points from Open-Elevation API.
- * Uses sub-sampling strategy: queries every ELEV_STRIDE-th point,
- * then interpolates elevations for intermediate points.
- * 
- * @param {Array<{lat: number, lon: number}>} points - Array of coordinate points
- * @param {Function} progressCallback - Optional progress callback (percent, message)
- * @returns {Promise<Array<{lat: number, lon: number, elevation: number}>>} Points with elevations
+ * Open a tile file and check it is a GeoTIFF covering the expected square.
+ * @returns {Promise<{tiff, image, geo}>}
  */
-export async function fetchElevations(points, progressCallback = null) {
-  if (!points || points.length === 0) {
-    return [];
-  }
-
+async function openTile(filePath, tile) {
+  const { fromFile } = await loadGeotiff();
+  const tiff = await fromFile(filePath);
   try {
-    // Step 1: Select sample points (every ELEV_STRIDE-th point, plus first and last)
-    const sampleIndices = [];
-    sampleIndices.push(0); // Always include first point
-    
-    for (let i = ELEV_STRIDE; i < points.length; i += ELEV_STRIDE) {
-      sampleIndices.push(i);
+    const image = await tiff.getImage();
+    const width = image.getWidth();
+    const height = image.getHeight();
+    if (width < 2 || height < 2) throw new Error(`tile is only ${width} x ${height} pixels`);
+    const [west, south, east, north] = image.getBoundingBox();
+    const tol = 0.01;
+    if (Math.abs(west - tile.lonFloor) > tol || Math.abs(south - tile.latFloor) > tol ||
+        Math.abs(east - (tile.lonFloor + 1)) > tol || Math.abs(north - (tile.latFloor + 1)) > tol) {
+      throw new Error(`tile covers ${west},${south} to ${east},${north}, not the expected 1-degree square`);
     }
-    
-    // Always include last point if not already included
-    const lastIdx = points.length - 1;
-    if (sampleIndices[sampleIndices.length - 1] !== lastIdx) {
-      sampleIndices.push(lastIdx);
+    const [ox, oy] = image.getOrigin();
+    const [rx, ry] = image.getResolution();
+    // PixelIsPoint (2, as Copernicus uses): the origin is the centre of the
+    // top-left pixel. PixelIsArea (1, the GeoTIFF default): its corner.
+    const isPoint = image.getGeoKeys()?.GTRasterTypeGeoKey === 2;
+    const half = isPoint ? 0 : 0.5;
+    const noData = image.getGDALNoData();
+    const blockW = image.isTiled ? image.getTileWidth() : 512;
+    const blockH = image.isTiled ? image.getTileHeight() : 512;
+    return { tiff, image, geo: { ox, oy, rx, ry, half, width, height, noData, blockW, blockH } };
+  } catch (error) {
+    try { tiff.close(); } catch { /* ignore */ }
+    throw error;
+  }
+}
+
+/** Download a tile into the cache folder. Resolves to its path, or null if there is no such tile (sea). */
+async function downloadTile(tile, progressCallback) {
+  const dir = cacheDir();
+  const finalPath = path.join(dir, `${tile.name}.tif`);
+  try {
+    await fsp.mkdir(dir, { recursive: true });
+  } catch (error) {
+    throw new Error(`the elevation cache folder ${dir} cannot be created (${error.code || error.message})`);
+  }
+
+  if (progressCallback) progressCallback(null, `Downloading elevation tile ${shortName(tile)} (first use; about 20-40 MB)`);
+  console.log(`[Elevation] Downloading ${tile.url}`);
+  const response = await elevationDeps.fetch(tile.url, { signal: AbortSignal.timeout(DOWNLOAD_TIMEOUT_MS) });
+  if (response.status === 404) {
+    console.log(`[Elevation] No tile ${tile.name} (all sea): elevation 0 there`);
+    return null;
+  }
+  if (!response.ok) throw new Error(`HTTP ${response.status}`);
+
+  const declared = Number(response.headers?.get?.('content-length'));
+  if (Number.isFinite(declared) && declared > 0 && (declared < MIN_TILE_BYTES || declared > MAX_TILE_BYTES)) {
+    throw new Error(`unexpected tile size ${declared} bytes`);
+  }
+
+  const tmpPath = path.join(dir, `${tile.name}.tif.part-${process.pid}-${crypto.randomBytes(4).toString('hex')}`);
+  try {
+    let written = 0;
+    const counter = async function* (source) {
+      for await (const chunk of source) {
+        written += chunk.length;
+        if (written > MAX_TILE_BYTES) throw new Error(`tile larger than ${MAX_TILE_BYTES} bytes`);
+        yield chunk;
+      }
+    };
+    try {
+      await pipeline(Readable.fromWeb(response.body), counter, fs.createWriteStream(tmpPath, { mode: 0o644 }));
+    } catch (error) {
+      if (error.code === 'EACCES' || error.code === 'EROFS' || error.code === 'EPERM') {
+        throw new Error(`the elevation cache folder ${dir} is not writable (${error.code})`);
+      }
+      throw error;
     }
-
-    const samplePoints = sampleIndices.map(i => points[i]);
-
-    if (progressCallback) {
-      progressCallback(
-        0,
-        `Fetching elevations for ${samplePoints.length}/${points.length} sample points (every ${ELEV_STRIDE}th point)`
-      );
+    if (written < MIN_TILE_BYTES) throw new Error(`download too small (${written} bytes)`);
+    if (Number.isFinite(declared) && declared > 0 && written !== declared) {
+      throw new Error(`download incomplete (${written} of ${declared} bytes)`);
     }
+    // Must open as a GeoTIFF for the right square before it is used.
+    const opened = await openTile(tmpPath, tile);
+    opened.tiff.close();
+    await fsp.rename(tmpPath, finalPath); // atomic: other readers see the whole file or none
+    console.log(`[Elevation] Cached ${finalPath} (${(written / 1048576).toFixed(1)} MB)`);
+    return finalPath;
+  } finally {
+    await fsp.rm(tmpPath, { force: true }).catch(() => {});
+  }
+}
 
-    // Step 2: Fetch elevations for sample points in batches
-    const sampleResults = await fetchElevationsBatched(samplePoints, progressCallback);
+/**
+ * Path of a cached tile, downloading it if needed; null for a sea tile.
+ * One download per tile at a time, however many jobs ask.
+ */
+async function ensureTile(tile, progressCallback) {
+  const finalPath = path.join(cacheDir(), `${tile.name}.tif`);
+  if (missingTiles.has(tile.name)) return null;
+  if (fs.existsSync(finalPath)) return finalPath;
 
-    // Build map of index → elevation for sample points
-    const elevationMap = new Map();
-    for (let i = 0; i < sampleIndices.length; i++) {
-      elevationMap.set(sampleIndices[i], sampleResults[i].elevation);
+  const failed = failedTiles.get(tile.name);
+  if (failed && elevationDeps.now() - failed.at < FAILED_TILE_RETRY_AFTER_MS) {
+    throw new Error(`elevation tile ${shortName(tile)} could not be downloaded a moment ago (${failed.message}); not retried yet`);
+  }
+
+  if (!inFlight.has(tile.name)) {
+    const p = downloadTile(tile, progressCallback)
+      .then((result) => {
+        failedTiles.delete(tile.name);
+        if (result === null) missingTiles.add(tile.name);
+        return result;
+      })
+      .catch((error) => {
+        failedTiles.set(tile.name, { at: elevationDeps.now(), message: error.message });
+        throw new Error(`elevation tile ${shortName(tile)} could not be downloaded (${error.message})`);
+      })
+      .finally(() => inFlight.delete(tile.name));
+    inFlight.set(tile.name, p);
+  }
+  return inFlight.get(tile.name);
+}
+
+/** Open a cached tile; a cached file that does not open is deleted and downloaded again once. */
+async function openCachedTile(tile, progressCallback) {
+  let filePath = await ensureTile(tile, progressCallback);
+  if (filePath === null) return null;
+  try {
+    return await openTile(filePath, tile);
+  } catch (error) {
+    if (error.code === 'NO_GEOTIFF') throw error; // not the file's fault: keep it
+    console.warn(`[Elevation] Cached tile ${filePath} is unreadable (${error.message}); downloading it again`);
+    await fsp.rm(filePath, { force: true }).catch(() => {});
+    for (const key of [...blockCache.keys()]) if (key.startsWith(`${tile.name}|`)) blockCache.delete(key);
+    filePath = await ensureTile(tile, progressCallback);
+    if (filePath === null) return null;
+    try {
+      return await openTile(filePath, tile);
+    } catch (error2) {
+      throw new Error(`elevation tile ${shortName(tile)} cannot be read (${error2.message})`);
     }
+  }
+}
 
-    if (progressCallback) {
-      progressCallback(80, 'Interpolating elevations for intermediate points');
-    }
+function cacheBlock(key, block) {
+  blockCache.delete(key);
+  blockCache.set(key, block);
+  while (blockCache.size > MAX_CACHED_BLOCKS) blockCache.delete(blockCache.keys().next().value);
+}
 
-    // Step 3: Interpolate elevations for all points
-    const results = [];
-    for (let i = 0; i < points.length; i++) {
-      if (elevationMap.has(i)) {
-        // Sample point - use fetched elevation
-        results.push({
-          lat: points[i].lat,
-          lon: points[i].lon,
-          elevation: elevationMap.get(i)
-        });
-      } else {
-        // Intermediate point - interpolate between surrounding samples
-        const elevation = interpolateElevation(i, sampleIndices, elevationMap);
-        results.push({
-          lat: points[i].lat,
-          lon: points[i].lon,
-          elevation
-        });
+/**
+ * Elevations for the points that fall in one tile, by bilinear interpolation
+ * between the four surrounding grid points. Writes into `out` at `indices`.
+ */
+async function sampleTile(tile, points, indices, out, progressCallback) {
+  const opened = await openCachedTile(tile, progressCallback);
+  if (opened === null) {
+    for (const i of indices) out[i] = 0; // sea tile
+    return;
+  }
+  const { tiff, image, geo } = opened;
+  try {
+    const { ox, oy, rx, ry, half, width, height, noData, blockW, blockH } = geo;
+    // Fractional pixel position (column, row) of each point, clamped to the grid.
+    const pos = indices.map(i => {
+      const col = (points[i].lon - ox) / rx - half;
+      const row = (points[i].lat - oy) / ry - half;
+      return {
+        col: Math.min(Math.max(col, 0), width - 1),
+        row: Math.min(Math.max(row, 0), height - 1)
+      };
+    });
+
+    // Load every block the four corners need (once each).
+    const needed = new Set();
+    for (const { col, row } of pos) {
+      const c0 = Math.floor(col), r0 = Math.floor(row);
+      for (const c of [c0, Math.min(c0 + 1, width - 1)]) {
+        for (const r of [r0, Math.min(r0 + 1, height - 1)]) {
+          needed.add(`${Math.floor(c / blockW)}|${Math.floor(r / blockH)}`);
+        }
       }
     }
-
-    if (progressCallback) {
-      progressCallback(100, `Elevation data complete (${results.length} points)`);
+    for (const b of needed) {
+      const key = `${tile.name}|${b}`;
+      if (blockCache.has(key)) { cacheBlock(key, blockCache.get(key)); continue; }
+      const [bx, by] = b.split('|').map(Number);
+      const x0 = bx * blockW, y0 = by * blockH;
+      const x1 = Math.min(x0 + blockW, width), y1 = Math.min(y0 + blockH, height);
+      const rasters = await image.readRasters({ window: [x0, y0, x1, y1], samples: [0] });
+      cacheBlock(key, { data: rasters[0], x0, y0, w: x1 - x0 });
     }
 
-    return results;
+    const valueAt = (c, r) => {
+      const block = blockCache.get(`${tile.name}|${Math.floor(c / blockW)}|${Math.floor(r / blockH)}`);
+      const v = block.data[(r - block.y0) * block.w + (c - block.x0)];
+      if (!Number.isFinite(v) || v <= NO_DATA_BELOW || (noData !== null && v === noData)) return null;
+      return v;
+    };
 
+    pos.forEach(({ col, row }, k) => {
+      const c0 = Math.floor(col), r0 = Math.floor(row);
+      const c1 = Math.min(c0 + 1, width - 1), r1 = Math.min(r0 + 1, height - 1);
+      const fx = col - c0, fy = row - r0;
+      const corners = [
+        [valueAt(c0, r0), (1 - fx) * (1 - fy)],
+        [valueAt(c1, r0), fx * (1 - fy)],
+        [valueAt(c0, r1), (1 - fx) * fy],
+        [valueAt(c1, r1), fx * fy]
+      ];
+      // No-data corners are left out (weights renormalised); none valid -> 0.
+      let sum = 0, weight = 0;
+      for (const [v, w] of corners) if (v !== null) { sum += v * w; weight += w; }
+      const anyValid = corners.some(([v]) => v !== null);
+      out[indices[k]] = weight > 1e-12 ? sum / weight
+        : anyValid ? corners.find(([v]) => v !== null)[0] : 0;
+    });
+  } finally {
+    try { tiff.close(); } catch { /* ignore */ }
+  }
+}
+
+/**
+ * Elevations for an array of points.
+ *
+ * Never throws: if the data cannot be had, every point gets elevation 0 and
+ * the returned array has degraded = true and degradedReason, which the
+ * geometry step turns into a serious problem.
+ *
+ * @param {Array<{lat: number, lon: number}>} points
+ * @param {Function} progressCallback - optional (percent, message)
+ * @returns {Promise<Array<{lat: number, lon: number, elevation: number}>>}
+ */
+export async function fetchElevations(points, progressCallback = null) {
+  if (!points || points.length === 0) return [];
+
+  const report = (pct, msg) => { if (progressCallback) progressCallback(pct, msg); };
+  try {
+    await loadGeotiff(); // fail fast (before any download) if it is not installed
+    // Group the points by tile.
+    const byTile = new Map();
+    points.forEach((p, i) => {
+      const tile = tileFor(p.lat, p.lon);
+      if (!byTile.has(tile.name)) byTile.set(tile.name, { tile, indices: [] });
+      byTile.get(tile.name).indices.push(i);
+    });
+
+    report(0, `Reading elevations for ${points.length} points from ${byTile.size} elevation tile(s)`);
+    const elevations = new Array(points.length).fill(0);
+    let done = 0;
+    for (const { tile, indices } of byTile.values()) {
+      await sampleTile(tile, points, indices, elevations,
+        (pct, msg) => report(Math.round((done / byTile.size) * 90), msg));
+      done++;
+      report(Math.round((done / byTile.size) * 90), `Elevation tile ${shortName(tile)} read`);
+    }
+    report(100, `Elevation data complete (${points.length} points)`);
+    return points.map((p, i) => ({ lat: p.lat, lon: p.lon, elevation: elevations[i] }));
   } catch (error) {
-    console.error('Elevation fetch failed:', error.message);
-
-    // Graceful degradation: return all points with elevation = 0
-    if (progressCallback) {
-      progressCallback(100, 'Elevation service unavailable - using elevation = 0');
-    }
-
-    // This never throws, so a caller wrapping fetchElevations in try/catch to
-    // detect failure will never see one - degraded/degradedReason on the
-    // returned array (not a shape change; arrays are objects) is how a
-    // caller can tell "succeeded with real data" from "silently zeroed out"
-    // and warn the user instead of shipping a CSV that's quietly wrong.
-    const fallback = points.map(p => ({
-      lat: p.lat,
-      lon: p.lon,
-      elevation: 0
-    }));
+    console.error('[Elevation] Failed:', error.message);
+    report(100, 'Elevation data unavailable - using elevation = 0');
+    const fallback = points.map(p => ({ lat: p.lat, lon: p.lon, elevation: 0 }));
     fallback.degraded = true;
     fallback.degradedReason = error.message;
     return fallback;
   }
 }
 
-/**
- * Fetch elevations for points in batches (max BATCH_SIZE per request).
- * Internal function used by fetchElevations.
- * 
- * @param {Array<{lat: number, lon: number}>} points - Points to query
- * @param {Function} progressCallback - Optional progress callback
- * @returns {Promise<Array<{lat: number, lon: number, elevation: number}>>}
- */
-async function fetchElevationsBatched(points, progressCallback = null) {
-  const results = [];
-  const totalBatches = Math.ceil(points.length / BATCH_SIZE);
-
-  for (let batchIdx = 0; batchIdx < totalBatches; batchIdx++) {
-    const start = batchIdx * BATCH_SIZE;
-    const end = Math.min(start + BATCH_SIZE, points.length);
-    const batch = points.slice(start, end);
-
-    if (progressCallback) {
-      const percent = Math.round((batchIdx / totalBatches) * 70); // 0-70% range
-      progressCallback(percent, `Querying elevation batch ${batchIdx + 1}/${totalBatches} (${batch.length} points)`);
-    }
-
-    // Circuit breaker: if a previous batch (this segment or an earlier one)
-    // already exhausted its retries recently, don't repeat the full
-    // timeout+retry dance - skip straight to degraded for this batch too.
-    if (circuitOpenedAt !== null) {
-      const elapsed = elevationDeps.now() - circuitOpenedAt;
-      if (elapsed < CIRCUIT_COOLDOWN_MS) {
-        throw new Error(
-          `Elevation service circuit open (failed ${Math.round(elapsed / 1000)}s ago, ` +
-          `re-probing after ${Math.round(CIRCUIT_COOLDOWN_MS / 1000)}s) - skipping retries`
-        );
-      }
-      // Cooldown elapsed - let this batch through as a probe. It closes the
-      // circuit on success or reopens it (with a fresh timestamp) below.
-    }
-
-    // Query batch with retries
-    let batchResults = null;
-    let lastError = null;
-
-    for (let retry = 0; retry <= MAX_RETRIES; retry++) {
-      try {
-        batchResults = await queryElevationBatch(batch);
-        break; // Success - exit retry loop
-      } catch (error) {
-        lastError = error;
-        if (retry < MAX_RETRIES) {
-          // Wait before retry: exponential backoff, much longer after a
-          // 429 "too many requests" (see RATE_LIMIT_BACKOFF_MS).
-          const delayMs = retryDelayMs(error, retry);
-          if (error.status === 429) {
-            console.warn(`[Elevation] Service is rate limiting (HTTP 429); waiting ${Math.round(delayMs / 1000)}s before retry ${retry + 1} of ${MAX_RETRIES}`);
-            if (progressCallback) progressCallback(Math.round((batchIdx / totalBatches) * 70), `Elevation service busy (rate limited); waiting ${Math.round(delayMs / 1000)} s before trying again`);
-          }
-          await elevationDeps.sleep(delayMs);
-        }
-      }
-    }
-
-    if (!batchResults) {
-      // All retries failed - open the circuit so later batches/segments in
-      // this process skip straight to degraded instead of repeating this.
-      circuitOpenedAt = elevationDeps.now();
-      throw new Error(`Elevation batch ${batchIdx + 1} failed after ${MAX_RETRIES} retries: ${lastError.message}`);
-    }
-
-    circuitOpenedAt = null; // Success - service is up, close the circuit
-    results.push(...batchResults);
-  }
-
-  return results;
-}
-
-/**
- * Query elevation for a single batch of points from Open-Elevation API.
- * 
- * @param {Array<{lat: number, lon: number}>} points - Points to query (max 100)
- * @returns {Promise<Array<{lat: number, lon: number, elevation: number}>>}
- */
-async function queryElevationBatch(points) {
-  if (points.length > BATCH_SIZE) {
-    throw new Error(`Batch size ${points.length} exceeds maximum ${BATCH_SIZE}`);
-  }
-
-  // Build request body
-  const locations = points.map(p => ({
-    latitude: p.lat,
-    longitude: p.lon
-  }));
-
-  const requestBody = JSON.stringify({ locations });
-
-  // Pace requests: at most one per MIN_REQUEST_INTERVAL_MS (public service).
-  const wait = lastRequestAt + MIN_REQUEST_INTERVAL_MS - elevationDeps.now();
-  if (wait > 0) await elevationDeps.sleep(wait);
-  lastRequestAt = elevationDeps.now();
-
-  // Send POST request
-  const response = await elevationDeps.fetch(OPEN_ELEVATION_URL, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'Accept': 'application/json'
-    },
-    body: requestBody,
-    socketTimeout: REQUEST_TIMEOUT_MS
-  });
-
-  if (!response.ok) {
-    const error = new Error(
-      response.status === 429
-        ? 'Open-Elevation API returned 429 (too many requests: the public elevation service is busy or rate limiting)'
-        : `Open-Elevation API returned ${response.status}${response.statusText ? ': ' + response.statusText : ''}`
-    );
-    error.status = response.status;
-    const headers = response.headers || {};
-    error.retryAfterMs = parseRetryAfter(headers['retry-after'], elevationDeps.now());
-    throw error;
-  }
-
-  const data = await response.json();
-
-  if (!data.results || !Array.isArray(data.results)) {
-    throw new Error('Invalid response format from Open-Elevation API');
-  }
-
-  // Extract elevations
-  const results = [];
-  for (let i = 0; i < points.length; i++) {
-    const result = data.results[i];
-    results.push({
-      lat: points[i].lat,
-      lon: points[i].lon,
-      elevation: result?.elevation ?? 0
-    });
-  }
-
-  return results;
-}
-
-/**
- * Interpolate elevation for an intermediate point between two sample points.
- * Uses linear interpolation based on array index position.
- * 
- * @param {number} targetIdx - Index of point needing elevation
- * @param {Array<number>} sampleIndices - Array of sample point indices (sorted)
- * @param {Map<number, number>} elevationMap - Map of index → elevation for samples
- * @returns {number} Interpolated elevation
- */
-function interpolateElevation(targetIdx, sampleIndices, elevationMap) {
-  // Find surrounding sample points
-  let lowerIdx = sampleIndices[0];
-  let upperIdx = sampleIndices[sampleIndices.length - 1];
-
-  for (let i = 0; i < sampleIndices.length - 1; i++) {
-    if (sampleIndices[i] <= targetIdx && sampleIndices[i + 1] >= targetIdx) {
-      lowerIdx = sampleIndices[i];
-      upperIdx = sampleIndices[i + 1];
-      break;
-    }
-  }
-
-  const lowerElev = elevationMap.get(lowerIdx) ?? 0;
-  const upperElev = elevationMap.get(upperIdx) ?? 0;
-
-  if (lowerIdx === upperIdx) {
-    return lowerElev;
-  }
-
-  // Linear interpolation by index position
-  const fraction = (targetIdx - lowerIdx) / (upperIdx - lowerIdx);
-  return lowerElev + fraction * (upperElev - lowerElev);
-}
-
-/**
- * Batch elevation fetching with configurable stride.
- * Allows caller to customize sub-sampling rate.
- * 
- * @param {Array<{lat: number, lon: number}>} points - Points to query
- * @param {number} stride - Sample every Nth point
- * @param {Function} progressCallback - Optional progress callback
- * @returns {Promise<Array<{lat: number, lon: number, elevation: number}>>}
- */
-export async function fetchElevationsWithStride(points, stride, progressCallback = null) {
-  const originalStride = ELEV_STRIDE;
-  
-  try {
-    // Temporarily override stride (not ideal, but works for single-threaded JS)
-    Object.defineProperty(globalThis, '_ELEV_STRIDE_OVERRIDE', { value: stride, configurable: true });
-    
-    // Use modified stride
-    return await fetchElevations(points, progressCallback);
-    
-  } finally {
-    // Restore original stride
-    delete globalThis._ELEV_STRIDE_OVERRIDE;
-  }
-}
-
-/**
- * Check if Open-Elevation API is available.
- * Sends a minimal test request to verify connectivity.
- * 
- * @returns {Promise<boolean>} True if API is available
- */
-export async function checkElevationServiceAvailable() {
-  try {
-    const testPoint = [{ latitude: 45.0, longitude: 9.0 }];
-    const response = await ipv4Fetch(OPEN_ELEVATION_URL, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Accept': 'application/json'
-      },
-      body: JSON.stringify({ locations: testPoint }),
-      socketTimeout: 5000 // 5 second timeout for health check
-    });
-
-    return response.ok;
-  } catch (error) {
-    return false;
-  }
-}
-
-export default {
-  fetchElevations,
-  fetchElevationsWithStride,
-  checkElevationServiceAvailable,
-  BATCH_SIZE,
-  ELEV_STRIDE,
-  REQUEST_TIMEOUT_MS
-};
+export default { fetchElevations, tileFor, cacheDir };

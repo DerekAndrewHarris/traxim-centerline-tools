@@ -128,7 +128,7 @@ Add to `Traxim-Live-Control-Interface-for-Web/.env`:
 TEMP_FILES_DIR=/var/traxim-temp-files
 SESSION_EXPIRY_HOURS=24
 OVERPASS_API_URL=https://overpass-api.de/api/interpreter
-ELEVATION_API_URL=https://api.open-elevation.com/api/v1/lookup
+ELEVATION_CACHE_DIR=/var/lib/traxim-elevation   # Copernicus DEM tile cache (see backend/services/elevation.js)
 OSM_NOMINATIM_URL=https://nominatim.openstreetmap.org/search
 ```
 

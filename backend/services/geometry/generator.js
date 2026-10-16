@@ -378,11 +378,11 @@ export async function generateGeometryForSegment(segmentLabel, segmentBbox, outp
       // failure, so this try/catch alone would never see it - check the flag
       // explicitly rather than silently shipping a CSV that's quietly all 0s.
       if (elevResults.degraded) {
-        warnings.push(`Elevation service unavailable (${elevResults.degradedReason}). Altitudes set to 0.`);
+        warnings.push(`Elevation data unavailable (${elevResults.degradedReason}). Altitudes set to 0.`);
         elevation = { ok: false, reason: elevResults.degradedReason };
       } else if (elevResults.length > 0 && elevResults.every(r => r.elevation === 0)) {
         // Backstop: a whole route at exactly 0 m is not real data.
-        elevation = { ok: false, reason: 'the elevation service returned 0 m for every point' };
+        elevation = { ok: false, reason: 'the elevation data gave 0 m for every point (all sea, or no data)' };
       }
 
       // Ground-surface DEM data is wrong inside tunnels/on bridges — override
@@ -677,10 +677,10 @@ async function generateAlternativeGeometry(segmentLabel, alternative, altNumber,
     const elevPts = processedPoints.map(pt => ({ lat: pt.latitude, lon: pt.longitude }));
     const elevResults = await fetchElevations(elevPts);
     if (elevResults.degraded) {
-      warnings.push(`${altLabel}: elevation service unavailable (${elevResults.degradedReason}). Altitudes set to 0.`);
+      warnings.push(`${altLabel}: elevation data unavailable (${elevResults.degradedReason}). Altitudes set to 0.`);
       elevation = { ok: false, reason: elevResults.degradedReason };
     } else if (elevResults.length > 0 && elevResults.every(r => r.elevation === 0)) {
-      elevation = { ok: false, reason: 'the elevation service returned 0 m for every point' };
+      elevation = { ok: false, reason: 'the elevation data gave 0 m for every point (all sea, or no data)' };
     }
     for (let i = 0; i < processedPoints.length; i++) {
       processedPoints[i].altitude = elevResults[i].elevation;

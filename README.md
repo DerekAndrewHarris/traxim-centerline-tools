@@ -39,7 +39,7 @@ The backend provides a REST API for automation (agents), while the frontend offe
 - ✅ CSV writer (Traxim format)
 - ✅ Job queue integration (background processing with progress tracking)
 - ✅ Geometry API routes (POST /geometry/generate, GET /geometry/jobs/:jobId)
-- ✅ Elevation service integration (Open-Elevation API with sub-sampling and interpolation)
+- ✅ Elevation from self-hosted Copernicus DEM GLO-30 tiles (downloaded once, cached in ELEVATION_CACHE_DIR, bilinear interpolation)
 
 **Infrastructure Generation (Completed):**
 - ✅ Topology adjacency graph construction

@@ -44,7 +44,7 @@ const SECTIONS = [
 ];
 
 let infraNodeCount = 120;
-let elevationAvailable = true;   // false: the stand-in geometry has no elevation data (as with HTTP 429)
+let elevationAvailable = true;   // false: the stand-in geometry has no elevation data (an elevation tile could not be downloaded)
 let lastGeometryData = null;     // what the combined job passed to the geometry step
 
 function geometryCsv(name) {
@@ -77,7 +77,7 @@ function installStandIns() {
       fs.writeFileSync(path.join(dir, `${file}_topology.json`), '{}');
       results.push({
         section: seg.label, lengthKm: 12.345, pointCount: 500, alternativeCount: 0, warnings: ['a geometry warning'],
-        elevation: elevationAvailable ? { ok: true, reason: null } : { ok: false, reason: 'Elevation batch 1 failed after 2 retries: Open-Elevation API returned 429 (too many requests)' },
+        elevation: elevationAvailable ? { ok: true, reason: null } : { ok: false, reason: 'elevation tile N44 E009 could not be downloaded (HTTP 503)' },
         alternativeElevation: [],
         smoothing: { adjustedCount: 3, maxAdjustmentM: 1.26 }
       });
@@ -661,8 +661,8 @@ test('no elevation data: completed_with_problems, the problem first and in full,
   assert.equal(status.serious_problems.length, 1);
   assert.match(status.serious_problems[0], /^Geometry: no elevation data, all altitudes are 0, so the geometry files cannot be used as they are/);
   assert.match(status.serious_problems[0], /Infrastructure, Regions, Speedboards and the KMZ do not use elevation and are not affected/);
-  assert.match(status.serious_problems[0], /429/);
-  assert.match(status.serious_problems[0], /Wait 15-30 minutes/);
+  assert.match(status.serious_problems[0], /N44 E009/);
+  assert.match(status.serious_problems[0], /Try generating the files again in a few minutes/);
   assert.match(status.serious_problems_note, /Tell the user about each of these first/);
   assert.equal(status.summary.routes[0].elevation_data, false);
   assert.ok(status.outputs.length > 0, 'the files are still listed (the user may want to look at them)');
