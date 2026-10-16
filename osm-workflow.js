@@ -59,7 +59,8 @@ const state = {
     pins: {},           // waypointId -> {lat, lon} for map-clicked waypoints
     pinMarkers: {},      // waypointId -> Leaflet marker for map-clicked waypoints
     pickingWaypointId: null, // waypointId currently armed for a map click, or null
-    outputStamp: null,   // date stamp of the last geometry run, for download names
+    outputStamp: null,   // date stamp of the last geometry run (geometry, Regions, KMZ names)
+    infrastructureStamp: null, // date stamp of the last infrastructure run (its own, every run)
     seriousProblems: []  // problems that make the files unusable as they are
 };
 
@@ -68,8 +69,7 @@ const state = {
  * files: "Regions.csv" -> "Regions_2026-10-16_093012.csv". The stamp comes
  * from the server (one per geometry run, also used for Infrastructure).
  */
-function stampedFileName(name) {
-    const stamp = state.outputStamp;
+function stampedFileName(name, stamp = state.outputStamp) {
     if (!stamp || !/^\d{4}-\d{2}-\d{2}_\d{6}$/.test(stamp)) return name;
     const dot = name.lastIndexOf('.');
     return dot > 0 ? `${name.slice(0, dot)}_${stamp}${name.slice(dot)}` : `${name}_${stamp}`;
@@ -235,6 +235,7 @@ function resetWorkflowUI() {
     state.pinMarkers = {};
     state.pickingWaypointId = null;
     state.outputStamp = null;
+    state.infrastructureStamp = null;
     state.seriousProblems = [];
 
     // Waypoints list back to two empty rows
@@ -668,8 +669,8 @@ function renderGeocodedList(locations, pendingMsg) {
     locations.forEach((loc, index) => {
         html += `
             <div class="result-item" style="margin-bottom:12px;padding:8px;background:rgba(67,160,71,0.1);border-left:3px solid #43a047;border-radius:3px;">
-                <strong style="color:#43a047;">${index + 1}. ${loc.name}</strong><br>
-                <span style="font-size:11px;color:#ccc;display:block;margin-top:4px;">${loc.displayName}</span>
+                <strong style="color:#43a047;">${index + 1}. ${escapeHtml(loc.name)}</strong><br>
+                <span style="font-size:11px;color:#ccc;display:block;margin-top:4px;">${escapeHtml(loc.displayName)}</span>
             </div>`;
     });
     if (pendingMsg) {
@@ -696,7 +697,8 @@ function drawGeocodedLocations(locations) {
             fillOpacity: 0.8
         });
 
-        marker.bindPopup(`<strong>${loc.name}</strong><br>${loc.displayName}`);
+        // Names come from OpenStreetMap / the geocoder: escaped (popup is HTML).
+        marker.bindPopup(`<strong>${escapeHtml(loc.name)}</strong><br>${escapeHtml(loc.displayName)}`);
         marker.addTo(mapLayers.geocoded);
 
         bounds.push([loc.lat, loc.lon]);
@@ -825,13 +827,13 @@ function displaySections(sections) {
             <div class="section-item ${isSelected ? 'selected' : ''}">
                 <label>
                     <input type="checkbox" class="section-checkbox" data-index="${index}" ${isSelected ? 'checked' : ''}>
-                    <strong>${section.name || 'Unnamed section'}</strong>
+                    <strong>${escapeHtml(section.name || 'Unnamed section')}</strong>
                 </label>
                 <div class="section-details">
-                    <span>Type: ${section.type || 'railway'}</span>
-                    ${section.operator ? ` | Operator: ${section.operator}` : ''}
-                    ${section.ref ? ` | Ref: ${section.ref}` : ''}
-                    <br><span class="osm-id">OSM ${section.osmType} ${section.osmId}</span>
+                    <span>Type: ${escapeHtml(section.type || 'railway')}</span>
+                    ${section.operator ? ` | Operator: ${escapeHtml(section.operator)}` : ''}
+                    ${section.ref ? ` | Ref: ${escapeHtml(section.ref)}` : ''}
+                    <br><span class="osm-id">OSM ${escapeHtml(section.osmType)} ${escapeHtml(section.osmId)}</span>
                 </div>
             </div>
         `;
@@ -920,7 +922,8 @@ function drawSections(sections) {
         (section.geometry || []).forEach(coords => {
             if (!coords || coords.length < 2) return;
             const poly = L.polyline(coords, { color, weight: 4, opacity: 0.85 });
-            poly.bindTooltip(name, { sticky: true });
+            // OSM names are not trusted HTML (Leaflet tooltips are HTML).
+            poly.bindTooltip(escapeHtml(name), { sticky: true });
             poly.addTo(group);
         });
 
@@ -961,7 +964,7 @@ async function fetchAndDrawOverlays() {
                 [[bbox.minLat, bbox.minLon], [bbox.maxLat, bbox.maxLon]],
                 { color: '#ff9800', weight: 1.5, fillOpacity: 0.03, dashArray: '4, 4' }
             );
-            rect.bindPopup(`<strong>Corridor</strong><br>${name}`);
+            rect.bindPopup(`<strong>Corridor</strong><br>${escapeHtml(name)}`);
             rect.addTo(mapLayers.sections);
         });
 
@@ -980,7 +983,7 @@ async function fetchAndDrawOverlays() {
                 opacity: line.isAlt ? 0.85 : 0.9,
                 dashArray: line.isAlt ? '4, 4' : null
             });
-            poly.bindPopup(`<strong>${line.label}</strong><br>${line.coords.length} points`);
+            poly.bindPopup(`<strong>${escapeHtml(line.label)}</strong><br>${line.coords.length} points`);
             poly.addTo(mapLayers.geometry);
         });
 
@@ -993,9 +996,9 @@ async function fetchAndDrawOverlays() {
                 opacity: 0.5
             });
             const tagInfo = Object.entries(w.tags || {})
-                .map(([k, v]) => `${k}=${v}`)
+                .map(([k, v]) => `${escapeHtml(k)}=${escapeHtml(v)}`)
                 .join('<br>');
-            poly.bindPopup(`<strong>Way ${w.id}</strong><br>${tagInfo || 'no tags'}`);
+            poly.bindPopup(`<strong>Way ${escapeHtml(w.id)}</strong><br>${tagInfo || 'no tags'}`);
             poly.addTo(mapLayers.topology);
         });
 
@@ -1218,7 +1221,7 @@ function displayGeometryResults(result) {
             const altNote = r.alternativeCount > 0
                 ? ` <span style="color:#aaa;font-size:0.9em;">+ ${r.alternativeCount} alt route${r.alternativeCount > 1 ? 's' : ''}</span>`
                 : '';
-            html += `<li>${r.section}: ${r.pointCount} points (${r.lengthKm.toFixed(2)} km)${altNote}</li>`;
+            html += `<li>${escapeHtml(r.section)}: ${r.pointCount} points (${r.lengthKm.toFixed(2)} km)${altNote}</li>`;
         }
         html += '</ul>';
     }
@@ -1227,7 +1230,7 @@ function displayGeometryResults(result) {
     if (failed.length > 0) {
         html += `<p class="warning"><strong>✗ Failed (${failed.length} section${failed.length > 1 ? 's' : ''}):</strong></p><ul>`;
         for (const r of failed) {
-            html += `<li class="error">${r.section}: ${r.error}</li>`;
+            html += `<li class="error">${escapeHtml(r.section)}: ${escapeHtml(r.error)}</li>`;
         }
         html += `<p style="color:#e57373;font-size:11px;">These sections produced no geometry file. ` +
                 `You can retry the whole process after a short break to allow OSM query limits to reset.</p>`;
@@ -1237,7 +1240,7 @@ function displayGeometryResults(result) {
     if (osmFailures.length > 0) {
         html += `<p class="warning" style="margin-top:10px"><strong>⚠ OSM query issues:</strong></p><ul>`;
         for (const f of osmFailures) {
-            html += `<li style="color:#ffb74d;font-size:11px;">${f.section}: ${f.warning}</li>`;
+            html += `<li style="color:#ffb74d;font-size:11px;">${escapeHtml(f.section)}: ${escapeHtml(f.warning)}</li>`;
         }
         html += `</ul><p style="color:#aaa;font-size:11px;">Some queries failed but the section was still generated using available data. ` +
                 `Geometry may be incomplete. If the result looks wrong, retry after a short break.</p>`;
@@ -1247,7 +1250,7 @@ function displayGeometryResults(result) {
     if (otherWarnings.length > 0) {
         html += `<p style="color:#aaa;margin-top:8px;font-size:11px;"><strong>Notes:</strong></p><ul>`;
         for (const w of otherWarnings) {
-            html += `<li style="color:#aaa;font-size:11px;">${w.section}: ${w.warning}</li>`;
+            html += `<li style="color:#aaa;font-size:11px;">${escapeHtml(w.section)}: ${escapeHtml(w.warning)}</li>`;
         }
         html += '</ul>';
     }
@@ -1255,7 +1258,7 @@ function displayGeometryResults(result) {
     // ── Regions.csv defaults notice ───────────────────────────────────────
     if (result.regionsWarning) {
         html += `<p class="warning" style="margin-top:10px"><strong>⚠ Regions.csv:</strong></p>` +
-                `<p style="color:#ffb74d;font-size:11px;">${result.regionsWarning}</p>`;
+                `<p style="color:#ffb74d;font-size:11px;">${escapeHtml(result.regionsWarning)}</p>`;
     }
 
     if (!html) {
@@ -1334,7 +1337,8 @@ async function downloadGeometryKml() {
         for (const [filename, file] of Object.entries(zip.files)) {
             if (filename.endsWith('.csv') && !filename.includes('wayids')) {
                 const csvContent = await file.async('text');
-                const sectionName = filename.replace('.csv', '').replace(/_/g, ' ');
+                // The geometry ZIP has a Geometry/ folder: name the route after the file only.
+                const sectionName = filename.split('/').pop().replace('.csv', '').replace(/_/g, ' ');
                 
                 // Use IOFunctions to parse CSV (same as original tool)
                 const points = IOFunctions.readCsvLatLongCharlotte(csvContent);
@@ -1423,7 +1427,8 @@ async function downloadGeometryBoth() {
         for (const [filename, file] of Object.entries(zip.files)) {
             if (filename.endsWith('.csv') && !filename.includes('wayids')) {
                 const csvContent = await file.async('text');
-                const sectionName = filename.replace('.csv', '').replace(/_/g, ' ');
+                // The geometry ZIP has a Geometry/ folder: name the route after the file only.
+                const sectionName = filename.split('/').pop().replace('.csv', '').replace(/_/g, ' ');
                 const points = IOFunctions.readCsvLatLongCharlotte(csvContent);
                 
                 if (points.length > 0) {
@@ -1566,7 +1571,7 @@ async function pollInfrastructureJob() {
         if (job.status === 'completed') {
             // Job complete
             document.getElementById('progressInfrastructure').style.display = 'none';
-            if (job.result && job.result.outputStamp) state.outputStamp = job.result.outputStamp;
+            state.infrastructureStamp = (job.result && job.result.infrastructureStamp) || null;
             displayInfrastructureResults(job.result);
             
             // Enable download
@@ -1613,13 +1618,13 @@ function displayInfrastructureResults(result) {
     html += `<ul>`;
     html += `<li>Nodes: ${result.nodeCount}</li>`;
     html += `<li>Connections: ${result.connectionCount}</li>`;
-    html += `<li>File: ${result.fileName}</li>`;
+    html += `<li>File: ${escapeHtml(stampedFileName('Infrastructure.csv', state.infrastructureStamp))}</li>`;
     html += `</ul>`;
 
     if (result.warnings && result.warnings.length > 0) {
         html += '<p><strong>Warnings:</strong></p><ul>';
         result.warnings.slice(0, 5).forEach(w => {
-            html += `<li class="warning">${w}</li>`;
+            html += `<li class="warning">${escapeHtml(w)}</li>`;
         });
         if (result.warnings.length > 5) {
             html += `<li class="warning">... and ${result.warnings.length - 5} more warnings</li>`;
@@ -1640,7 +1645,7 @@ function updateDownloadSummary() {
     // The geometry's serious problems apply to the whole set of files.
     summaryDiv.innerHTML = seriousProblemsHtml(state.seriousProblems) + `
         <p class="success"><strong>Infrastructure file generated successfully.</strong></p>
-        <p>Click below to download${state.outputStamp ? ` (${escapeHtml(stampedFileName('Infrastructure.csv'))}; the date and time in the name match the geometry files of this run)` : ''}.</p>
+        <p>Click below to download${state.infrastructureStamp ? ` (${escapeHtml(stampedFileName('Infrastructure.csv', state.infrastructureStamp))}: the date and time in the name are when this Infrastructure file was generated; the geometry, Regions and KMZ files it was built from carry ${escapeHtml(state.outputStamp || 'their own stamp')})` : ''}.</p>
     `;
 }
 
@@ -1666,7 +1671,7 @@ async function downloadAllFiles() {
         const url = window.URL.createObjectURL(blob);
         const a = document.createElement('a');
         a.href = url;
-        a.download = stampedFileName('Infrastructure.csv');
+        a.download = stampedFileName('Infrastructure.csv', state.infrastructureStamp);
         document.body.appendChild(a);
         a.click();
         window.URL.revokeObjectURL(url);
@@ -1853,17 +1858,16 @@ function renderAgentSessionView(sessionId, view) {
     const canChoose = view.state === 'awaiting_confirmation' && sections.length > 0;
 
     // Waypoints
-    // Escaped here because drawGeocodedLocations puts them into popup HTML.
+    // drawGeocodedLocations and drawSections escape the names themselves.
     state.geocodedLocations = (map.waypoints || []).map(w => ({
-        name: escapeHtml(w.name), lat: w.lat, lon: w.lon, displayName: escapeHtml(w.display_name || w.name)
+        name: w.name, lat: w.lat, lon: w.lon, displayName: w.display_name || w.name
     }));
     if (state.geocodedLocations.length > 0) drawGeocodedLocations(state.geocodedLocations);
 
     // Search boxes and candidate sections. Before a choice: all ticked and
     // drawn, as in the normal workflow; after: the chosen ones only.
-    // Names escaped: drawSections puts them into the hover tooltips (HTML).
     state.searchBboxes = map.search_bboxes || [];
-    state.availableSections = (map.sections || []).map(s => ({ ...s, name: escapeHtml(s.name) }));
+    state.availableSections = map.sections || [];
     state.selectedSections = chosen.length > 0
         ? chosen.map(n => n - 1)
         : state.availableSections.map((_, i) => i);
