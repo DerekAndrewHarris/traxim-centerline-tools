@@ -200,3 +200,57 @@ test('a route starting at a tunnel portal (possible ground height) keeps the gro
   assert.deepEqual(warnings, []);
   assert.equal(elevations[0].elevation, 60);
 });
+
+// ── Main routes: the join with the previous segment (Derek, 17 Oct 2026) ─────
+
+const { correctRouteElevations } = await import('../backend/services/geometry/generator.js');
+
+/** The previous segment's finished route, ending (with its overshoot) around the start of this one. */
+function previousSegment(elevation) {
+  const pts = [];
+  for (let m = -1500; m <= 1000; m += 25) pts.push({ lat: LAT + 3 / 110540, lon: 9.76 + m / M_PER_DEG_LON, elevation });
+  return { label: 'Previous segment', points: pts };
+}
+
+function mainRoute(profiles, groundFn, intervals = []) {
+  const elevations = chainage.map(m => ({ elevation: groundFn(m) }));
+  const { anchors, warnings } = correctRouteElevations({
+    elevations, points: coords, refCoords: coords, refChainageM: chainage,
+    tunnelIntervals: intervals, bridgeIntervals: [], profiles, routeLabel: 'This segment'
+  });
+  const raw = elevations.map(e => e.elevation);
+  const result = applyGradientEnvelopeSmoothing(raw, chainage, DEFAULT_RULING_GRADIENT, [], anchors);
+  return { raw, ...result, anchors, warnings };
+}
+
+test('main route: its start takes the height of the previous segment there, so the join matches', () => {
+  // The elevation data gives 26 m at the shared station; the previous segment's finished line is at 12 m there.
+  const r = mainRoute([previousSegment(12)], m => 26 + m * 0.002);
+  assert.deepEqual(r.anchors, [{ index: 0, elevation: 12 }]);
+  assert.equal(r.smoothed[0], 12, 'join height = previous segment');
+  assert.ok(maxGradient(r.smoothed) <= DEFAULT_RULING_GRADIENT + 1e-9);
+  // Beyond the gradient reach of the 14 m correction (14 / 0.025 = 560 m) the profile is unchanged.
+  for (let i = 0; i < N; i++) if (chainage[i] > 600) assert.ok(Math.abs(r.smoothed[i] - r.raw[i]) < 0.01);
+  assert.deepEqual(r.warnings, [], 'a 14 m difference is within the normal error of the data');
+});
+
+test('main route: start inside a tunnel takes the previous segment height and the tunnel line starts from it', () => {
+  const r = mainRoute([previousSegment(TRUE_START)], groundAt, tunnel);
+  assert.equal(r.raw[0], TRUE_START);
+  assert.ok(r.raw[Math.round(PORTAL_M / 2 / SPACING_M)] < 40, 'mid-tunnel near the real level, not the hillside');
+  assert.equal(r.smoothed[0], TRUE_START);
+  assert.ok(r.warnings.some(w => /^Elevation anchor: This segment starts inside a tunnel/.test(w)));
+});
+
+test('main route: a join more than 50 m from the ground height is flagged', () => {
+  const r = mainRoute([previousSegment(12)], () => 90);
+  assert.equal(r.smoothed[0], 12);
+  assert.equal(r.warnings.length, 1);
+  assert.match(r.warnings[0], /^ELEVATION CHECK: This segment: where it starts it meets Previous segment/);
+});
+
+test('main route: first segment (no earlier routes) is unchanged', () => {
+  const r = mainRoute([], m => 26 + m * 0.002);
+  assert.deepEqual(r.anchors, []);
+  assert.equal(r.raw[0], 26);
+});

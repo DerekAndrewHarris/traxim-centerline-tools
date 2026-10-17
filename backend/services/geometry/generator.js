@@ -372,6 +372,7 @@ export async function generateGeometryForSegment(segmentLabel, segmentBbox, outp
     if (progressCallback) progressCallback(60, `Resampled to ${finalPoints.length} points`);
 
     // ── 7. Elevation fetch (60-70%) ───────────────────────────────────────────
+    let mainAnchors = [];   // ends joined to an earlier segment's route (see below)
     if (progressCallback) progressCallback(60, 'Fetching elevation data...');
 
     try {
@@ -391,13 +392,18 @@ export async function generateGeometryForSegment(segmentLabel, segmentBbox, outp
         elevation = { ok: false, reason: 'the elevation data gave 0 m for every point (all sea, or no data)' };
       }
 
-      // Ground-surface DEM data is wrong inside tunnels/on bridges — override
-      // with a straight-line interpolation between portal elevations for any
-      // point falling in a tunnel/bridge interval (see processor.js).
-      if (tunnelIntervals.length > 0 || bridgeIntervals.length > 0) {
-        const finalChainageM = mapPointsToChainage(elevPts, rawCoords, rawChainageM);
-        applyPortalElevationInterpolation(elevResults, finalChainageM, tunnelIntervals);
-        applyPortalElevationInterpolation(elevResults, finalChainageM, bridgeIntervals);
+      // Ends that join an earlier segment's route take their height from it,
+      // then the tunnel/bridge straight lines (see correctRouteElevations).
+      const corrected = correctRouteElevations({
+        elevations: elevResults, points: elevPts, refCoords: rawCoords, refChainageM: rawChainageM,
+        tunnelIntervals, bridgeIntervals, elevationOk: elevation.ok,
+        profiles: Array.isArray(options.priorProfiles) ? options.priorProfiles : [],
+        routeLabel: segmentLabel, rulingGradient
+      });
+      mainAnchors = corrected.anchors;
+      warnings.push(...corrected.warnings);
+      if (mainAnchors.length > 0) {
+        console.log(`[Geometry Generator] Main route ends anchored: ${mainAnchors.map(a => `point ${a.index} = ${a.elevation.toFixed(1)} m`).join(', ')}`);
       }
 
       for (let i = 0; i < finalPoints.length; i++) {
@@ -433,8 +439,9 @@ export async function generateGeometryForSegment(segmentLabel, segmentBbox, outp
     {
       const rawAltitudes = finalPoints.map(pt => pt.altitude);
       const chainageMetres = finalPoints.map(pt => pt.chainage * 1000);
-      const { smoothed, adjustedCount, maxAdjustmentM } =
-        applyGradientEnvelopeSmoothing(rawAltitudes, chainageMetres, rulingGradient);
+      const { smoothed, adjustedCount, maxAdjustmentM, anchorConflict } =
+        applyGradientEnvelopeSmoothing(rawAltitudes, chainageMetres, rulingGradient, [], mainAnchors);
+      if (anchorConflict) warnings.push(anchorConflictWarning(segmentLabel, rulingGradient));
       smoothing = { adjustedCount, maxAdjustmentM };
       for (let i = 0; i < finalPoints.length; i++) {
         finalPoints[i].rawAltitude = rawAltitudes[i];
@@ -717,25 +724,13 @@ async function generateAlternativeGeometry(segmentLabel, alternative, altNumber,
     } else if (elevResults.length > 0 && elevResults.every(r => r.elevation === 0)) {
       elevation = { ok: false, reason: 'the elevation data gave 0 m for every point (all sea, or no data)' };
     }
-    // Ends first (October 2026): where the route meets an already-worked-out
-    // route its height there comes from that route, and an end inside a
-    // tunnel or on a bridge must not use the ground height - see
-    // anchorRouteEnds. The tunnel/bridge straight lines then start from these.
-    if (elevation.ok) {
-      const finalChainageM = altRawChainageM
-        ? mapPointsToChainage(elevPts, alternative.coords, altRawChainageM)
-        : elevPts.map(() => -1);
-      const ends = anchorRouteEnds({
-        elevations: elevResults, coords: elevPts, pointChainageM: finalChainageM,
-        intervals: [...tunnelIntervals, ...bridgeIntervals], profiles, routeLabel: altLabel, rulingGradient
-      });
-      anchors = ends.anchors;
-      warnings.push(...ends.warnings);
-      if (tunnelIntervals.length > 0 || bridgeIntervals.length > 0) {
-        applyPortalElevationInterpolation(elevResults, finalChainageM, tunnelIntervals);
-        applyPortalElevationInterpolation(elevResults, finalChainageM, bridgeIntervals);
-      }
-    }
+    // Ends first, then the tunnel/bridge straight lines (see correctRouteElevations).
+    const corrected = correctRouteElevations({
+      elevations: elevResults, points: elevPts, refCoords: alternative.coords, refChainageM: altRawChainageM,
+      tunnelIntervals, bridgeIntervals, elevationOk: elevation.ok, profiles, routeLabel: altLabel, rulingGradient
+    });
+    anchors = corrected.anchors;
+    warnings.push(...corrected.warnings);
     for (let i = 0; i < processedPoints.length; i++) {
       processedPoints[i].altitude = elevResults[i].elevation;
     }
@@ -761,11 +756,7 @@ async function generateAlternativeGeometry(segmentLabel, alternative, altNumber,
     const chainageMetres = processedPoints.map(pt => pt.chainage * 1000);
     const { smoothed, adjustedCount, maxAdjustmentM, anchorConflict } =
       applyGradientEnvelopeSmoothing(rawAltitudes, chainageMetres, rulingGradient, [], anchors);
-    if (anchorConflict) {
-      warnings.push(`ELEVATION CHECK: ${altLabel}: the heights of the routes it meets at its two ends differ by more than a ` +
-        `${formatGradientPercent(rulingGradient)}% gradient allows over its length, so its profile cannot keep to that gradient ` +
-        `everywhere; check the elevation profiles of this route and the routes it joins.`);
-    }
+    if (anchorConflict) warnings.push(anchorConflictWarning(altLabel, rulingGradient));
     for (let i = 0; i < processedPoints.length; i++) {
       processedPoints[i].rawAltitude = rawAltitudes[i];
       processedPoints[i].altitude = smoothed[i];
@@ -798,6 +789,48 @@ async function generateAlternativeGeometry(segmentLabel, alternative, altNumber,
 
   console.log(`[Geometry Generator] Wrote alt route ${altNumber}: ${filePath} (${totalKm.toFixed(2)} km)`);
   return { filePath, label: altLabel, elevation, points: processedPoints };
+}
+
+/**
+ * The elevation corrections made before smoothing, for a main route or an
+ * alternative route (October 2026), in this order:
+ *  1. ends that meet an already-finished route profile take their height
+ *     from it (anchors for the smoothing), and an end inside a tunnel or on a
+ *     bridge does not use the ground height (see anchorRouteEnds in
+ *     processor.js) - only when real elevation data was obtained;
+ *  2. the tunnel/bridge straight lines between portals, which therefore
+ *     start from those end heights.
+ * Main routes: the profiles are the earlier segments' routes, so the join
+ * with the previous segment always matches (Derek, 17 Oct 2026).
+ *
+ * Mutates `elevations` (array of {elevation}).
+ *
+ * @returns {{anchors: Array<{index:number, elevation:number}>, warnings: string[]}}
+ */
+export function correctRouteElevations({ elevations, points, refCoords, refChainageM, tunnelIntervals = [], bridgeIntervals = [],
+  elevationOk = true, profiles = [], routeLabel, rulingGradient = DEFAULT_RULING_GRADIENT }) {
+  const pointChainageM = refCoords && refChainageM && refCoords.length >= 2
+    ? mapPointsToChainage(points, refCoords, refChainageM)
+    : points.map(() => -1);
+  let result = { anchors: [], warnings: [] };
+  if (elevationOk) {
+    result = anchorRouteEnds({
+      elevations, coords: points, pointChainageM, intervals: [...tunnelIntervals, ...bridgeIntervals],
+      profiles, routeLabel, rulingGradient
+    });
+  }
+  if (tunnelIntervals.length > 0 || bridgeIntervals.length > 0) {
+    applyPortalElevationInterpolation(elevations, pointChainageM, tunnelIntervals);
+    applyPortalElevationInterpolation(elevations, pointChainageM, bridgeIntervals);
+  }
+  return result;
+}
+
+/** The warning when a route's two joined ends are too far apart in height for the maximum gradient. */
+function anchorConflictWarning(label, rulingGradient) {
+  return `ELEVATION CHECK: ${label}: the heights of the routes it joins at its two ends differ by more than a ` +
+    `${formatGradientPercent(rulingGradient)}% gradient allows over its length, so its profile cannot keep to that gradient ` +
+    `everywhere; check the elevation profiles of this route and the routes it joins.`;
 }
 
 /** 0.04 -> "4", 0.033 -> "3.3" (for messages). */
