@@ -1902,13 +1902,39 @@ function rulingGradientAt(km, defaultGradient, zones) {
  * @param {number[]} rawElevations
  * @param {number[]} chainageM - Cumulative distance per point, metres (e.g. from buildCumulativeDistances)
  * @param {number} [defaultGradient] - Ruling gradient as a fraction (e.g. 0.025 for 2.5%); defaults to DEFAULT_RULING_GRADIENT
+ * Anchors (October 2026). The midpoint rule treats every point alike, so when
+ * the data is impossible along a whole route the error is shared out along
+ * it rather than removed: on La Spezia Centrale - Vezzano Ligure alt4 (17 Oct
+ * 2026) the raw profile started about 280 m too high (the hillside above the
+ * tunnel the route starts in); at 2.5% an error that size needs 11 km to die
+ * away, so the whole 4.4 km route became one 2.5% slope that still ended
+ * 86 m too high where it meets the main line at La Spezia Centrale. An
+ * anchor is a point whose height is KNOWN (e.g. where an alternative route
+ * meets a route whose profile has already been worked out): the result
+ * passes exactly through it and every other point is kept within the ruling
+ * gradient of it, so an error elsewhere cannot move it. Anchors at both ends
+ * hold a route at the right height at both ends. With no anchors the result
+ * is exactly as before.
+ *
+ * @param {number[]} rawElevations
+ * @param {number[]} chainageM - Cumulative distance per point, metres (e.g. from buildCumulativeDistances)
+ * @param {number} [defaultGradient] - Ruling gradient as a fraction (e.g. 0.025 for 2.5%); defaults to DEFAULT_RULING_GRADIENT
  * @param {Array<{startKm: number, endKm: number, maxGradientPercent: number}>} [zones] - Optional chainage-range overrides
- * @returns {{smoothed: number[], adjustedCount: number, maxAdjustmentM: number}}
+ * @param {Array<{index: number, elevation: number}>} [anchors] - points whose height is known
+ * @returns {{smoothed: number[], adjustedCount: number, maxAdjustmentM: number, anchorConflict: boolean}}
+ *   anchorConflict: two anchors differ in height by more than the ruling
+ *   gradient allows between them (the result cannot then keep to it everywhere)
  */
-export function applyGradientEnvelopeSmoothing(rawElevations, chainageM, defaultGradient = DEFAULT_RULING_GRADIENT, zones = []) {
+export function applyGradientEnvelopeSmoothing(rawElevations, chainageM, defaultGradient = DEFAULT_RULING_GRADIENT, zones = [], anchors = []) {
   const n = rawElevations.length;
-  if (n === 0) return { smoothed: [], adjustedCount: 0, maxAdjustmentM: 0 };
-  if (n === 1) return { smoothed: [rawElevations[0]], adjustedCount: 0, maxAdjustmentM: 0 };
+  if (n === 0) return { smoothed: [], adjustedCount: 0, maxAdjustmentM: 0, anchorConflict: false };
+  const pins = (anchors ?? []).filter(a =>
+    Number.isInteger(a.index) && a.index >= 0 && a.index < n && Number.isFinite(a.elevation));
+  if (pins.length > 0) {
+    rawElevations = rawElevations.slice();
+    for (const a of pins) rawElevations[a.index] = a.elevation;
+  }
+  if (n === 1) return { smoothed: [rawElevations[0]], adjustedCount: 0, maxAdjustmentM: 0, anchorConflict: false };
 
   // Per-segment ruling gradient (piecewise-constant across zones), keyed by
   // segment index i for the segment between point i-1 and point i.
@@ -1938,6 +1964,35 @@ export function applyGradientEnvelopeSmoothing(rawElevations, chainageM, default
     lowerBwd[i] = Math.max(rawElevations[i], lowerBwd[i + 1] - maxDelta);
   }
 
+  // Anchors: the highest and lowest each point may be while staying within
+  // the ruling gradient of every anchor (the same forward + backward sweeps).
+  // Clamping the midpoint profile into this band keeps it within the ruling
+  // gradient (both the profile and the band limits are) and puts it exactly
+  // on each anchor.
+  let pinUpper = null, pinLower = null, anchorConflict = false;
+  if (pins.length > 0) {
+    const pinAt = new Map(pins.map(a => [a.index, a.elevation]));
+    pinUpper = new Array(n).fill(Infinity);
+    pinLower = new Array(n).fill(-Infinity);
+    for (let i = 0; i < n; i++) {
+      if (i > 0) {
+        const d = segGradient[i] * (chainageM[i] - chainageM[i - 1]);
+        pinUpper[i] = pinUpper[i - 1] + d;
+        pinLower[i] = pinLower[i - 1] - d;
+      }
+      if (pinAt.has(i)) {
+        pinUpper[i] = Math.min(pinUpper[i], pinAt.get(i));
+        pinLower[i] = Math.max(pinLower[i], pinAt.get(i));
+      }
+    }
+    for (let i = n - 2; i >= 0; i--) {
+      const d = segGradient[i + 1] * (chainageM[i + 1] - chainageM[i]);
+      pinUpper[i] = Math.min(pinUpper[i], pinUpper[i + 1] + d);
+      pinLower[i] = Math.max(pinLower[i], pinLower[i + 1] - d);
+    }
+    anchorConflict = pinLower.some((lo, i) => lo > pinUpper[i] + 1e-6);
+  }
+
   const smoothed = new Array(n);
   let adjustedCount = 0;
   let maxAdjustmentM = 0;
@@ -1946,6 +2001,7 @@ export function applyGradientEnvelopeSmoothing(rawElevations, chainageM, default
     const upper = Math.min(upperFwd[i], upperBwd[i]);
     const lower = Math.max(lowerFwd[i], lowerBwd[i]);
     smoothed[i] = (upper + lower) / 2;
+    if (pinUpper) smoothed[i] = Math.min(Math.max(smoothed[i], pinLower[i]), pinUpper[i]);
 
     const delta = Math.abs(smoothed[i] - rawElevations[i]);
     if (delta > 0.01) {
@@ -1954,7 +2010,7 @@ export function applyGradientEnvelopeSmoothing(rawElevations, chainageM, default
     }
   }
 
-  return { smoothed, adjustedCount, maxAdjustmentM };
+  return { smoothed, adjustedCount, maxAdjustmentM, anchorConflict };
 }
 
 /**
@@ -2037,6 +2093,141 @@ export function largeSmoothingCorrectionWarnings(routeLabel, raw, smoothed, chai
   return findLargeSmoothingCorrections(raw, smoothed, chainageM, -1, thresholdM).map(s => text(s, 'below',
     'This is probably a bridge or viaduct not marked in OpenStreetMap (the elevation data then gives the height ' +
     'of the valley floor or water below it)'));
+}
+
+/**
+ * How close (metres, across the track) the end of an alternative route must
+ * be to an already-worked-out route profile for its height to be taken from
+ * that profile. Where an alternative meets another route the two lines are
+ * within a few metres (detectAlternativeRoutes counts 8 m as "met"); the two
+ * directional tracks near Riomaggiore that separate without a junction are
+ * ~4 m apart where alt4 of La Spezia Centrale - Vezzano Ligure starts.
+ */
+export const ROUTE_ANCHOR_MAX_DISTANCE_M = 30;
+
+/**
+ * The height of the nearest already-worked-out route profile at a point:
+ * the nearest point on any profile's line (between its points, interpolating
+ * the height), if that is within `maxDistM`.
+ *
+ * @param {{lat:number, lon:number}} point
+ * @param {Array<{label:string, points:Array<{lat:number, lon:number, elevation:number}>}>} profiles
+ * @param {number} [maxDistM]
+ * @returns {{elevation:number, distanceM:number, label:string}|null}
+ */
+export function elevationNearPoint(point, profiles, maxDistM = ROUTE_ANCHOR_MAX_DISTANCE_M) {
+  if (!point || !Array.isArray(profiles)) return null;
+  const mLat = 110540;
+  const mLon = 111320 * Math.cos(point.lat * Math.PI / 180);
+  const xy = q => [(q.lon - point.lon) * mLon, (q.lat - point.lat) * mLat];
+  let best = null;
+  for (const prof of profiles) {
+    const pts = prof?.points;
+    if (!Array.isArray(pts) || pts.length === 0) continue;
+    for (let i = 0; i < pts.length; i++) {
+      const a = pts[i];
+      if (!Number.isFinite(a?.elevation)) continue;
+      const b = i + 1 < pts.length && Number.isFinite(pts[i + 1]?.elevation) ? pts[i + 1] : a;
+      const [ax, ay] = xy(a);
+      const [bx, by] = xy(b);
+      const dx = bx - ax, dy = by - ay;
+      const len2 = dx * dx + dy * dy;
+      const t = len2 > 0 ? Math.min(1, Math.max(0, -(ax * dx + ay * dy) / len2)) : 0;
+      const d = Math.hypot(ax + t * dx, ay + t * dy);
+      if (d <= maxDistM && (!best || d < best.distanceM)) {
+        best = { elevation: a.elevation + t * (b.elevation - a.elevation), distanceM: d, label: prof.label };
+      }
+    }
+  }
+  return best;
+}
+
+/**
+ * Heights for the two ends of an alternative route, before the tunnel/bridge
+ * straight lines are drawn and before smoothing (October 2026).
+ *
+ * Where an end meets a route whose profile is already worked out (this
+ * segment's main route, an earlier alternative, or a route of an earlier
+ * segment) within `maxDistM`, its height is taken from that profile and
+ * returned as an anchor for applyGradientEnvelopeSmoothing - the two routes
+ * are the same track there, so they must be at the same height.
+ *
+ * Where an end lies inside a tunnel or on a bridge (the route starts or ends
+ * there, so there is no portal at that end) the elevation data is the ground
+ * above or below the railway. If no route profile is close enough and the
+ * ground height there is impossible (further from the height at the nearest
+ * point outside the tunnel/bridge than the ruling gradient allows over that
+ * distance), that outside height is used instead (i.e. level up to the
+ * portal) and a warning says it was a guess. A possible ground height is
+ * kept: the route may well begin right at a portal (e.g. where it leaves
+ * another line just outside a tunnel), and then the ground height is right.
+ *
+ * Mutates `elevations[0]` / `elevations[n-1]` (array of {elevation}); the
+ * tunnel/bridge interpolation then starts from those values.
+ *
+ * @param {object} p
+ * @param {Array<{elevation:number}>} p.elevations - per output point
+ * @param {Array<{lat:number, lon:number}>} p.coords - per output point
+ * @param {number[]} p.pointChainageM - per output point, same frame as p.intervals
+ * @param {Array<{startM:number, endM:number}>} p.intervals - tunnel AND bridge intervals
+ * @param {Array<{label:string, points:Array}>} p.profiles - see elevationNearPoint
+ * @param {string} p.routeLabel
+ * @param {number} [p.maxDistM]
+ * @param {number} [p.thresholdM] - warn if an anchor differs from the ground height
+ *   at an end that is NOT in a tunnel/bridge by more than this
+ * @param {number} [p.rulingGradient] - as a fraction (see above)
+ * @returns {{anchors:Array<{index:number, elevation:number}>, warnings:string[]}}
+ */
+export function anchorRouteEnds({ elevations, coords, pointChainageM, intervals = [], profiles = [], routeLabel,
+  maxDistM = ROUTE_ANCHOR_MAX_DISTANCE_M, thresholdM = ELEVATION_REVIEW_THRESHOLD_M, rulingGradient = DEFAULT_RULING_GRADIENT }) {
+  const anchors = [];
+  const warnings = [];
+  const n = elevations?.length ?? 0;
+  if (n === 0 || !coords || coords.length !== n) return { anchors, warnings };
+  const inside = i => intervals.some(iv => pointChainageM[i] >= iv.startM && pointChainageM[i] <= iv.endM);
+  const ends = n === 1 ? [[0, 'start', 1]] : [[0, 'start', 1], [n - 1, 'end', -1]];
+
+  for (const [idx, word, step] of ends) {
+    const ground = elevations[idx].elevation;
+    const inTunnel = inside(idx);
+    const ref = elevationNearPoint(coords[idx], profiles, maxDistM);
+    const where = word === 'start' ? 'starts' : 'ends';
+    if (ref) {
+      elevations[idx].elevation = ref.elevation;
+      anchors.push({ index: idx, elevation: ref.elevation });
+      if (inTunnel) {
+        warnings.push(`Elevation anchor: ${routeLabel} ${where} inside a tunnel or on a bridge (no portal at that end); ` +
+          `its height there was taken from ${ref.label} (${ref.elevation.toFixed(1)} m, ${ref.distanceM.toFixed(0)} m away) ` +
+          `instead of the ground height (${ground.toFixed(1)} m).`);
+      } else if (Math.abs(ground - ref.elevation) > thresholdM) {
+        warnings.push(`ELEVATION CHECK: ${routeLabel}: where it ${where} it meets ${ref.label} ` +
+          `(${ref.distanceM.toFixed(0)} m away), whose height there is ${ref.elevation.toFixed(1)} m, but the elevation ` +
+          `data gives ${ground.toFixed(1)} m (${Math.abs(ground - ref.elevation).toFixed(1)} m different). The route was ` +
+          `set to ${ref.elevation.toFixed(1)} m there; check that the two really are the same track at the same level ` +
+          `(and not, say, one line passing over the other).`);
+      }
+      continue;
+    }
+    if (!inTunnel) continue;
+    let j = idx;
+    while (j >= 0 && j < n && inside(j)) j += step;
+    if (j < 0 || j >= n) {
+      warnings.push(`ELEVATION CHECK: ${routeLabel} lies entirely inside tunnels or on bridges and meets no other route ` +
+        `within ${maxDistM} m, so its heights come from the ground above or below it and are probably wrong; ` +
+        `check the elevation profile.`);
+      break;
+    }
+    const guess = elevations[j].elevation;
+    const distM = Math.abs(pointChainageM[j] - pointChainageM[idx]);
+    if (Math.abs(ground - guess) <= rulingGradient * distM) continue; // possible: keep the ground height
+    elevations[idx].elevation = guess;
+    warnings.push(`ELEVATION CHECK: ${routeLabel} ${where} inside a tunnel or on a bridge (no portal at that end) and ` +
+      `meets no other route within ${maxDistM} m to take the height from. The ground height there ` +
+      `(${ground.toFixed(1)} m) is not the railway's, so the height at the nearest point outside ` +
+      `(${guess.toFixed(1)} m, ${(distM / 1000).toFixed(2)} km along) ` +
+      `was used instead - level up to there. This is a guess; check the elevation profile at this end.`);
+  }
+  return { anchors, warnings };
 }
 
 /**
