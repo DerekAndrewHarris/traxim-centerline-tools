@@ -2,7 +2,8 @@
 # inside .github/workflows). Copy it over .github/workflows/deploy.yml ONLY after the server
 # has the deploy-fg user, its key, the sudoers rule and /usr/local/bin/deploy-file-generator,
 # and the repository secrets SSH_USERNAME / SSH_PRIVATE_KEY have been changed to deploy-fg and
-# its new private key (step-by-step instructions: the October 2026 deploy-key proposal).
+# its new private key. Step-by-step instructions: Traxim-Live-Control-Interface-for-Web repo,
+# deploy/CONTROLLER-AUTO-DEPLOY-SETUP.md, Part B (set up together with the Controller's auto-deploy).
 
 name: Deploy to Server
 
