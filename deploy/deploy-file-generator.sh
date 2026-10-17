@@ -15,6 +15,8 @@
 # Rollback (by hand, as root):
 #   cd /var/www/TraximCenterlineTools && git reset --hard <previous commit> && systemctl restart traxim-file-generator
 #   (the previous commit is printed below as "Was at:")
+#   If that deploy changed the libraries ("package files changed" in its log), also put the previous
+#   ones back first:  rm -rf node_modules && mv node_modules.old node_modules
 
 set -euo pipefail
 
@@ -29,15 +31,46 @@ fail() { echo "DEPLOY ABORTED: $1" >&2; exit 1; }
 cd "$APP"
 git config --global --add safe.directory "$APP" 2>/dev/null || true
 
+WAS=$(git rev-parse HEAD)
 echo "Was at: $(git log -1 --oneline)"
 git fetch origin main
 git reset --hard origin/main
+NOW=$(git rev-parse HEAD)
 echo "Now at: $(git log -1 --oneline)"
 
 # Cache-busting build id in index.html (used as ?v= on the front-end files).
-BUILD_ID=$(git rev-parse --short HEAD)
-sed -i "s/__BUILD_ID__/$BUILD_ID/g" index.html
-echo "Stamped build ID: $BUILD_ID"
+stamp_build_id() {
+  BUILD_ID=$(git rev-parse --short HEAD)
+  sed -i "s/__BUILD_ID__/$BUILD_ID/g" index.html
+  echo "Stamped build ID: $BUILD_ID"
+}
+
+# Libraries: only when package.json / package-lock.json changed (added 17 Oct 2026; before, this was a
+# manual "npm ci --omit=dev" on the server that was easy to forget). The new node_modules is built in
+# a temporary folder as www-data (not root), and only swapped in if npm ci succeeds; the previous one
+# is kept as node_modules.old. If npm ci fails, the code goes back to the previous commit and the
+# service is not restarted, so the running version is untouched.
+if [ "$WAS" != "$NOW" ] && ! git diff --quiet "$WAS" "$NOW" -- package.json package-lock.json; then
+  echo "package files changed: npm ci --omit=dev (as www-data, in a temporary folder)"
+  NPMDIR=$(mktemp -d /var/tmp/file-generator-npm.XXXXXX)
+  cp package.json package-lock.json "$NPMDIR/"
+  chown -R www-data:www-data "$NPMDIR"
+  if runuser -u www-data -- env HOME="$NPMDIR" npm_config_cache="$NPMDIR/.npm" npm_config_update_notifier=false \
+       bash -c "cd '$NPMDIR' && npm ci --omit=dev --no-audit --no-fund"; then
+    rm -rf "$APP/node_modules.old"
+    [ -d "$APP/node_modules" ] && mv "$APP/node_modules" "$APP/node_modules.old"
+    mv "$NPMDIR/node_modules" "$APP/node_modules"
+    rm -rf "$NPMDIR"
+  else
+    rm -rf "$NPMDIR"
+    git reset --hard "$WAS"
+    stamp_build_id
+    chown -R www-data:www-data "$APP"
+    fail "npm ci failed - files put back to $(git log -1 --oneline); service not restarted"
+  fi
+fi
+
+stamp_build_id
 
 # Same ownership as before. Files readable, not executable, by others (the old chmod -R 755 made every
 # file executable). .env stays readable only by the service user.
