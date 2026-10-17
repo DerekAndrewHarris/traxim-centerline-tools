@@ -39,6 +39,7 @@ import {
   applyGradientEnvelopeSmoothing,
   largeSmoothingCorrectionWarnings,
   coordWayIdsFromWays,
+  anchorRouteEnds,
   DEFAULT_RULING_GRADIENT
 } from './processor.js';
 import { fetchElevations } from '../elevation.js';
@@ -68,8 +69,11 @@ import { promises as fs } from 'fs';
  *   segment's confirmed line looks like unless it's passed in explicitly — without this, a candidate
  *   that's actually just the previous segment's own mainline (walked backward past the shared waypoint)
  *   reads as "far from my own centerline" and gets accepted as a bogus alt route.
- * @param {{maxGradient?: number}} [options] - maxGradient: maximum gradient for elevation smoothing,
- *   as a fraction (0.025 = 2.5%, the default DEFAULT_RULING_GRADIENT)
+ * @param {{maxGradient?: number, priorProfiles?: Array<{label: string, points: Array<{lat: number, lon: number, elevation: number}>}>}} [options] -
+ *   maxGradient: maximum gradient for elevation smoothing, as a fraction (0.025 = 2.5%, the default
+ *   DEFAULT_RULING_GRADIENT). priorProfiles: the finished (smoothed) elevation profiles of the routes of
+ *   already-generated segments (their results' elevationProfiles), so that an alternative route that
+ *   starts or ends on one of them takes its height there from it (see anchorRouteEnds in processor.js).
  * @returns {Promise<{filePath: string, pointCount: number, lengthKm: number, alternativeCount: number, alternativeFiles: string[], warnings: string[], rawCoords: {lat: number, lon: number}[], elevation: {ok: boolean, reason: string|null}, alternativeElevation: Array<{route: string, ok: boolean, reason: string|null}>, smoothing: {adjustedCount: number, maxAdjustmentM: number}}>}
  */
 export async function generateGeometryForSegment(segmentLabel, segmentBbox, outputDir, spacingMetres = 25, startPoint = null, endPoint = null, progressCallback = null, sections = null, relationWayIdCache = null, sessionPath = null, priorCenterlines = [], options = {}) {
@@ -472,6 +476,15 @@ export async function generateGeometryForSegment(segmentLabel, segmentBbox, outp
     console.log(`[Geometry Generator] Wrote geometry to: ${filePath}`);
 
     // ── 9. Generate alternative route CSVs (80-90%) ──────────────────────────
+    // Finished profiles an alternative's ends can take their height from
+    // (October 2026): this segment's main route, the earlier segments' routes
+    // and, as they are made, this segment's earlier alternatives.
+    const toProfile = (label, pts) => ({
+      label,
+      points: pts.map(pt => ({ lat: pt.latitude, lon: pt.longitude, elevation: pt.altitude }))
+    });
+    const elevationProfiles = elevation.ok ? [toProfile(segmentLabel, finalPoints)] : [];
+    const priorProfiles = Array.isArray(options.priorProfiles) ? options.priorProfiles : [];
     const alternativeFiles = [];
     const alternativeElevation = [];
     for (let altIdx = 0; altIdx < alternativeRoutes.length; altIdx++) {
@@ -481,8 +494,9 @@ export async function generateGeometryForSegment(segmentLabel, segmentBbox, outp
       try {
         const altResult = await generateAlternativeGeometry(
           segmentLabel, alt, altIdx + 1, outputDir, spacingMetres, warnings, rulingGradient,
-          splitWayGeometry, splitWayTags
+          splitWayGeometry, splitWayTags, [...elevationProfiles, ...priorProfiles]
         );
+        if (altResult.elevation.ok) elevationProfiles.push(toProfile(altResult.label, altResult.points));
         alternativeFiles.push(altResult.filePath);
         alternativeElevation.push({ route: altResult.label, ok: altResult.elevation.ok, reason: altResult.elevation.reason });
       } catch (altErr) {
@@ -651,7 +665,9 @@ export async function generateGeometryForSegment(segmentLabel, segmentBbox, outp
       // For the caller to accumulate into priorCenterlines for subsequent segments'
       // alt-route detection (see the priorCenterlines param doc above). Not meant for
       // the client-facing job result — strip it out before it's included there.
-      rawCoords
+      rawCoords,
+      // Likewise for the next segments' alternative routes (options.priorProfiles).
+      elevationProfiles
     };
 
   } catch (error) {
@@ -664,7 +680,7 @@ export async function generateGeometryForSegment(segmentLabel, segmentBbox, outp
  * Generate a geometry CSV for one alternative route.
  */
 async function generateAlternativeGeometry(segmentLabel, alternative, altNumber, outputDir, spacingMetres, warnings, rulingGradient = DEFAULT_RULING_GRADIENT,
-  wayGeometry = null, wayTags = null) {
+  wayGeometry = null, wayTags = null, profiles = []) {
   const safeName = segmentLabel.replace(/[^a-zA-Z0-9_\-]/g, '_');
   const altLabel = `${segmentLabel}_alt${altNumber}`;
   const altSafeName = `${safeName}_alt${altNumber}`;
@@ -691,6 +707,7 @@ async function generateAlternativeGeometry(segmentLabel, alternative, altNumber,
 
   // Elevation
   let elevation = { ok: true, reason: null };
+  let anchors = [];
   try {
     const elevPts = processedPoints.map(pt => ({ lat: pt.latitude, lon: pt.longitude }));
     const elevResults = await fetchElevations(elevPts);
@@ -700,10 +717,24 @@ async function generateAlternativeGeometry(segmentLabel, alternative, altNumber,
     } else if (elevResults.length > 0 && elevResults.every(r => r.elevation === 0)) {
       elevation = { ok: false, reason: 'the elevation data gave 0 m for every point (all sea, or no data)' };
     }
-    if (tunnelIntervals.length > 0 || bridgeIntervals.length > 0) {
-      const finalChainageM = mapPointsToChainage(elevPts, alternative.coords, altRawChainageM);
-      applyPortalElevationInterpolation(elevResults, finalChainageM, tunnelIntervals);
-      applyPortalElevationInterpolation(elevResults, finalChainageM, bridgeIntervals);
+    // Ends first (October 2026): where the route meets an already-worked-out
+    // route its height there comes from that route, and an end inside a
+    // tunnel or on a bridge must not use the ground height - see
+    // anchorRouteEnds. The tunnel/bridge straight lines then start from these.
+    if (elevation.ok) {
+      const finalChainageM = altRawChainageM
+        ? mapPointsToChainage(elevPts, alternative.coords, altRawChainageM)
+        : elevPts.map(() => -1);
+      const ends = anchorRouteEnds({
+        elevations: elevResults, coords: elevPts, pointChainageM: finalChainageM,
+        intervals: [...tunnelIntervals, ...bridgeIntervals], profiles, routeLabel: altLabel, rulingGradient
+      });
+      anchors = ends.anchors;
+      warnings.push(...ends.warnings);
+      if (tunnelIntervals.length > 0 || bridgeIntervals.length > 0) {
+        applyPortalElevationInterpolation(elevResults, finalChainageM, tunnelIntervals);
+        applyPortalElevationInterpolation(elevResults, finalChainageM, bridgeIntervals);
+      }
     }
     for (let i = 0; i < processedPoints.length; i++) {
       processedPoints[i].altitude = elevResults[i].elevation;
@@ -728,8 +759,13 @@ async function generateAlternativeGeometry(segmentLabel, alternative, altNumber,
   {
     const rawAltitudes = processedPoints.map(pt => pt.altitude);
     const chainageMetres = processedPoints.map(pt => pt.chainage * 1000);
-    const { smoothed, adjustedCount, maxAdjustmentM } =
-      applyGradientEnvelopeSmoothing(rawAltitudes, chainageMetres, rulingGradient);
+    const { smoothed, adjustedCount, maxAdjustmentM, anchorConflict } =
+      applyGradientEnvelopeSmoothing(rawAltitudes, chainageMetres, rulingGradient, [], anchors);
+    if (anchorConflict) {
+      warnings.push(`ELEVATION CHECK: ${altLabel}: the heights of the routes it meets at its two ends differ by more than a ` +
+        `${formatGradientPercent(rulingGradient)}% gradient allows over its length, so its profile cannot keep to that gradient ` +
+        `everywhere; check the elevation profiles of this route and the routes it joins.`);
+    }
     for (let i = 0; i < processedPoints.length; i++) {
       processedPoints[i].rawAltitude = rawAltitudes[i];
       processedPoints[i].altitude = smoothed[i];
@@ -761,7 +797,7 @@ async function generateAlternativeGeometry(segmentLabel, alternative, altNumber,
   );
 
   console.log(`[Geometry Generator] Wrote alt route ${altNumber}: ${filePath} (${totalKm.toFixed(2)} km)`);
-  return { filePath, label: altLabel, elevation };
+  return { filePath, label: altLabel, elevation, points: processedPoints };
 }
 
 /** 0.04 -> "4", 0.033 -> "3.3" (for messages). */

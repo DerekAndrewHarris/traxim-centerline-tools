@@ -329,6 +329,10 @@ export async function runGeometryGeneration(data, updateProgress) {
   // "this candidate is just an earlier segment's mainline, walked backward past
   // our shared waypoint" (see priorCenterlines doc in generator.js).
   const priorCenterlines = [];
+  // Finished elevation profiles of the earlier segments' routes, so that an
+  // alternative route starting or ending on one of them takes its height
+  // there from it (see anchorRouteEnds in geometry/processor.js).
+  const priorProfiles = [];
   for (let i = 0; i < segments.length; i++) {
     const segment = segments[i];
 
@@ -354,13 +358,15 @@ export async function runGeometryGeneration(data, updateProgress) {
         relationWayIdCache,
         sessionDirPath,
         priorCenterlines,
-        { maxGradient: maxGradientPercent / 100 }
+        { maxGradient: maxGradientPercent / 100, priorProfiles }
       );
 
       // rawCoords is only for the next segments' alt-route detection — keep it
       // out of the client-facing job result (it can be thousands of points).
-      const { rawCoords, ...publicResult } = result;
+      // elevationProfiles likewise (for the next segments' alternative routes).
+      const { rawCoords, elevationProfiles, ...publicResult } = result;
       if (rawCoords) priorCenterlines.push(rawCoords);
+      if (Array.isArray(elevationProfiles)) priorProfiles.push(...elevationProfiles);
 
       results.push({
         section: segment.label,

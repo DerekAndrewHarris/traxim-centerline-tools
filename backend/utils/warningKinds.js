@@ -54,7 +54,8 @@ const INFO = [
   /^2-branch normalisation:/i,
   /^F-branch fix:/i,
   /^Speedboards: \d+ speedboard row/i,
-  /^Truncation produced fewer than 2 points/i
+  /^Truncation produced fewer than 2 points/i,
+  /^Elevation anchor:/i
 ];
 
 /**
