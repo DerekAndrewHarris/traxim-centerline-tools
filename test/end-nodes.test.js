@@ -63,9 +63,9 @@ test('clampEndNodesToGeometry leaves nodes with more than one link alone', () =>
   assert.equal(end.km, 1);
 });
 
-test('clampAllKmToGeometry keeps alias kilometrages in range too', () => {
+test('clampAllKmToGeometry keeps alias kilometrages in range too (end node: right up to the ends)', () => {
   const geo = new Map([['A', [{ lat: 0, lon: 0, km: 0 }, { lat: 0, lon: 1, km: 5 }]], ['B', [{ lat: 0, lon: 0, km: 2 }, { lat: 0, lon: 1, km: 3 }]]]);
-  const n = { region: 'A', km: -0.4, region2: 'B', km2: 3.7, region3: null, km3: null };
+  const n = { region: 'A', km: -0.4, region2: 'B', km2: 3.7, region3: null, km3: null, fNode: 'P' };
   clampAllKmToGeometry([n], geo);
   assert.equal(n.km, 0);
   assert.equal(n.km2, 3);
@@ -83,7 +83,7 @@ test('kmLabel never gives "-0.0"', async () => {
   assert.equal(kmLabel(12.34), '12.3');
 });
 
-test('a turnout a few metres before the start of the geometry is named and placed at km 0.0, not -0.0', async () => {
+test('a turnout a few metres before the start of the geometry is named km 0.0 (not -0.0) and moved 25 m in', async () => {
   // Turnout J0 at x = -9 m (geometry starts at x = 0), siding to the south.
   const net = new Net().point('W', -600, 0).point('J0', -9, 0).point('J2', 1900, 0).point('E', 2600, 0)
     .point('S1', 40, -4).point('S2', 300, -4).point('T1', 1850, -4).point('T2', 1600, -4);
@@ -100,8 +100,11 @@ test('a turnout a few metres before the start of the geometry is named and place
     assert.ok(!/km -/.test(row.Name), `name ${row.Name}`);
     assert.ok(Number(row.Km1) >= 0, `${row.Name} km ${row.Km1}`);
   }
-  const turnout = rows.find(r => r['D Node'] && Math.abs(xOf(r) + 9) < 2);
-  assert.ok(turnout, 'the turnout stays where it is (9 m before the start)');
-  assert.ok(Number(turnout.Km1) >= 0 && Number(turnout.Km1) < 0.05, `km ${turnout.Km1}`);
+  // Geometry end margin (18 Oct 2026): not within 25 m of the start, so the
+  // turnout is slid along the line from x = -9 to x = 25 or a little more
+  // (26 m: the usual 26.2 m minimum gap to the end node at km 0 also holds).
+  const turnout = rows.find(r => r['D Node']);
+  assert.ok(Number(turnout.Km1) >= 0.025 && Number(turnout.Km1) <= 0.027, `km ${turnout.Km1}`);
+  assert.ok(Math.abs(xOf(turnout) - Number(turnout.Km1) * 1000) < 1, `turnout at x=${xOf(turnout).toFixed(1)}`);
   assert.equal(turnout.Name, 'A km 0.0');
 });

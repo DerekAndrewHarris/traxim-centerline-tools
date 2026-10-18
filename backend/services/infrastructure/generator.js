@@ -627,13 +627,17 @@ function resolveKmConstraints(nodes, geometryBySection) {
     // node) would be dragged onto the boundary AFTER spacing was solved, landing
     // on top of its neighbour (two nodes at exactly 0.000). Make the range a
     // hard bound here so spacing is solved with it, packing inwards from the end.
+    // Non-end nodes also keep GEOMETRY_END_MARGIN_M away from each end
+    // (allowedKmRange, 18 Oct 2026); because it is a bound here, nodes near
+    // an end are packed inwards in order, with the usual gap between them.
     const pts = geometryBySection ? geometryBySection.get(geo) : null;
     let gMin = -Infinity, gMax = Infinity;
     if (pts && pts.length > 0) { gMin = Math.min(...pts.map(p => p.km)); gMax = Math.max(...pts.map(p => p.km)); }
-    const blo = x0.map(() => gMin), bhi = x0.map(() => gMax);
+    const bounds = members.map(n => (Number.isFinite(gMin) ? allowedKmRange(gMin, gMax, isEndNode(n)) : { lo: gMin, hi: gMax }));
+    const blo = bounds.map(b => b.lo), bhi = bounds.map(b => b.hi);
 
     // Dykstra's alternating projections.
-    const x = x0.map(v => Math.min(gMax, Math.max(gMin, v)));
+    const x = x0.map((v, i) => Math.min(bhi[i], Math.max(blo[i], v)));
     const pl = new Array(cons.length).fill(0), ph = new Array(cons.length).fill(0), pb = new Array(members.length).fill(0);
     let sweeps = 0, worst = Infinity;
     for (; sweeps < MAX_SWEEPS; sweeps++) {
@@ -794,19 +798,165 @@ function geometryEnds(points) {
 }
 
 /**
+ * Geometry end margin (Derek, 18 Oct 2026). An ordinary node (turnout,
+ * diamond, slip, platform, signal, capacity point ...) may not sit within
+ * this many metres of the start or end of the geometry it is on, on any of
+ * its kilometrages. 25 m is the normal spacing of geometry points, i.e.
+ * where the next geometry point would be.
+ *
+ * Why: the resolver stops with an error when a link reaches past the end of
+ * its geometry ("link ... location ... km is less than ... minimum
+ * kilometrage"). A node exactly AT the end is accepted, but has no room:
+ * the Network Editor writes a double slip as two turnouts 1 m either side
+ * of the diamond, so a diamond at km 0 put one of them at km -0.001.
+ *
+ * End nodes (one connection) are exempt: they belong at the ends.
+ */
+export const GEOMETRY_END_MARGIN_M = 25;
+
+/** A move (metres) up to this size is too small to ask the user to check. */
+const GEOMETRY_END_REVIEW_MOVE_M = 5;
+
+/** An end node has exactly one connection; it may sit at a geometry end. */
+function isEndNode(node) {
+  return [node.fNode, node.tNode, node.dNode, node.xNode].filter(Boolean).length === 1;
+}
+
+/**
+ * The km range a node may use on a geometry running from minKm to maxKm.
+ * End nodes: the whole range. Other nodes: GEOMETRY_END_MARGIN_M in from
+ * each end, rounded inwards to a whole metre so the 3-decimal km written to
+ * the file is still at least 25 m in. A geometry too short to leave any
+ * room (under 50 m) keeps its whole range; the caller reports that.
+ */
+export function allowedKmRange(minKm, maxKm, endNode = false) {
+  if (endNode) return { lo: minKm, hi: maxKm, margin: false };
+  const m = GEOMETRY_END_MARGIN_M / 1000;
+  const lo = Math.ceil((minKm + m) * 1000 - 1e-6) / 1000;
+  const hi = Math.floor((maxKm - m) * 1000 + 1e-6) / 1000;
+  if (lo > hi) return { lo: minKm, hi: maxKm, margin: false };
+  return { lo, hi, margin: true };
+}
+
+/**
  * A node's kilometrage on a geometry, kept inside the geometry's own km range.
  * projectOntoGeometry() carries on past the ends of the line, so a turnout or
  * diamond a few metres before the start of a route got a km such as -0.009
  * and a name such as "... km -0.0" (October 2026 test run, Sestri Levante).
- * End nodes were already moved to the end of the geometry
- * (clampEndNodesToGeometry); turnouts and diamonds stay where they are, but
- * their km (and so their name) is the geometry's first or last km.
+ * This is used for the turnouts and diamonds made from the OSM junctions
+ * (never end nodes), so the km is also kept GEOMETRY_END_MARGIN_M in from
+ * each end (18 Oct 2026). keepNodesAwayFromGeometryEnds() moves the node
+ * itself to match at the end of the run.
  */
 export function kmWithinGeometry(point, points) {
   const km = nearestKm(point, points);
   if (!points || points.length < 2) return km;
   const { minKm, maxKm } = geometryEnds(points);
-  return Math.min(maxKm, Math.max(minKm, km));
+  const { lo, hi } = allowedKmRange(minKm, maxKm, false);
+  return Math.min(hi, Math.max(lo, km));
+}
+
+/**
+ * The point at kilometrage `km` along a geometry (lat/lon), carried on in a
+ * straight line past either end along the first or last segment.
+ */
+function pointAlongGeometry(points, km) {
+  const pts = [...points].sort((a, b) => a.km - b.km);
+  let a = pts[0], b = pts[1];
+  for (let i = 0; i < pts.length - 1; i++) {
+    a = pts[i]; b = pts[i + 1];
+    if (km <= b.km) break;
+  }
+  const t = b.km === a.km ? 0 : (km - a.km) / (b.km - a.km);
+  return { lat: a.lat + t * (b.lat - a.lat), lon: a.lon + t * (b.lon - a.lon) };
+}
+
+/**
+ * Geometry end margin, last step (18 Oct 2026). By now every kilometrage of
+ * every non-end node is GEOMETRY_END_MARGIN_M in from its geometry's ends
+ * (resolveKmConstraints and clampAllKmToGeometry use allowedKmRange, which
+ * also keeps the nodes in order along each line and the usual spacing
+ * between them). This moves the node ITSELF (lat/lon) to match its first
+ * kilometrage where the node lay near or beyond an end: it is slid along
+ * the line by the same distance, so it stays on its own track.
+ *
+ * Warnings: a "check" warning lists every node moved more than
+ * GEOMETRY_END_REVIEW_MOVE_M (any of its kilometrages, or its position), and
+ * every node still within the margin because there was no room (a geometry
+ * under 50 m long, or too many nodes packed near the end to keep them apart
+ * and in order). Small moves are counted in an information note.
+ *
+ * @returns {{moved: number, reviewed: number, noRoom: number}}
+ */
+export function keepNodesAwayFromGeometryEnds(nodes, geometryBySection, warnings = [], kmBefore = null) {
+  const SLOTS = [['region', 'km'], ['region2', 'km2'], ['region3', 'km3']];
+  const review = [], noRoom = [];
+  let small = 0;
+  for (const node of nodes) {
+    if (isEndNode(node)) continue;
+    let biggest = 0, slid = false;
+    const notes = [];
+    // Slide the node along its first geometry to its (final) first km.
+    const pts = node.region ? geometryBySection.get(node.region) : null;
+    if (pts && pts.length >= 2 && node.km != null && Number.isFinite(node.lat) && Number.isFinite(node.lon)) {
+      const { minKm, maxKm } = geometryEnds(pts);
+      const range = allowedKmRange(minKm, maxKm, false);
+      const kmHere = projectOntoGeometry({ lat: node.lat, lon: node.lon }, pts).km;
+      const slack = 0.0005; // half a metre: rounding of the written km
+      if (range.margin && (kmHere < range.lo - slack || kmHere > range.hi + slack)) {
+        const from = pointAlongGeometry(pts, kmHere), to = pointAlongGeometry(pts, node.km);
+        node.lat += to.lat - from.lat;
+        node.lon += to.lon - from.lon;
+        const m = Math.abs(node.km - kmHere) * 1000;
+        biggest = Math.max(biggest, m);
+        slid = true;
+        if (m > GEOMETRY_END_REVIEW_MOVE_M) notes.push(`moved ${m.toFixed(0)} m along ${node.region}`);
+      }
+    }
+    // Kilometrages moved by the margin (alias regions included).
+    const before = kmBefore ? kmBefore.get(node) : null;
+    for (const [rf, kf] of SLOTS) {
+      const region = node[rf];
+      const g = region ? geometryBySection.get(region) : null;
+      if (!g || g.length < 2 || node[kf] == null) continue;
+      const { minKm, maxKm } = geometryEnds(g);
+      const range = allowedKmRange(minKm, maxKm, false);
+      if (!range.margin || node[kf] < range.lo - 1e-6 || node[kf] > range.hi + 1e-6) {
+        noRoom.push(`"${node.name}" (${region} km ${node[kf].toFixed(3)})`);
+        continue;
+      }
+      const old = before ? before[region] : null;
+      if (old != null) {
+        const m = Math.abs(node[kf] - old) * 1000;
+        // Only moves the margin caused: the old km was near or past an end.
+        const wasNearEnd = old < range.lo - 1e-6 || old > range.hi + 1e-6;
+        if (wasNearEnd && m > 1e-3) {
+          biggest = Math.max(biggest, m);
+          // (The first km's move is already reported as the node's move.)
+          if (m > GEOMETRY_END_REVIEW_MOVE_M && !(rf === 'region' && slid)) notes.push(`${region} km ${old.toFixed(3)} -> ${node[kf].toFixed(3)}`);
+        }
+      }
+    }
+    if (notes.length) review.push(`"${node.name}" (${notes.join(', ')})`);
+    else if (biggest > 1e-3) small++;
+  }
+  const list = (items) => items.slice(0, 20).join('; ') + (items.length > 20 ? `; and ${items.length - 20} more` : '');
+  if (review.length) {
+    warnings.push(`GEOMETRY END MARGIN: ${review.length} node(s) lay within ${GEOMETRY_END_MARGIN_M} m of the start or end ` +
+      `of a geometry and were moved ${GEOMETRY_END_MARGIN_M} m in, along the line (the resolver fails when a node reaches past ` +
+      `a geometry end). Check they are still in the right place: ${list(review)}`);
+  }
+  if (noRoom.length) {
+    warnings.push(`GEOMETRY END NO ROOM: ${noRoom.length} kilometrage(s) are still within ${GEOMETRY_END_MARGIN_M} m of the ` +
+      `start or end of their geometry: there is no room to move them in without putting nodes out of order or too close ` +
+      `together (or the geometry is under ${2 * GEOMETRY_END_MARGIN_M} m long). Fix in the Network Editor or lengthen the ` +
+      `geometry: ${list(noRoom)}`);
+  }
+  if (small) {
+    warnings.push(`Geometry end margin: ${small} node(s) moved by up to ${GEOMETRY_END_REVIEW_MOVE_M} m to stay ` +
+      `${GEOMETRY_END_MARGIN_M} m in from the ends of their geometry.`);
+  }
+  return { moved: review.length + small, reviewed: review.length, noRoom: noRoom.length };
 }
 
 /** A km for a node name, one decimal; never "-0.0". */
@@ -858,18 +1008,24 @@ export function clampEndNodesToGeometry(nodes, geometryBySection, warnings = [])
   return moved;
 }
 
-/** Clamp every node's km (all three region slots) into its geometry's km range. */
+/**
+ * Clamp every node's km (all three region slots) into its geometry's km
+ * range: the whole range for end nodes, GEOMETRY_END_MARGIN_M in from each
+ * end for every other node (allowedKmRange).
+ */
 export function clampAllKmToGeometry(nodes, geometryBySection) {
   const ranges = new Map();
   for (const [region, pts] of geometryBySection) {
     if (pts && pts.length > 0) { const { minKm, maxKm } = geometryEnds(pts); ranges.set(region, { minKm, maxKm }); }
   }
   for (const node of nodes) {
+    const endNode = isEndNode(node);
     for (const [regionField, kmField] of [['region', 'km'], ['region2', 'km2'], ['region3', 'km3']]) {
       const range = node[regionField] ? ranges.get(node[regionField]) : null;
       if (!range || node[kmField] == null) continue;
-      if (node[kmField] < range.minKm) node[kmField] = range.minKm;
-      if (node[kmField] > range.maxKm) node[kmField] = range.maxKm;
+      const { lo, hi } = allowedKmRange(range.minKm, range.maxKm, endNode);
+      if (node[kmField] < lo) node[kmField] = lo;
+      if (node[kmField] > hi) node[kmField] = hi;
     }
   }
 }
@@ -3404,6 +3560,13 @@ async function generateInfrastructureForSections(confirmedSections, networkName,
   // projected km on the same region. Solve ordering and spacing again now that
   // every region a node belongs to is final; where nothing is violated this
   // changes nothing.
+  // (Each node's kilometrages before this, to report the moves the geometry
+  // end margin causes: keepNodesAwayFromGeometryEnds below.)
+  const kmBeforeEndMargin = new Map(nodes.map(n => [n, {
+    ...(n.region ? { [n.region]: n.km } : {}),
+    ...(n.region2 ? { [n.region2]: n.km2 } : {}),
+    ...(n.region3 ? { [n.region3]: n.km3 } : {})
+  }]));
   resolveKmConstraints(nodes, geometryBySection);
 
   // Every kilometrage inside its geometry's range. The solver above already
@@ -3411,6 +3574,10 @@ async function generateInfrastructureForSections(confirmedSections, networkName,
   // has no links (the solver skips such regions), e.g. an alias km that was
   // projected past the end of the line.
   clampAllKmToGeometry(nodes, geometryBySection);
+
+  // Non-end nodes near or past a geometry end: slide the node itself in to
+  // match its km, and warn about big moves or nodes with no room.
+  keepNodesAwayFromGeometryEnds(nodes, geometryBySection, warnings, kmBeforeEndMargin);
 
   // Which nodes the Train Graph draws (Draw column), see assignDrawFlags.
   const drawCount = assignDrawFlags(nodes);

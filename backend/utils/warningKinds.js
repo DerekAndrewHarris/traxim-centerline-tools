@@ -50,6 +50,7 @@ const INFO = [
   /^Platform ".*" \([^)]*\): (island platform|tracks on both sides)/i,
   /^Boundary nodes: created/i,
   /^End nodes: /i,
+  /^Geometry end margin: \d+ node\(s\) moved by up to/i,
   /^Reciprocal link enforcement:/i,
   /^2-branch normalisation:/i,
   /^F-branch fix:/i,
