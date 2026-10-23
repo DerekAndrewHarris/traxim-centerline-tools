@@ -17,6 +17,82 @@ class JobQueue extends EventEmitter {
     // MAX_CONCURRENT_JOBS in the service's environment to change it; it used
     // to be hard-coded to 3 and the variable was ignored.
     this.maxConcurrent = JobQueue.readMaxConcurrent(process.env.MAX_CONCURRENT_JOBS);
+    // Activity log for the Traxim Controller's admin console (October 2026):
+    // the last ACTIVITY_KEEP job starts/finishes/failures, numbered, read by
+    // the Controller through GET /internal/admin/activity (routes/internalAdmin.js).
+    // In memory only; bootId changes at every start so the Controller knows
+    // the numbering began again. Job type, owner id, times, node counts only.
+    this.bootId = randomBytes(8).toString('hex');
+    this.activity = [];
+    this.activitySeq = 0;
+  }
+
+  /**
+   * Small, data-free summary of a finished job's result: node / connection /
+   * leg counts and the number of serious problems. Never file contents,
+   * place names or warnings.
+   * @param {object} result
+   * @returns {object}
+   */
+  static summariseResult(result) {
+    if (!result || typeof result !== 'object') return {};
+    const s = result.summary && typeof result.summary === 'object' ? result.summary : {};
+    const num = (v) => (Number.isFinite(v) ? v : undefined);
+    const out = {
+      nodes: num(result.nodeCount) ?? num(s.infrastructure_nodes),
+      connections: num(result.connectionCount) ?? num(s.infrastructure_connections),
+      legs: num(result.successfulSections) ?? num(s.legs_generated),
+      legs_total: num(result.totalSections) ?? num(s.legs_total),
+      serious_problems: Array.isArray(result.seriousProblems) ? result.seriousProblems.length : undefined
+    };
+    for (const k of Object.keys(out)) if (out[k] === undefined) delete out[k];
+    return out;
+  }
+
+  /** Add one entry to the activity log (see the constructor). */
+  recordActivity(job, event, extra = {}) {
+    this.activitySeq += 1;
+    this.activity.push({
+      seq: this.activitySeq,
+      event,
+      at: new Date().toISOString(),
+      job_id: job.id,
+      job_type: job.type,
+      owner_id: job.data && Number.isInteger(job.data.ownerId) ? job.data.ownerId : null,
+      label: job.data && typeof job.data.label === 'string' ? job.data.label.slice(0, 100) : null,
+      started_at: job.startedAt ? job.startedAt.toISOString() : null,
+      ...extra
+    });
+    if (this.activity.length > JobQueue.ACTIVITY_KEEP) this.activity.splice(0, this.activity.length - JobQueue.ACTIVITY_KEEP);
+  }
+
+  /**
+   * Activity after entry `after` (all kept entries if `boot` is not this
+   * run's bootId), and the jobs running and waiting now.
+   * @param {number} after
+   * @param {string} boot
+   */
+  activitySince(after, boot) {
+    const from = boot === this.bootId ? (Number(after) || 0) : 0;
+    const view = (job) => ({
+      job_id: job.id,
+      job_type: job.type,
+      owner_id: job.data && Number.isInteger(job.data.ownerId) ? job.data.ownerId : null,
+      created_at: job.createdAt ? job.createdAt.toISOString() : null,
+      started_at: job.startedAt ? job.startedAt.toISOString() : null,
+      progress: job.progress,
+      current_step: job.currentStep ? String(job.currentStep).slice(0, 120) : null
+    });
+    return {
+      boot: this.bootId,
+      last_seq: this.activitySeq,
+      events: this.activity.filter(a => a.seq > from),
+      live: {
+        running: [...this.processing].map(id => this.jobs.get(id)).filter(Boolean).map(view),
+        queued: this.queue.map(id => this.jobs.get(id)).filter(Boolean).map(view),
+        max_concurrent: this.maxConcurrent
+      }
+    };
   }
 
   /**
@@ -179,6 +255,7 @@ class JobQueue extends EventEmitter {
     this.processing.add(jobId);
 
     console.log(`[JobQueue] Starting job: ${jobId}`);
+    this.recordActivity(job, 'started');
     this.emit('start', { jobId });
 
     try {
@@ -194,6 +271,7 @@ class JobQueue extends EventEmitter {
       job.completedAt = new Date();
 
       console.log(`[JobQueue] Completed job: ${jobId} (${Math.round((job.completedAt - job.startedAt) / 1000)}s)`);
+      this.recordActivity(job, 'completed', { duration_ms: job.completedAt - job.startedAt, summary: JobQueue.summariseResult(result) });
       this.emit('complete', { jobId, result });
 
     } catch (error) {
@@ -203,6 +281,7 @@ class JobQueue extends EventEmitter {
       job.completedAt = new Date();
 
       console.error(`[JobQueue] Failed job: ${jobId}`, error);
+      this.recordActivity(job, 'failed', { duration_ms: job.completedAt - job.startedAt, error: String(error && error.message).slice(0, 200) });
       // Not 'error': an EventEmitter 'error' event with no listener throws,
       // which turned every failed job into an unhandled promise rejection
       // that stops the whole service (Node 15+), losing every other job.
@@ -259,6 +338,9 @@ class JobQueue extends EventEmitter {
     return removed;
   }
 }
+
+// Entries kept in the activity log for the Controller's admin console.
+JobQueue.ACTIVITY_KEEP = 1000;
 
 // Singleton instance
 const jobQueue = new JobQueue();

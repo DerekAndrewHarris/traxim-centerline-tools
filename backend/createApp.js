@@ -7,6 +7,8 @@
  *   /internal/agent/...      agent routes, for the Traxim Controller only.
  *                            nginx does NOT forward this path; see
  *                            utils/internalAuth.js.
+ *   /internal/admin/...      job activity for the Controller's admin console
+ *                            (Controller only, same secret; routes/internalAdmin.js).
  */
 
 import express from 'express';
@@ -15,6 +17,7 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import fileGeneratorRoutes from './routes/index.js';
 import agentRoutes from './routes/agent.js';
+import internalAdminRoutes from './routes/internalAdmin.js';
 import { errorHandler, notFoundHandler } from './utils/errorHandler.js';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -51,6 +54,8 @@ export function createApp({ serveStatic = true } = {}) {
 
   // Agent routes (Controller only) - mounted before the static files
   app.use('/internal/agent', agentRoutes);
+  // Job activity for the Controller's admin console (Controller only)
+  app.use('/internal/admin', internalAdminRoutes);
 
   // Serve frontend static files
   if (serveStatic) {

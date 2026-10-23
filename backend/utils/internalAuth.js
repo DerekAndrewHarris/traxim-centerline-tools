@@ -27,24 +27,47 @@ function digest(value) {
   return createHash('sha256').update(String(value)).digest();
 }
 
-export function requireInternalCaller(req, res, next) {
+/**
+ * The checks shared by both kinds of internal caller: the secret is set up,
+ * the request did not come through nginx, and it carries the secret.
+ * Sends the refusal and returns false, or returns true.
+ */
+function checkInternalKey(req, res) {
   const configured = process.env.TRAXIM_INTERNAL_KEY || '';
   if (configured.length < MIN_KEY_LENGTH) {
-    return res.status(503).json({
+    res.status(503).json({
       success: false,
       error: 'Agent access to the File Generator is not set up on the server (TRAXIM_INTERNAL_KEY is missing).'
     });
+    return false;
   }
 
   // Came through nginx: never an internal call. Answer as if nothing is here.
   if (req.headers['x-forwarded-for'] || req.headers['x-real-ip']) {
-    return res.status(404).json({ success: false, error: 'Not found' });
+    res.status(404).json({ success: false, error: 'Not found' });
+    return false;
   }
 
   const given = req.get('x-traxim-internal-key') || '';
   if (!given || !timingSafeEqual(digest(given), digest(configured))) {
-    return res.status(401).json({ success: false, error: 'Not allowed' });
+    res.status(401).json({ success: false, error: 'Not allowed' });
+    return false;
   }
+  return true;
+}
+
+/**
+ * The Controller itself, not on behalf of a user (its admin console reading
+ * job activity, routes/internalAdmin.js): the same three protections, no
+ * user id.
+ */
+export function requireInternalService(req, res, next) {
+  if (!checkInternalKey(req, res)) return;
+  next();
+}
+
+export function requireInternalCaller(req, res, next) {
+  if (!checkInternalKey(req, res)) return;
 
   const userId = req.get('x-traxim-user-id') || '';
   if (!/^[1-9][0-9]{0,9}$/.test(userId)) {
